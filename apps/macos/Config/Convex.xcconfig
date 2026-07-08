@@ -1,0 +1,9 @@
+// Convex.xcconfig
+// Convex deployment URL for team `nabeelo`, project `whistle`, deployment
+// `grandiose-alpaca-243` (TECH-SPEC §2a — this deployment already exists
+// and is targeted non-interactively). Not a secret (it's a public HTTPS
+// endpoint), but kept out of source per TECH-SPEC's "env/xcconfig, never
+// hardcoded" convention so switching deployments (e.g. a future prod vs.
+// dev split) never requires a source-code change.
+
+CONVEX_URL = https://grandiose-alpaca-243.convex.cloud

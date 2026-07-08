@@ -1,0 +1,193 @@
+// StatusItemController.swift
+// Custom NSStatusItem (deliberately NOT SwiftUI's MenuBarExtra, which can't
+// cleanly split left/right-click behavior — TECH-SPEC §4.1). Left-click is a
+// capture-trigger placeholder in this unit (fully wired to
+// CapturePanelController in U8); right-click pops an NSMenu with History,
+// Settings, account/sign-in state, Check for Updates, and Quit.
+//
+// Also owns launch-at-login registration via SMAppService (plan U6,
+// TECH-SPEC requirement R6).
+//
+// @MainActor per TECH-SPEC §4.1's concurrency map: UI controllers carry a
+// targeted @MainActor rather than the whole app building under strict
+// Swift 6 concurrency checking.
+
+import AppKit
+import ServiceManagement
+import WhistleCore
+
+@MainActor
+public final class StatusItemController: NSObject {
+    private let statusItem: NSStatusItem
+    private let authController: AuthController
+
+    /// Placeholder for the left-click capture action. Fully wired to
+    /// `CapturePanelController` in U8; here it's a no-op-by-default hook so
+    /// this unit's smoke test can verify the click path is reachable
+    /// without a capture panel existing yet.
+    public var onCaptureTriggered: () -> Void = {}
+    public var onHistoryRequested: () -> Void = {}
+    public var onSettingsRequested: () -> Void = {}
+    public var onCheckForUpdatesRequested: () -> Void = {}
+
+    /// True whenever >=1 capture is `ready` and unopened (TECH-SPEC §4.1
+    /// ready-indicator). Wired up fully once HistoryWindow's subscription
+    /// exists (U9); exposed here so that unit can set it without this
+    /// controller depending on ConvexService directly.
+    public var hasUnreadReadyCaptures: Bool = false {
+        didSet { updateIcon() }
+    }
+
+    public init(authController: AuthController) {
+        self.statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+        self.authController = authController
+        super.init()
+        configureButton()
+    }
+
+    // MARK: - Button / icon
+
+    private func configureButton() {
+        guard let button = statusItem.button else { return }
+        button.image = NSImage(
+            systemSymbolName: "mic.circle",
+            accessibilityDescription: "Whistle"
+        )
+        button.target = self
+        button.action = #selector(statusItemClicked(_:))
+        button.sendAction(on: [.leftMouseUp, .rightMouseUp])
+    }
+
+    private func updateIcon() {
+        guard let button = statusItem.button else { return }
+        let symbolName = hasUnreadReadyCaptures ? "mic.circle.fill" : "mic.circle"
+        button.image = NSImage(systemSymbolName: symbolName, accessibilityDescription: "Whistle")
+    }
+
+    // MARK: - Click routing
+
+    @objc private func statusItemClicked(_ sender: NSStatusBarButton) {
+        guard let event = NSApp.currentEvent else { return }
+        switch event.type {
+        case .rightMouseUp:
+            showMenu()
+        default:
+            onCaptureTriggered()
+        }
+    }
+
+    // MARK: - Right-click menu
+
+    private func showMenu() {
+        let menu = NSMenu()
+
+        menu.addItem(accountMenuItem())
+        menu.addItem(.separator())
+
+        let historyItem = NSMenuItem(title: "History", action: #selector(historyClicked), keyEquivalent: "")
+        historyItem.target = self
+        menu.addItem(historyItem)
+
+        let settingsItem = NSMenuItem(title: "Settings…", action: #selector(settingsClicked), keyEquivalent: ",")
+        settingsItem.target = self
+        menu.addItem(settingsItem)
+
+        menu.addItem(.separator())
+
+        let updatesItem = NSMenuItem(
+            title: "Check for Updates…",
+            action: #selector(checkForUpdatesClicked),
+            keyEquivalent: ""
+        )
+        updatesItem.target = self
+        menu.addItem(updatesItem)
+
+        menu.addItem(.separator())
+
+        let quitItem = NSMenuItem(title: "Quit Whistle", action: #selector(quitClicked), keyEquivalent: "q")
+        quitItem.target = self
+        menu.addItem(quitItem)
+
+        statusItem.menu = menu
+        statusItem.button?.performClick(nil)
+        // NSStatusItem shows `menu` automatically on the next click while
+        // it's assigned; clear it after so left-click reverts to the
+        // capture-trigger action instead of always opening the menu.
+        DispatchQueue.main.async { [weak self] in
+            self?.statusItem.menu = nil
+        }
+    }
+
+    private func accountMenuItem() -> NSMenuItem {
+        let title: String
+        switch authController.state {
+        case .signedIn:
+            title = "Signed in"
+        case .signingIn:
+            title = "Signing in…"
+        case .reauthRequired:
+            title = "Sign-in required…"
+        case .signedOut:
+            title = "Sign In…"
+        }
+        let item = NSMenuItem(title: title, action: #selector(accountClicked), keyEquivalent: "")
+        item.target = self
+        item.isEnabled = authController.state != .signingIn && authController.state != .signedIn
+        return item
+    }
+
+    // MARK: - Actions
+
+    @objc private func accountClicked() {
+        Task { await authController.signIn() }
+    }
+
+    @objc private func historyClicked() {
+        onHistoryRequested()
+    }
+
+    @objc private func settingsClicked() {
+        onSettingsRequested()
+    }
+
+    @objc private func checkForUpdatesClicked() {
+        onCheckForUpdatesRequested()
+    }
+
+    @objc private func quitClicked() {
+        NSApp.terminate(nil)
+    }
+}
+
+// MARK: - Launch at login
+
+/// Wraps `SMAppService.mainApp` registration (plan U6, requirement R6).
+/// Isolated behind a tiny type so `StatusItemController`/settings UI can be
+/// tested without depending on the real `SMAppService` singleton's
+/// process-level state.
+@MainActor
+public enum LaunchAtLogin {
+    public static var isEnabled: Bool {
+        SMAppService.mainApp.status == .enabled
+    }
+
+    public static func setEnabled(_ enabled: Bool) {
+        do {
+            if enabled {
+                if SMAppService.mainApp.status != .enabled {
+                    try SMAppService.mainApp.register()
+                }
+            } else {
+                if SMAppService.mainApp.status == .enabled {
+                    try SMAppService.mainApp.unregister()
+                }
+            }
+        } catch {
+            // Registration can fail (e.g. outside a signed .app bundle
+            // during local `xcodebuild test` runs) — degrade silently per
+            // TECH-SPEC §2a's "skip + log a reason" convention rather than
+            // crash the app over a non-critical convenience feature.
+            NSLog("Whistle: LaunchAtLogin.setEnabled(\(enabled)) failed: \(error)")
+        }
+    }
+}

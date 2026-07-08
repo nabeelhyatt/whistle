@@ -1,0 +1,14 @@
+// Auth0.xcconfig
+// Auth0 tenant configuration — PLACEHOLDER values. No real Auth0 tenant
+// exists yet (TECH-SPEC §9/§2a: the one-shot build targets the seam, not a
+// live tenant). Real values are provisioned post-run and documented in
+// SECRETS.md (added when a real tenant is provisioned); until then these
+// placeholders let the app compile and run against MockAuthProvider without
+// ever attempting a real network call (Auth0AuthProvider.Config detects the
+// placeholder shape and treats the provider as unconfigured).
+//
+// To wire a real tenant later: replace the two values below (or override
+// them from the environment at build time), then re-run `xcodegen generate`.
+
+AUTH0_DOMAIN = your-tenant.us.auth0.com
+AUTH0_CLIENT_ID = REPLACE_WITH_REAL_AUTH0_CLIENT_ID
