@@ -28,6 +28,8 @@ struct WhistleApp: App {
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItemController: StatusItemController?
     private var authController: AuthController?
+    private var capturePanelController: CapturePanelController?
+    private var captureStore: CaptureStore?
 
     /// Convex deployment URL — read from Info.plist (`CONVEX_URL`, injected
     /// via xcconfig, see project.yml), never hardcoded. Falls back to the
@@ -55,6 +57,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem.onSettingsRequested = { [weak self] in self?.showSettingsPlaceholder() }
         statusItem.onCheckForUpdatesRequested = { [weak self] in self?.checkForUpdatesPlaceholder() }
         self.statusItemController = statusItem
+
+        let store = Self.makeCaptureStore()
+        self.captureStore = store
+        let capturePanel = CapturePanelController(store: store)
+        capturePanel.onHistoryRequested = { [weak self] in self?.showHistoryPlaceholder() }
+        capturePanel.onSettingsRequested = { [weak self] in self?.showSettingsPlaceholder() }
+        capturePanel.registerHotkey()
+        self.capturePanelController = capturePanel
+
+        // Left-click starts capture immediately (PRD F1.1) -- replaces
+        // U6's placeholder no-op.
+        statusItem.onCaptureTriggered = { [weak capturePanel] in
+            capturePanel?.trigger()
+        }
 
         LaunchAtLogin.setEnabled(true)
 
@@ -99,6 +115,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             guard let auth0Provider = authProvider as? Auth0AuthProvider else { return }
             try await auth0Provider.login()
         }
+    }
+
+    /// Real on-disk `CaptureStore` under Application Support -- the local
+    /// offline-first queue (TECH-SPEC §4.1). Falls back to an in-memory
+    /// store only if directory creation somehow fails, so a launch never
+    /// crashes over local storage setup.
+    private static func makeCaptureStore() -> CaptureStore {
+        let fileManager = FileManager.default
+        let appSupport = (try? fileManager.url(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask,
+            appropriateFor: nil,
+            create: true
+        )) ?? fileManager.temporaryDirectory
+        let whistleDir = appSupport.appendingPathComponent("Whistle", isDirectory: true)
+        try? fileManager.createDirectory(at: whistleDir, withIntermediateDirectories: true)
+
+        let dbPath = whistleDir.appendingPathComponent("whistle.sqlite").path
+        let screenshotsDir = whistleDir.appendingPathComponent("screenshots", isDirectory: true)
+
+        do {
+            return try CaptureStore(path: dbPath, screenshotsDirectory: screenshotsDir)
+        } catch {
+            NSLog("Whistle: failed to open on-disk CaptureStore (\(error)); falling back to in-memory store")
+            return (try? CaptureStore(path: nil, screenshotsDirectory: screenshotsDir))
+                ?? Self.fatalCaptureStoreFallback()
+        }
+    }
+
+    private static func fatalCaptureStoreFallback() -> CaptureStore {
+        // In-memory DB creation failing too indicates a fundamentally
+        // broken environment (e.g. GRDB itself unavailable) -- there's no
+        // graceful degrade left, per TECH-SPEC §2a this is treated as a
+        // hard failure rather than silently running with no store at all.
+        fatalError("Whistle: unable to construct any CaptureStore, in-memory fallback included")
     }
 
     private static func makeConvexService(authProvider: any WhistleAuthProvider) -> any ConvexServiceProtocol {
