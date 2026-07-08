@@ -1,0 +1,270 @@
+// SyncEngine.swift
+// Drains the local pending_captures queue when online (TECH-SPEC §4.1
+// `SyncEngine` / §13 U5). Upload-then-create is atomic from the queue's
+// point of view: if the screenshot upload fails, the whole capture stays
+// queued (never partially synced). `captures.create` failures move the
+// draft to `syncFailed`, which surfaces a LOCAL retry affordance distinct
+// from the server-side `captures.retry` — the same `clientId` is always
+// reused so the server's dedupe-on-`(userId, clientId)` makes retries safe.
+//
+// No AppKit/UIKit. Network reachability is injected via `NetworkMonitoring`
+// so tests never touch real `NWPathMonitor`.
+
+import Foundation
+#if canImport(Network)
+    import Network
+#endif
+
+// MARK: - Network monitoring seam
+
+/// Abstraction over connectivity so SyncEngine is testable without a real
+/// network stack. `NWPathMonitorNetworkMonitor` is the production
+/// implementation (macOS/iOS); tests inject a fake that flips online/offline
+/// on demand.
+public protocol NetworkMonitoring: Sendable {
+    /// Current reachability, polled once at drain time.
+    var isOnline: Bool { get async }
+    /// Emits `true`/`false` whenever reachability changes. The first value
+    /// is the current state at subscription time.
+    func pathUpdates() -> AsyncStream<Bool>
+}
+
+#if canImport(Network)
+    /// Production `NetworkMonitoring` backed by `NWPathMonitor` (TECH-SPEC
+    /// §4.1: "NWPathMonitor-driven queue drain").
+    public final class NWPathMonitorNetworkMonitor: NetworkMonitoring, @unchecked Sendable {
+        private let monitor = NWPathMonitor()
+        private let queue = DispatchQueue(label: "com.whistle.core.network-monitor")
+        private let lock = NSLock()
+        private var lastStatus: Bool = true
+        private var continuations: [Int: AsyncStream<Bool>.Continuation] = [:]
+        private var nextId = 0
+
+        public init() {
+            monitor.pathUpdateHandler = { [weak self] path in
+                self?.handle(path: path)
+            }
+            monitor.start(queue: queue)
+        }
+
+        deinit {
+            monitor.cancel()
+        }
+
+        public var isOnline: Bool {
+            get async {
+                lock.withLock { lastStatus }
+            }
+        }
+
+        public func pathUpdates() -> AsyncStream<Bool> {
+            AsyncStream { continuation in
+                let (id, current): (Int, Bool) = lock.withLock {
+                    let id = nextId
+                    nextId += 1
+                    continuations[id] = continuation
+                    return (id, lastStatus)
+                }
+                continuation.yield(current)
+                continuation.onTermination = { [weak self] _ in
+                    self?.lock.withLock { _ = self?.continuations.removeValue(forKey: id) }
+                }
+                _ = id
+            }
+        }
+
+        private func handle(path: NWPath) {
+            let online = path.status == .satisfied
+            let continuations: [AsyncStream<Bool>.Continuation] = lock.withLock {
+                lastStatus = online
+                return Array(self.continuations.values)
+            }
+            for continuation in continuations {
+                continuation.yield(online)
+            }
+        }
+    }
+
+    extension NSLock {
+        fileprivate func withLock<T>(_ body: () -> T) -> T {
+            lock()
+            defer { unlock() }
+            return body()
+        }
+    }
+#endif
+
+// MARK: - Screenshot upload transport seam
+
+/// Abstraction over the raw HTTP POST used to upload screenshot bytes to
+/// the Convex-issued upload URL (TECH-SPEC §4.1: "generateUploadUrl -> HTTP
+/// POST -> storageId"). Kept separate from `URLSession` so tests can fake
+/// network failures without a real server.
+public protocol ScreenshotUploading: Sendable {
+    /// POSTs `data` to `uploadUrl` and returns the resulting Convex
+    /// `storageId` (parsed from the JSON response body `{"storageId": ...}`
+    /// per Convex file-upload conventions).
+    func upload(data: Data, to uploadUrl: URL) async throws -> String
+}
+
+public struct URLSessionScreenshotUploader: ScreenshotUploading {
+    private let session: URLSession
+
+    public init(session: URLSession = .shared) {
+        self.session = session
+    }
+
+    private struct UploadResponse: Decodable {
+        let storageId: String
+    }
+
+    public func upload(data: Data, to uploadUrl: URL) async throws -> String {
+        var request = URLRequest(url: uploadUrl)
+        request.httpMethod = "POST"
+        request.setValue("image/jpeg", forHTTPHeaderField: "Content-Type")
+        let (body, response) = try await session.upload(for: request, from: data)
+        if let http = response as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
+            throw SyncEngineError.uploadFailed(statusCode: http.statusCode)
+        }
+        let decoded = try JSONDecoder().decode(UploadResponse.self, from: body)
+        return decoded.storageId
+    }
+}
+
+// MARK: - Errors
+
+public enum SyncEngineError: Error, Equatable {
+    case uploadFailed(statusCode: Int)
+    case offline
+}
+
+// MARK: - Backoff policy
+
+/// Backoff schedule for local retries, mirroring the spirit of the
+/// server-side pipeline's backoff (TECH-SPEC §6) but local-only. Not used to
+/// block `drainOnce()` — SyncEngine leaves scheduling/timing to the caller
+/// (e.g. a periodic timer or connectivity callback in the app target); this
+/// just computes the delay a caller *should* wait before the next attempt.
+public enum SyncBackoff {
+    private static let delaysSeconds: [TimeInterval] = [1, 4, 10, 20]
+
+    public static func delay(forAttempt attempt: Int) -> TimeInterval {
+        guard attempt > 0 else { return 0 }
+        let index = min(attempt - 1, delaysSeconds.count - 1)
+        return delaysSeconds[index]
+    }
+}
+
+// MARK: - SyncEngine
+
+/// Drains `CaptureStore`'s pending queue against a `ConvexServiceProtocol`.
+/// Every method is safe to call repeatedly and safe to call while offline
+/// (it simply does nothing / reports nothing drained).
+public actor SyncEngine {
+    private let store: CaptureStore
+    private let convex: any ConvexServiceProtocol
+    private let uploader: any ScreenshotUploading
+    private let networkMonitor: (any NetworkMonitoring)?
+
+    public init(
+        store: CaptureStore,
+        convex: any ConvexServiceProtocol,
+        uploader: any ScreenshotUploading = URLSessionScreenshotUploader(),
+        networkMonitor: (any NetworkMonitoring)? = nil
+    ) {
+        self.store = store
+        self.convex = convex
+        self.uploader = uploader
+        self.networkMonitor = networkMonitor
+    }
+
+    /// Attempts to drain every `queued`/`syncFailed` draft once, in
+    /// capture-order (oldest first). Does nothing (returns immediately) if
+    /// the network monitor reports offline. Each draft is fully independent:
+    /// one failing does not stop the others from being attempted.
+    ///
+    /// - Returns: clientIds that were successfully synced this pass.
+    @discardableResult
+    public func drainOnce() async -> [String] {
+        if let networkMonitor, await networkMonitor.isOnline == false {
+            return []
+        }
+
+        let drafts: [CaptureDraft]
+        do {
+            drafts = try store.drafts(in: [.queued, .syncFailed])
+        } catch {
+            return []
+        }
+
+        var synced: [String] = []
+        for draft in drafts {
+            do {
+                try store.updateLocalState(clientId: draft.clientId, to: .syncing)
+                let serverId = try await syncOne(draft)
+                try store.updateLocalState(clientId: draft.clientId, to: .synced, serverId: serverId, localError: nil)
+                synced.append(draft.clientId)
+            } catch {
+                _ = try? store.incrementLocalAttempt(clientId: draft.clientId)
+                _ = try? store.updateLocalState(
+                    clientId: draft.clientId,
+                    to: .syncFailed,
+                    localError: String(describing: error)
+                )
+            }
+        }
+        return synced
+    }
+
+    /// Uploads the screenshot (if any) then calls `captures.create`. Atomic
+    /// from the queue's point of view: if the upload throws, this whole
+    /// function throws before any mutation is attempted, so the draft is
+    /// left `queued`/`syncFailed` rather than partially synced (TECH-SPEC
+    /// §13 U5: "screenshot upload fails but mutation would succeed -> whole
+    /// capture stays queued").
+    private func syncOne(_ draft: CaptureDraft) async throws -> String {
+        var screenshotStorageId: String?
+
+        if let path = draft.screenshotPath, let data = store.screenshotData(atPath: path) {
+            let uploadUrl = try await convex.filesGenerateUploadUrl()
+            guard let url = URL(string: uploadUrl) else {
+                throw SyncEngineError.uploadFailed(statusCode: -1)
+            }
+            // If this throws, we return before calling capturesCreate —
+            // nothing has been mutated server-side, and the draft stays in
+            // the queue for the next drain attempt (same clientId reused).
+            screenshotStorageId = try await uploader.upload(data: data, to: url)
+        }
+
+        let input = CaptureCreateInput(
+            clientId: draft.clientId,
+            transcript: draft.transcript,
+            notes: draft.notes,
+            screenshotStorageId: screenshotStorageId,
+            projectId: draft.projectId,
+            projectName: draft.projectName,
+            agent: draft.agent,
+            model: draft.model,
+            capturedAt: draft.capturedAt
+        )
+        // The server dedupes on (userId, clientId) — TECH-SPEC §6 — so
+        // calling this again on a local retry with the same clientId is
+        // always safe and never creates a duplicate capture.
+        return try await convex.capturesCreate(input)
+    }
+
+    /// Convenience for a caller (e.g. app target) that wants to keep
+    /// draining forever as connectivity changes. Not required for tests;
+    /// tests call `drainOnce()` directly to keep assertions deterministic.
+    public func runForever() async {
+        guard let networkMonitor else {
+            _ = await drainOnce()
+            return
+        }
+        for await online in networkMonitor.pathUpdates() {
+            if online {
+                _ = await drainOnce()
+            }
+        }
+    }
+}

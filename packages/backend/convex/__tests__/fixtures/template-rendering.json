@@ -1,0 +1,91 @@
+[
+  {
+    "description": "all six variables substitute; screenshot present so the #if block renders",
+    "input": {
+      "template": "Captured {{captured_at_iso}} for {{project_name}} ({{workspace_name}}).\n\nTranscript: {{transcript}}\nNotes: {{notes}}\n{{#if screenshot_url}}Screenshot: {{screenshot_url}}{{/if}}",
+      "vars": {
+        "transcript": "add a dark mode toggle",
+        "notes": "top right of settings",
+        "screenshot_url": "https://example.convex.cloud/api/storage/abc123",
+        "captured_at_iso": "2026-07-04T18:30:00.000Z",
+        "project_name": "Whistle",
+        "workspace_name": "idea: add a dark mode toggle #a1b2c3"
+      }
+    },
+    "expected": "Captured 2026-07-04T18:30:00.000Z for Whistle (idea: add a dark mode toggle #a1b2c3).\n\nTranscript: add a dark mode toggle\nNotes: top right of settings\nScreenshot: https://example.convex.cloud/api/storage/abc123"
+  },
+  {
+    "description": "empty screenshot_url removes the #if block entirely",
+    "input": {
+      "template": "Notes: {{notes}}\n{{#if screenshot_url}}Screenshot: {{screenshot_url}}{{/if}}\nDone.",
+      "vars": {
+        "transcript": "",
+        "notes": "no screenshot this time",
+        "screenshot_url": "",
+        "captured_at_iso": "2026-07-04T18:30:00.000Z",
+        "project_name": "Whistle",
+        "workspace_name": "idea: no screenshot this time #d4e5f6"
+      }
+    },
+    "expected": "Notes: no screenshot this time\n\nDone."
+  },
+  {
+    "description": "literal {{ in user text (transcript/notes) passes through untouched",
+    "input": {
+      "template": "Transcript: {{transcript}}\nNotes: {{notes}}",
+      "vars": {
+        "transcript": "the config uses {{mustache}} syntax literally",
+        "notes": "don't render this: {{not_a_real_var}}",
+        "screenshot_url": "",
+        "captured_at_iso": "2026-07-04T18:30:00.000Z",
+        "project_name": "Whistle",
+        "workspace_name": "idea: mustache literal #112233"
+      }
+    },
+    "expected": "Transcript: the config uses {{mustache}} syntax literally\nNotes: don't render this: {{not_a_real_var}}"
+  },
+  {
+    "description": "missing var (not present in vars map) substitutes as empty string",
+    "input": {
+      "template": "Project: {{project_name}}\nModel hint: {{model}}\nEnd.",
+      "vars": {
+        "transcript": "",
+        "notes": "",
+        "screenshot_url": "",
+        "captured_at_iso": "2026-07-04T18:30:00.000Z",
+        "project_name": "Whistle"
+      }
+    },
+    "expected": "Project: Whistle\nModel hint: \nEnd."
+  },
+  {
+    "description": "empty transcript and notes substitute as empty strings, template unaffected otherwise",
+    "input": {
+      "template": "T:[{{transcript}}] N:[{{notes}}] P:[{{project_name}}]",
+      "vars": {
+        "transcript": "",
+        "notes": "",
+        "screenshot_url": "",
+        "captured_at_iso": "2026-07-04T18:30:00.000Z",
+        "project_name": "Whistle",
+        "workspace_name": "idea: screenshot capture 2026-07-04"
+      }
+    },
+    "expected": "T:[] N:[] P:[Whistle]"
+  },
+  {
+    "description": "screenshot_url present but #if block appears multiple times — each occurrence resolves independently",
+    "input": {
+      "template": "{{#if screenshot_url}}A:{{screenshot_url}}{{/if}} | {{#if screenshot_url}}B:{{screenshot_url}}{{/if}}",
+      "vars": {
+        "transcript": "",
+        "notes": "",
+        "screenshot_url": "https://example.convex.cloud/api/storage/xyz789",
+        "captured_at_iso": "2026-07-04T18:30:00.000Z",
+        "project_name": "Whistle",
+        "workspace_name": "idea: multiple if blocks #aabbcc"
+      }
+    },
+    "expected": "A:https://example.convex.cloud/api/storage/xyz789 | B:https://example.convex.cloud/api/storage/xyz789"
+  }
+]
