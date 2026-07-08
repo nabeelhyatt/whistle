@@ -1,4 +1,4 @@
-import { mutation } from "./_generated/server";
+import { internalQuery, mutation } from "./_generated/server";
 import { requireIdentity } from "./lib/auth";
 
 /**
@@ -27,5 +27,22 @@ export const ensure = mutation({
       email: identity.email ?? undefined,
       createdAt: Date.now(),
     });
+  },
+});
+
+/**
+ * Resolves the calling user's row (or null if unauthenticated / not yet
+ * `users.ensure`d), for use by actions in projects.ts and pipeline.ts which
+ * cannot call `requireUser` directly (it's a QueryCtx/MutationCtx helper).
+ */
+export const getSelfInternal = internalQuery({
+  args: {},
+  handler: async (ctx) => {
+    const identity = await ctx.auth.getUserIdentity();
+    if (identity === null) return null;
+    return await ctx.db
+      .query("users")
+      .withIndex("by_subject", (q) => q.eq("authSubject", identity.subject))
+      .unique();
   },
 });
