@@ -7,6 +7,7 @@
 // visible Scene of its own — everything is driven by the app delegate.
 
 import AppKit
+import Combine
 import SwiftUI
 import WhistleCore
 
@@ -30,6 +31,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var authController: AuthController?
     private var capturePanelController: CapturePanelController?
     private var captureStore: CaptureStore?
+    private var convexService: (any ConvexServiceProtocol)?
+    private var historyViewModel: HistoryViewModel?
+    private var historyWindowController: HistoryWindowController?
+    private var notificationService: NotificationService?
+    private var cancellables: Set<AnyCancellable> = []
 
     /// Convex deployment URL — read from Info.plist (`CONVEX_URL`, injected
     /// via xcconfig, see project.yml), never hardcoded. Falls back to the
@@ -43,6 +49,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         let authProvider = Self.makeAuthProvider()
         let convexService = Self.makeConvexService(authProvider: authProvider)
+        self.convexService = convexService
 
         let auth = AuthController(
             authProvider: authProvider,
@@ -53,18 +60,61 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         self.authController = auth
 
         let statusItem = StatusItemController(authController: auth)
-        statusItem.onHistoryRequested = { [weak self] in self?.showHistoryPlaceholder() }
         statusItem.onSettingsRequested = { [weak self] in self?.showSettingsPlaceholder() }
         statusItem.onCheckForUpdatesRequested = { [weak self] in self?.checkForUpdatesPlaceholder() }
         self.statusItemController = statusItem
 
         let store = Self.makeCaptureStore()
         self.captureStore = store
+
+        let notificationService = NotificationService()
+        self.notificationService = notificationService
+
+        let historyViewModel = HistoryViewModel(
+            store: store,
+            convex: convexService,
+            notificationService: notificationService,
+            lastSeenStore: Self.makeLastSeenStatusStore()
+        )
+        self.historyViewModel = historyViewModel
+        historyViewModel.start()
+
+        // Ready-indicator (TECH-SPEC §4.1 StatusItemController row): this
+        // unit computes the >=1-ready-and-unopened count from the same
+        // subscription HistoryViewModel drives, and pushes it onto the
+        // status item.
+        historyViewModel.$hasUnreadReadyCaptures
+            .receive(on: DispatchQueue.main)
+            .sink { [weak statusItem] hasUnread in
+                statusItem?.hasUnreadReadyCaptures = hasUnread
+            }
+            .store(in: &cancellables)
+
+        let historyWindow = HistoryWindowController(viewModel: historyViewModel)
+        self.historyWindowController = historyWindow
+
         let capturePanel = CapturePanelController(store: store)
-        capturePanel.onHistoryRequested = { [weak self] in self?.showHistoryPlaceholder() }
+        capturePanel.onHistoryRequested = { [weak self] in self?.showHistory() }
         capturePanel.onSettingsRequested = { [weak self] in self?.showSettingsPlaceholder() }
         capturePanel.registerHotkey()
         self.capturePanelController = capturePanel
+
+        historyWindow.onDuplicate = { [weak self, weak capturePanel] row in
+            guard let self else { return }
+            let screenshotData = self.resolveScreenshotData(for: row)
+            let preFill = historyViewModel.duplicatePreFill(for: row, screenshotData: screenshotData)
+            capturePanel?.trigger(preFill: preFill)
+        }
+
+        // Notification click routing (TECH-SPEC §4.1 NotificationService row):
+        // ready/readyUnverified -> open deep link (marks opened); failed/auth
+        // -> Settings placeholder (U10 wires the real window); failed other
+        // -> captures.retry.
+        notificationService.onRoute = { [weak self] route in
+            self?.handleNotificationRoute(route)
+        }
+
+        statusItem.onHistoryRequested = { [weak self] in self?.showHistory() }
 
         // Left-click starts capture immediately (PRD F1.1) -- replaces
         // U6's placeholder no-op.
@@ -86,12 +136,45 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         false
     }
 
-    // MARK: - Placeholders (fully wired in later units: U9 History, U6/U8
-    // Settings, U11 Sparkle updater)
+    // MARK: - History
 
-    private func showHistoryPlaceholder() {
-        NSLog("Whistle: History window requested (wired in U9)")
+    private func showHistory() {
+        historyWindowController?.show()
     }
+
+    /// Resolves screenshot bytes for "Duplicate as new capture" (PRD F3.6):
+    /// local-only rows read straight from `CaptureStore`'s temp file; server-
+    /// synced rows have no local file, so this unit intentionally leaves
+    /// screenshot duplication as a text/notes-only pre-fill for server rows
+    /// (screenshot re-fetch over HTTP is not implemented in this unit -- the
+    /// pre-fill still works correctly for transcript/notes/project, which is
+    /// the documented recovery scenario, PRD F3.6).
+    private func resolveScreenshotData(for row: HistoryRowViewModel) -> Data? {
+        guard let store = captureStore, row.serverRecord == nil else { return nil }
+        guard let draft = try? store.draft(clientId: row.clientId), let path = draft.screenshotPath else { return nil }
+        return store.screenshotData(atPath: path)
+    }
+
+    // MARK: - Notification routing
+
+    private func handleNotificationRoute(_ route: NotificationRoute) {
+        guard let historyViewModel else { return }
+        switch route {
+        case .openDeepLink(let recordId):
+            guard let row = historyViewModel.rows.first(where: { $0.serverRecord?.id == recordId }) else { return }
+            historyViewModel.openDeepLink(for: row)
+        case .openSettingsApiKeyPlaceholder:
+            // SettingsWindow itself is U10 -- this is a clearly-marked
+            // placeholder action until then.
+            showSettingsPlaceholder()
+        case .retry(let recordId):
+            guard let row = historyViewModel.rows.first(where: { $0.serverRecord?.id == recordId }) else { return }
+            historyViewModel.retry(row)
+        }
+    }
+
+    // MARK: - Placeholders (fully wired in later units: U6/U8 Settings,
+    // U11 Sparkle updater)
 
     private func showSettingsPlaceholder() {
         NSLog("Whistle: Settings window requested (wired in U6/U8 settings unit)")
@@ -142,6 +225,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return (try? CaptureStore(path: nil, screenshotsDirectory: screenshotsDir))
                 ?? Self.fatalCaptureStoreFallback()
         }
+    }
+
+    /// On-disk "last-seen server status per clientId" (plan U9: dedup
+    /// notifications across relaunch). Lives alongside the real
+    /// `CaptureStore` database under Application Support; falls back to an
+    /// in-memory store (relaunch dedup degrades, but the app never crashes)
+    /// if that directory is somehow unavailable.
+    private static func makeLastSeenStatusStore() -> LastSeenStatusStore {
+        let fileManager = FileManager.default
+        guard let appSupport = try? fileManager.url(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask,
+            appropriateFor: nil,
+            create: true
+        ) else {
+            return InMemoryLastSeenStatusStore()
+        }
+        let whistleDir = appSupport.appendingPathComponent("Whistle", isDirectory: true)
+        try? fileManager.createDirectory(at: whistleDir, withIntermediateDirectories: true)
+        let fileURL = whistleDir.appendingPathComponent("last-seen-status.json")
+        return FileLastSeenStatusStore(fileURL: fileURL)
     }
 
     private static func fatalCaptureStoreFallback() -> CaptureStore {
