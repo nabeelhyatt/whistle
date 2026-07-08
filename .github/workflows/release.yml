@@ -1,0 +1,171 @@
+# release.yml — tag-triggered signed release (U11, TECH-SPEC §10).
+#
+# Builds the Whistle app, signs, notarizes, packages a DMG, generates a
+# Sparkle appcast entry, and uploads everything to a GitHub Release.
+#
+# EVERY credentialed step is ENV-GATED (TECH-SPEC §10): it checks its
+# secret first and skips with a logged reason when absent. The repo
+# currently has ZERO Actions secrets, so an un-provisioned run produces an
+# ad-hoc-signed, un-notarized DMG (not distributable) and an unsigned
+# appcast item — the workflow itself still succeeds. Provision the secrets
+# in SECRETS.md to get a full signed/notarized/published release.
+#
+# Required secrets for a FULL release (see SECRETS.md for provisioning):
+#   DEVELOPER_ID_P12_BASE64   Developer ID Application cert, base64 .p12
+#   DEVELOPER_ID_P12_PASSWORD password for the .p12
+#   NOTARY_KEY_ID             App Store Connect API key ID
+#   NOTARY_ISSUER_ID          App Store Connect issuer ID
+#   NOTARY_KEY_P8_BASE64      ASC API private key (.p8), base64
+#   SPARKLE_ED_PRIVATE_KEY    Sparkle EdDSA private key (generate_keys -x)
+#
+# Versioning: the DMG version comes from MARKETING_VERSION in
+# apps/macos/project.yml — bump it in the same change that creates the
+# `v*` tag (the appcast step asserts they match).
+
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write # create the GitHub Release + upload assets
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Build, sign, notarize, publish
+    runs-on: macos-26
+    env:
+      DEVELOPER_DIR: /Applications/Xcode.app/Contents/Developer
+      HAS_SIGNING: ${{ secrets.DEVELOPER_ID_P12_BASE64 != '' && secrets.DEVELOPER_ID_P12_PASSWORD != '' }}
+      HAS_NOTARY: ${{ secrets.NOTARY_KEY_ID != '' && secrets.NOTARY_ISSUER_ID != '' && secrets.NOTARY_KEY_P8_BASE64 != '' }}
+      HAS_SPARKLE_KEY: ${{ secrets.SPARKLE_ED_PRIVATE_KEY != '' }}
+      SPARKLE_VERSION: 2.9.4 # keep in lockstep with project.yml's pin
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install xcodegen
+        run: brew install xcodegen
+
+      # ---- Codesigning cert (env-gated) ----------------------------------
+      - name: Import Developer ID certificate
+        if: env.HAS_SIGNING == 'true'
+        env:
+          P12_BASE64: ${{ secrets.DEVELOPER_ID_P12_BASE64 }}
+          P12_PASSWORD: ${{ secrets.DEVELOPER_ID_P12_PASSWORD }}
+        run: |
+          set -euo pipefail
+          KEYCHAIN_PATH="$RUNNER_TEMP/whistle-release.keychain-db"
+          KEYCHAIN_PASSWORD="$(uuidgen)"
+          echo "$P12_BASE64" | base64 --decode > "$RUNNER_TEMP/developer_id.p12"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security import "$RUNNER_TEMP/developer_id.p12" \
+            -k "$KEYCHAIN_PATH" -P "$P12_PASSWORD" \
+            -T /usr/bin/codesign -T /usr/bin/security
+          security set-key-partition-list -S apple-tool:,apple: \
+            -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security list-keychains -d user -s "$KEYCHAIN_PATH" login.keychain-db
+          rm -f "$RUNNER_TEMP/developer_id.p12"
+
+      - name: Skip cert import (no signing secrets)
+        if: env.HAS_SIGNING != 'true'
+        run: echo "SKIP Developer ID cert import — DEVELOPER_ID_P12_BASE64 / DEVELOPER_ID_P12_PASSWORD not provisioned (see SECRETS.md). Build will be ad-hoc signed."
+
+      # ---- Notary key (env-gated) -----------------------------------------
+      - name: Materialize notary API key
+        if: env.HAS_NOTARY == 'true'
+        env:
+          P8_BASE64: ${{ secrets.NOTARY_KEY_P8_BASE64 }}
+        run: |
+          set -euo pipefail
+          echo "$P8_BASE64" | base64 --decode > "$RUNNER_TEMP/notary_key.p8"
+          {
+            echo "NOTARY_KEY_PATH=$RUNNER_TEMP/notary_key.p8"
+            echo "NOTARY_KEY_ID=${{ secrets.NOTARY_KEY_ID }}"
+            echo "NOTARY_ISSUER_ID=${{ secrets.NOTARY_ISSUER_ID }}"
+          } >> "$GITHUB_ENV"
+
+      - name: Skip notary setup (no notary secrets)
+        if: env.HAS_NOTARY != 'true'
+        run: echo "SKIP notarization setup — NOTARY_KEY_ID / NOTARY_ISSUER_ID / NOTARY_KEY_P8_BASE64 not provisioned (see SECRETS.md)."
+
+      # ---- Build / sign / DMG / notarize ----------------------------------
+      # package-dmg.sh env-gates internally: it falls back to ad-hoc signing
+      # when no Developer ID identity is in the keychain and skips
+      # notarization when NOTARY_* are unset.
+      - name: Package DMG
+        run: ./apps/macos/Scripts/package-dmg.sh
+
+      - name: Locate artifact
+        id: artifact
+        run: |
+          set -euo pipefail
+          DMG="$(ls apps/macos/dist/Whistle-*.dmg)"
+          VERSION="$(basename "$DMG" .dmg | sed 's/^Whistle-//')"
+          TAG="${GITHUB_REF_NAME#v}"
+          if [[ "$VERSION" != "$TAG" ]]; then
+            echo "ERROR: tag v$TAG does not match MARKETING_VERSION $VERSION (bump apps/macos/project.yml)" >&2
+            exit 1
+          fi
+          echo "dmg=$DMG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      # ---- Sparkle appcast entry (env-gated) -------------------------------
+      - name: Sign update & generate appcast item
+        if: env.HAS_SPARKLE_KEY == 'true'
+        env:
+          SPARKLE_ED_PRIVATE_KEY: ${{ secrets.SPARKLE_ED_PRIVATE_KEY }}
+          DMG: ${{ steps.artifact.outputs.dmg }}
+          VERSION: ${{ steps.artifact.outputs.version }}
+        run: |
+          set -euo pipefail
+          curl -sL -o "$RUNNER_TEMP/sparkle.tar.xz" \
+            "https://github.com/sparkle-project/Sparkle/releases/download/${SPARKLE_VERSION}/Sparkle-${SPARKLE_VERSION}.tar.xz"
+          mkdir -p "$RUNNER_TEMP/sparkle"
+          tar -xf "$RUNNER_TEMP/sparkle.tar.xz" -C "$RUNNER_TEMP/sparkle"
+          printf '%s' "$SPARKLE_ED_PRIVATE_KEY" > "$RUNNER_TEMP/sparkle_ed_key"
+          SIGNATURE_ATTRS="$("$RUNNER_TEMP/sparkle/bin/sign_update" -f "$RUNNER_TEMP/sparkle_ed_key" "$DMG")"
+          rm -f "$RUNNER_TEMP/sparkle_ed_key"
+          SIZE="$(stat -f%z "$DMG")"
+          BUILD_NUMBER="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' \
+            apps/macos/dist/DerivedData/Build/Products/Release/Whistle.app/Contents/Info.plist)"
+          cat > apps/macos/dist/appcast-item.xml <<ITEM
+          <item>
+            <title>Version ${VERSION}</title>
+            <pubDate>$(date -R)</pubDate>
+            <sparkle:version>${BUILD_NUMBER}</sparkle:version>
+            <sparkle:shortVersionString>${VERSION}</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+            <enclosure
+              url="https://github.com/${GITHUB_REPOSITORY}/releases/download/v${VERSION}/$(basename "$DMG")"
+              ${SIGNATURE_ATTRS}
+              length="${SIZE}"
+              type="application/octet-stream" />
+          </item>
+          ITEM
+          echo "Appcast item written to apps/macos/dist/appcast-item.xml —"
+          echo "merge it into apps/web/public/appcast.xml and deploy the web app to publish the update."
+
+      - name: Skip appcast signing (no Sparkle key)
+        if: env.HAS_SPARKLE_KEY != 'true'
+        run: echo "SKIP Sparkle appcast entry — SPARKLE_ED_PRIVATE_KEY not provisioned (see SECRETS.md). Update cannot be offered to existing installs without it."
+
+      # ---- Publish -----------------------------------------------------------
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DMG: ${{ steps.artifact.outputs.dmg }}
+        run: |
+          set -euo pipefail
+          ASSETS=("$DMG")
+          [[ -f apps/macos/dist/appcast-item.xml ]] && ASSETS+=(apps/macos/dist/appcast-item.xml)
+          gh release create "$GITHUB_REF_NAME" \
+            --title "Whistle $GITHUB_REF_NAME" \
+            --generate-notes \
+            "${ASSETS[@]}"

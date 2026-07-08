@@ -59,6 +59,15 @@ packages:
   Auth0:
     url: https://github.com/auth0/Auth0.swift
     exactVersion: 2.24.1
+  # Sparkle 2 — software update framework (TECH-SPEC §10, plan U11).
+  # 2.9.4 is the latest tagged GitHub release as of this integration
+  # (checked via `gh api repos/sparkle-project/Sparkle/releases/latest`);
+  # pinned exact per the U5 pinning convention this plan applies to all
+  # beta/young SPM deps (Sparkle 2 is stable/1.0+, but pinning exact keeps
+  # the build reproducible regardless).
+  Sparkle:
+    url: https://github.com/sparkle-project/Sparkle
+    exactVersion: 2.9.4
 
 targets:
   Whistle:
@@ -92,6 +101,7 @@ targets:
       - package: WhistleCore
       - package: KeyboardShortcuts
       - package: Auth0
+      - package: Sparkle
       # System frameworks used by the U7 capture services
       # (ScreenshotService, TranscriptionService/LegacySpeechTranscriber/
       # SpeechAnalyzerTranscriber, AudioEngineTap). Linked explicitly

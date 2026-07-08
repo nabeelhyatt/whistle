@@ -8,6 +8,7 @@
 
 import AppKit
 import Combine
+import Sparkle
 import SwiftUI
 import WhistleCore
 
@@ -39,6 +40,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var onboardingWindowController: OnboardingWindowController?
     private var cancellables: Set<AnyCancellable> = []
 
+    /// Sparkle 2 auto-updater (U11, TECH-SPEC §10). The standard updater
+    /// controller drives scheduled background checks (SUScheduledCheckInterval
+    /// in Info.plist) and the user-initiated "Check for Updates…" menu item.
+    /// Feed URL + EdDSA public key come from Info.plist (SUFeedURL /
+    /// SUPublicEDKey, injected via Config/Sparkle.xcconfig). `startingUpdater:
+    /// true` is safe even though the feed URL is a placeholder domain — a
+    /// failed feed fetch is a silent no-op for scheduled checks and a normal
+    /// error sheet for manual ones.
+    private var updaterController: SPUStandardUpdaterController?
+
     /// Convex deployment URL — read from Info.plist (`CONVEX_URL`, injected
     /// via xcconfig, see project.yml), never hardcoded. Falls back to the
     /// known grandiose-alpaca-243 deployment as a hardcoded emergency
@@ -48,6 +59,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
+
+        // Env-gated crash reporting (TECH-SPEC §10): clean no-op until
+        // SENTRY_DSN is provisioned — see CrashReporting.swift / SECRETS.md.
+        CrashReporting.configure()
 
         let authProvider = Self.makeAuthProvider()
         let convexService = Self.makeConvexService(authProvider: authProvider)
@@ -61,9 +76,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         )
         self.authController = auth
 
+        let updaterController = SPUStandardUpdaterController(
+            startingUpdater: true,
+            updaterDelegate: nil,
+            userDriverDelegate: nil
+        )
+        self.updaterController = updaterController
+
         let statusItem = StatusItemController(authController: auth)
         statusItem.onSettingsRequested = { [weak self] in self?.showSettings() }
-        statusItem.onCheckForUpdatesRequested = { [weak self] in self?.checkForUpdatesPlaceholder() }
+        // Real Sparkle updater (U11) — replaces the U6 placeholder that only
+        // logged the request.
+        statusItem.onCheckForUpdatesRequested = { [weak updaterController] in
+            updaterController?.checkForUpdates(nil)
+        }
         self.statusItemController = statusItem
 
         let store = Self.makeCaptureStore()
@@ -224,12 +250,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             settingsWindowController = SettingsWindowController(viewModel: viewModel)
         }
         settingsWindowController?.show(section: section)
-    }
-
-    // MARK: - Placeholders (fully wired in later units: U11 Sparkle updater)
-
-    private func checkForUpdatesPlaceholder() {
-        NSLog("Whistle: Check for Updates requested (wired in U11 via Sparkle)")
     }
 
     // MARK: - Wiring

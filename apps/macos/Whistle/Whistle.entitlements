@@ -8,5 +8,31 @@
 	<true/>
 	<key>com.apple.security.network.client</key>
 	<true/>
+	<!--
+	Sparkle 2 sandboxing (TECH-SPEC §10, plan U11): the app stays sandboxed
+	(app-sandbox above is NOT disabled) and uses Sparkle's Installer XPC
+	Service, which is bundled prebuilt inside Sparkle.framework's
+	XPCServices/ directory when Sparkle is consumed via SPM/binary
+	distribution — no custom Installer.xpc/Downloader.xpc Xcode targets are
+	needed for this path (per sparkle-project.org/documentation/sandboxing/
+	and github.com/sparkle-project/Sparkle/discussions/2270). The mach-lookup
+	temporary exceptions below are what let the sandboxed app talk to that
+	bundled installer service; SUEnableInstallerLauncherService=YES in
+	Info.plist is the corresponding app-side switch.
+
+	We deliberately do NOT enable Sparkle's Downloader XPC Service
+	(SUEnableDownloaderService) or attempt to sandbox it: that requires
+	building Sparkle from source and editing its own ConfigCommon.xcconfig
+	(DOWNLOADER_SANDBOXED_ENTITLEMENTS / XPC_SERVICE_BUNDLE_ID_PREFIX), which
+	is unnecessary here — Downloader sandboxing only matters for apps that
+	lack the network client entitlement, and this app already has
+	com.apple.security.network.client above, so Sparkle's update-file
+	download rides on the app's own sandboxed network access instead.
+	-->
+	<key>com.apple.security.temporary-exception.mach-lookup.global-name</key>
+	<array>
+		<string>$(PRODUCT_BUNDLE_IDENTIFIER)-spks</string>
+		<string>$(PRODUCT_BUNDLE_IDENTIFIER)-spki</string>
+	</array>
 </dict>
 </plist>

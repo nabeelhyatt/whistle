@@ -45,3 +45,6 @@ next-env.d.ts
 .swiftpm/
 *.xcodeproj
 xcuserdata/
+
+# macOS app packaging output (apps/macos/Scripts/package-dmg.sh, U11)
+apps/macos/dist/

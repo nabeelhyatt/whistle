@@ -6,4 +6,9 @@
 // hardcoded" convention so switching deployments (e.g. a future prod vs.
 // dev split) never requires a source-code change.
 
-CONVEX_URL = https://grandiose-alpaca-243.convex.cloud
+// NOTE: `//` begins a comment ANYWHERE in an xcconfig line, so a literal
+// URL here silently truncated to `https:` (caught during U11 packaging
+// verification — the built Info.plist carried CONVEX_URL="https:" and the
+// app fell through to its hardcoded fallback). The empty substitution
+// `$()` splits the two slashes without changing the resolved value.
+CONVEX_URL = https:/$()/grandiose-alpaca-243.convex.cloud

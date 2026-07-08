@@ -6,3 +6,4 @@
 
 #include "Auth0.xcconfig"
 #include "Convex.xcconfig"
+#include "Sparkle.xcconfig"
