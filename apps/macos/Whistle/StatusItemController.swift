@@ -20,6 +20,7 @@ import WhistleCore
 public final class StatusItemController: NSObject {
     private let statusItem: NSStatusItem
     private let authController: AuthController
+    private let readyBadge = NSView()
 
     /// Placeholder for the left-click capture action. Fully wired to
     /// `CapturePanelController` in U8; here it's a no-op-by-default hook so
@@ -35,7 +36,7 @@ public final class StatusItemController: NSObject {
     /// exists (U9); exposed here so that unit can set it without this
     /// controller depending on ConvexService directly.
     public var hasUnreadReadyCaptures: Bool = false {
-        didSet { updateIcon() }
+        didSet { updateReadyBadge() }
     }
 
     public init(authController: AuthController) {
@@ -49,19 +50,38 @@ public final class StatusItemController: NSObject {
 
     private func configureButton() {
         guard let button = statusItem.button else { return }
-        button.image = NSImage(
-            systemSymbolName: "mic.circle",
-            accessibilityDescription: "Whistle"
-        )
+        let icon = NSImage(named: "MenuBarIcon")
+        icon?.isTemplate = true
+        button.image = icon
+        button.toolTip = "Whistle"
         button.target = self
         button.action = #selector(statusItemClicked(_:))
         button.sendAction(on: [.leftMouseUp, .rightMouseUp])
+        configureReadyBadge(in: button)
     }
 
-    private func updateIcon() {
-        guard let button = statusItem.button else { return }
-        let symbolName = hasUnreadReadyCaptures ? "mic.circle.fill" : "mic.circle"
-        button.image = NSImage(systemSymbolName: symbolName, accessibilityDescription: "Whistle")
+    /// Small fixed-color dot overlaid on the (template, auto light/dark
+    /// adapting) menu bar icon to signal an unread ready capture -- a
+    /// template image can't carry its own color, so the "ready" state is a
+    /// separate always-yellow subview rather than a recolored icon.
+    private func configureReadyBadge(in button: NSStatusBarButton) {
+        let diameter: CGFloat = 6
+        readyBadge.wantsLayer = true
+        readyBadge.layer?.backgroundColor = NSColor(srgbRed: 0xF1 / 255, green: 0xB4 / 255, blue: 0x18 / 255, alpha: 1).cgColor
+        readyBadge.layer?.cornerRadius = diameter / 2
+        readyBadge.isHidden = true
+        readyBadge.translatesAutoresizingMaskIntoConstraints = false
+        button.addSubview(readyBadge)
+        NSLayoutConstraint.activate([
+            readyBadge.widthAnchor.constraint(equalToConstant: diameter),
+            readyBadge.heightAnchor.constraint(equalToConstant: diameter),
+            readyBadge.trailingAnchor.constraint(equalTo: button.trailingAnchor, constant: -1),
+            readyBadge.bottomAnchor.constraint(equalTo: button.bottomAnchor, constant: -2)
+        ])
+    }
+
+    private func updateReadyBadge() {
+        readyBadge.isHidden = !hasUnreadReadyCaptures
     }
 
     // MARK: - Click routing
