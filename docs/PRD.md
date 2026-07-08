@@ -9,7 +9,7 @@ date: 2026-07-04
 
 ## Summary
 
-Whistle is a macOS menu bar app that turns a fleeting product idea into a researched PRD waiting in a Conductor workspace. One keystroke opens a capture panel with the mic already hot and a screenshot already taken; you speak and/or type for a few seconds, hit ⏎, and go back to your day. In the background, Whistle creates a Conductor cloud workspace against the relevant repo and hands the agent everything you captured plus an embedded planning prompt. The next time you open Conductor, there's a workspace with a draft PRD, codebase research already done, and 3–5 clarifying questions waiting for you.
+Whistle is a macOS menu bar app that turns a fleeting product idea into a researched plan waiting in a Conductor workspace. One keystroke opens a capture panel with the mic already hot and a screenshot already taken; you speak and/or type for a few seconds, hit ⏎, and go back to your day. In the background, Whistle creates a Conductor cloud workspace against the relevant repo and hands the agent everything you captured plus an embedded planning prompt. The next time you open Conductor, there's a workspace with a draft plan, codebase research already done, and 3–5 clarifying questions waiting for you.
 
 ## Problem Frame
 
@@ -31,7 +31,7 @@ Whistle collapses "I should write this up later" into "it's already being writte
    - A small panel drops down anchored beneath the menu bar icon: live transcript (editable), a typed-notes field, the screenshot thumbnail (removable), a project picker (defaults to last-used), and a slim header with two small icons — History and Settings — for everything that isn't capturing.
 3. **Submit** — ⏎ (or ⌘⏎ from the notes field). Panel dismisses immediately. Total interaction target: under 15 seconds.
 4. **Background pipeline** — capture syncs to the backend; the backend uploads context, creates the Conductor workspace, and sends the planning prompt. Laptop can sleep; the pipeline is server-side.
-5. **Ready** — When the agent finishes its first pass, Whistle shows a macOS notification: *"PRD draft ready: 'concierge search latency' — 4 questions waiting."* Clicking it opens the workspace via Conductor deep link.
+5. **Ready** — When the agent finishes its first pass, Whistle shows a macOS notification: *"Plan draft ready: 'concierge search latency' — 4 questions waiting."* Clicking it opens the workspace via Conductor deep link and marks the capture opened (see Success metrics).
 6. **Review** — The History window (reached from the capture panel's history icon or the right-click menu) shows every capture with status and a one-click jump into the Conductor workspace.
 
 ## Requirements
@@ -50,23 +50,25 @@ Whistle collapses "I should write this up later" into "it's already being writte
 - F2.1 On submit, the capture (transcript + notes + screenshot + project + timestamp) is persisted to Convex; the Conductor submission runs **server-side** (Convex actions), so it survives lid-close.
 - F2.2 Screenshot is stored in Convex file storage; its URL is embedded in the prompt with instructions for the agent to download and view it.
 - F2.3 Workspace is created via `POST /v0/workspaces` with the chosen project, `agent: "claude"`, and a name derived from the capture (first ~6 meaningful words).
-- F2.4 The planning prompt (see `docs/PROMPT-TEMPLATE.md`) is sent to the workspace's initial session. The prompt instructs the agent to research the codebase, write a PRD/plan document, **not** implement code, and end with 3–5 clarifying questions.
+- F2.4 The planning prompt (see `docs/PROMPT-TEMPLATE.md`) is sent to the workspace's initial session. The prompt instructs the agent to research the codebase, write a plan document, **not** implement code, and end with 3–5 clarifying questions.
 - F2.5 Pipeline retries transient failures (exponential backoff, ≥5 attempts over ~30 min) and surfaces terminal failures in history with a "Retry" affordance.
 - F2.6 After the message is sent, the backend polls session status; when the agent goes `idle`, it fetches the final agent message, extracts the clarifying questions, and stores them on the capture record.
 
 ### History (F3)
 - F3.1 The History window leads with the most recent captures and shows a status chip per capture: *Waiting for network / Queued → Creating workspace → Agent working → Ready / Sent–status unknown / Failed*. (Exact mapping of local + server states to chips: Tech Spec §4.4.) Status changes in-flight are otherwise communicated by notifications (F4), not a persistent menu.
-- F3.2 Each item deep-links into its Conductor workspace (`deepLink` from the API).
+- F3.2 Each item deep-links into its Conductor workspace (`deepLink` from the API). Opening a deep link marks the capture *opened* (see Success metrics).
 - F3.3 The history window shows, per capture: transcript, notes, screenshot preview, status, timestamps, the agent's clarifying questions, and workspace link. Searchable.
 - F3.4 History syncs via Convex (source of truth) and is available offline from local cache.
+- F3.5 Opened captures are visually de-emphasized in History; each row offers an archive/dismiss affordance that removes it from the default view (not a delete — archived captures remain reachable via a filter). The menu bar icon shows a ready-indicator (dot/badge) whenever ≥1 capture is *Ready* and unopened, clearing as soon as none remain.
+- F3.6 **Duplicate as new capture**: any History row can be re-opened as a fresh capture — transcript, notes, and screenshot pre-filled into a new capture panel with the project picker focused — so a capture sent to the wrong project, or one whose content came out garbled, can be corrected without retyping. This creates an entirely new capture (new workspace); it does not edit or resubmit the original.
 
 ### Notifications (F4)
-- F4.1 Local notification when a capture reaches *Ready* (agent idle, PRD drafted), including the count of clarifying questions when available.
+- F4.1 Local notification when a capture reaches *Ready* (agent idle, plan drafted), including the count of clarifying questions when available.
 - F4.2 Local notification on terminal failure with the reason and a retry action.
 
 ### Onboarding & settings (F5)
-- F5.1 First-run wizard: (1) sign in, (2) paste Conductor API key with a link to `app.conductor.build/users/api-keys` and inline validation via `GET /v0/projects`, (3) grant permissions — mic, speech recognition, screen recording — each with an explainer screen and live status (screen recording requires a trip to System Settings; detect and guide), (4) choose default project, (5) set hotkey, (6) guided test capture.
-- F5.2 Settings: hotkey, default project, agent (`claude`/`codex`/`cursor`), model override, screenshot on/off default, edit prompt template (with "reset to default"), account/sign-out, API key management (masked, replaceable).
+- F5.1 First-run wizard, reordered for time-to-first-value: (1) sign in; (2) **one combined** permission screen for mic + speech recognition, with a live status row per permission (not a separate explainer screen each); (3) paste Conductor API key with a link to `app.conductor.build/users/api-keys` and inline validation via `GET /v0/projects`; (4) default project — chosen automatically, with no step shown, when the account has exactly one project; (5) guided test capture, with a one-line "Your hotkey is ⌥⇧W — change" affordance rather than a dedicated hotkey step; (6) **screen recording is offered after the first successful test capture**, as an upsell ("Add screenshots to future captures"), not a blocking wizard step — capture already degrades gracefully without it (see Error & edge states), and requiring a System Settings round-trip before any value lands would jeopardize the 5-minute activation target. Wizard progress persists across app relaunch (the screen-recording grant, like screen-recording changes generally, can require the app to relaunch).
+- F5.2 Settings: hotkey, default project, agent (`claude`/`codex`/`cursor`), model override, screenshot on/off default, edit prompt template (with "reset to default" and a lint warning when the template's "How to end" section is missing, since clarifying-question extraction depends on it), account/sign-out, API key management (masked, replaceable).
 - F5.3 Prompt template is user-editable text with documented `{{variables}}`; stored per-user in the backend so it follows the user to future clients (iOS).
 
 ### Product/distribution (F6)
@@ -110,6 +112,7 @@ Whistle collapses "I should write this up later" into "it's already being writte
 | Empty capture (no speech, no text) | Submit disabled. Screenshot-only submits allowed (screenshot + auto-note "screenshot-only capture"). |
 | Very long dictation (>5 min) | Soft cap with gentle UI hint; transcript preserved, capture still submits. |
 | Duplicate hotkey press while panel open | Focuses existing panel; does not re-screenshot. |
+| Submitted to wrong project / garbled content | Duplicate as new capture from History (F3.6): pre-fills a fresh capture panel with the project picker focused, so it can be corrected and resent without retyping. |
 
 ## Privacy & trust
 
@@ -123,13 +126,13 @@ Whistle collapses "I should write this up later" into "it's already being writte
 - Time-to-dismiss: median trigger→submit under 15 s.
 - Capture reliability: >99% of submitted captures reach *Ready* or a surfaced, retryable failure.
 - Activation: a new user completes onboarding and a real capture in under 5 minutes.
-- The metric that matters: % of captures whose Conductor workspace the user actually opens within 48 h (target >60%).
+- The metric that matters: % of captures whose Conductor workspace the user actually opens within 48 h (target >60%). Instrumented directly via `openedAt` (patched when the user opens a capture's deep link from Whistle, F3.2/F3.5) — this is now a measurable query against the captures table, not an inferred figure.
 
 ## Phased delivery
 
-- **Phase 0** — Repo restructure to monorepo; two de-risking proofs before real building: (1) end-to-end "hello workspace" script against the real Conductor API, (2) Auth0 + convex-swift login spike in a sandboxed Developer-ID macOS app; then Convex project + auth + schema.
+- **Phase 0** — Repo restructure to monorepo; a de-risking proof before real building: an end-to-end "hello workspace" script against the real Conductor API; then Convex project + auth (mock-first — see Tech Spec §2a/§9) + schema. Real Auth0 tenant provisioning and login verification happen after the build, not as a gating spike.
 - **Phase 1 (v1.0)** — Everything in F1–F6.
-- **Phase 1.1** — Clarifying-questions extraction polish, prompt template editor UX, multi-display option, per-capture agent/model override.
+- **Phase 1.1** — Clarifying-questions extraction polish, prompt template editor UX, multi-display option, per-capture agent/model override, archive workspace from History (Conductor archive endpoint), daily rollup notification for unopened ready captures.
 - **Phase 2 (v2)** — iOS: share-extension + Action-button capture (photo/screenshot from share sheet instead of screen capture), same backend/pipeline/history untouched.
 
 ## Open questions (deferred to implementation)
