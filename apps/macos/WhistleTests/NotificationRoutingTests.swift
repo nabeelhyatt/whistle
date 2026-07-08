@@ -262,12 +262,12 @@ final class NotificationRoutingTests: XCTestCase {
 
         var settingsRouteFired = false
         notificationService.onRoute = { route in
-            if case .openSettingsApiKeyPlaceholder = route {
+            if case .openSettingsApiKey = route {
                 settingsRouteFired = true
             }
         }
         let route = NotificationService.decodeRoute(from: fakeCenter.posted[0].userInfo)
-        XCTAssertEqual(route, .openSettingsApiKeyPlaceholder)
+        XCTAssertEqual(route, .openSettingsApiKey)
         notificationService.onRoute(route!)
         XCTAssertTrue(settingsRouteFired)
     }

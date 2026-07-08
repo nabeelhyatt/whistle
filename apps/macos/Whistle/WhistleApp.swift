@@ -35,6 +35,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var historyViewModel: HistoryViewModel?
     private var historyWindowController: HistoryWindowController?
     private var notificationService: NotificationService?
+    private var settingsWindowController: SettingsWindowController?
+    private var onboardingWindowController: OnboardingWindowController?
     private var cancellables: Set<AnyCancellable> = []
 
     /// Convex deployment URL — read from Info.plist (`CONVEX_URL`, injected
@@ -60,7 +62,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         self.authController = auth
 
         let statusItem = StatusItemController(authController: auth)
-        statusItem.onSettingsRequested = { [weak self] in self?.showSettingsPlaceholder() }
+        statusItem.onSettingsRequested = { [weak self] in self?.showSettings() }
         statusItem.onCheckForUpdatesRequested = { [weak self] in self?.checkForUpdatesPlaceholder() }
         self.statusItemController = statusItem
 
@@ -95,7 +97,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         let capturePanel = CapturePanelController(store: store)
         capturePanel.onHistoryRequested = { [weak self] in self?.showHistory() }
-        capturePanel.onSettingsRequested = { [weak self] in self?.showSettingsPlaceholder() }
+        capturePanel.onSettingsRequested = { [weak self] in self?.showSettings() }
         capturePanel.registerHotkey()
         self.capturePanelController = capturePanel
 
@@ -108,10 +110,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Notification click routing (TECH-SPEC §4.1 NotificationService row):
         // ready/readyUnverified -> open deep link (marks opened); failed/auth
-        // -> Settings placeholder (U10 wires the real window); failed other
+        // -> Settings -> API key (the real window, U10); failed other
         // -> captures.retry.
         notificationService.onRoute = { [weak self] route in
             self?.handleNotificationRoute(route)
+        }
+
+        historyWindow.onOpenSettings = { [weak self] in
+            self?.showSettings(section: .apiKey)
         }
 
         statusItem.onHistoryRequested = { [weak self] in self?.showHistory() }
@@ -126,7 +132,43 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         Task {
             await auth.resolveInitialState()
+            self.showOnboardingIfNeeded()
         }
+    }
+
+    // MARK: - Onboarding (U10: wizard on first run only; resumes mid-flow
+    // after a relaunch, e.g. the screen-recording grant's relaunch)
+
+    private func showOnboardingIfNeeded() {
+        guard let auth = authController, let convexService, let capturePanelController else { return }
+
+        let stateStore = UserDefaultsOnboardingStateStore()
+        guard !stateStore.load().completed else { return }
+
+        let viewModel = OnboardingViewModel(
+            auth: auth,
+            convex: convexService,
+            permissions: .system(),
+            screenRecording: .system(),
+            stateStore: stateStore
+        )
+        viewModel.onTriggerTestCapture = { [weak capturePanelController] in
+            capturePanelController?.trigger()
+        }
+        viewModel.onOpenSettings = { [weak self] in
+            self?.showSettings()
+        }
+
+        // The guided test capture goes through the REAL capture panel; its
+        // submit callback is what advances the wizard to the screenshot
+        // upsell (PRD F5.1 step 5 -> 6).
+        capturePanelController.onCaptureSubmitted = { [weak viewModel] _ in
+            viewModel?.noteTestCaptureSubmitted()
+        }
+
+        let controller = OnboardingWindowController(viewModel: viewModel)
+        self.onboardingWindowController = controller
+        controller.show()
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
@@ -163,22 +205,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         case .openDeepLink(let recordId):
             guard let row = historyViewModel.rows.first(where: { $0.serverRecord?.id == recordId }) else { return }
             historyViewModel.openDeepLink(for: row)
-        case .openSettingsApiKeyPlaceholder:
-            // SettingsWindow itself is U10 -- this is a clearly-marked
-            // placeholder action until then.
-            showSettingsPlaceholder()
+        case .openSettingsApiKey:
+            // The failed/auth route lands directly on the API-key section
+            // (TECH-SPEC §4.4 "open Settings -> API key").
+            showSettings(section: .apiKey)
         case .retry(let recordId):
             guard let row = historyViewModel.rows.first(where: { $0.serverRecord?.id == recordId }) else { return }
             historyViewModel.retry(row)
         }
     }
 
-    // MARK: - Placeholders (fully wired in later units: U6/U8 Settings,
-    // U11 Sparkle updater)
+    // MARK: - Settings (real window, U10 — replaces the U6–U9 placeholder)
 
-    private func showSettingsPlaceholder() {
-        NSLog("Whistle: Settings window requested (wired in U6/U8 settings unit)")
+    private func showSettings(section: SettingsSection = .general) {
+        if settingsWindowController == nil {
+            guard let auth = authController, let convexService else { return }
+            let viewModel = SettingsViewModel(convex: convexService, auth: auth)
+            settingsWindowController = SettingsWindowController(viewModel: viewModel)
+        }
+        settingsWindowController?.show(section: section)
     }
+
+    // MARK: - Placeholders (fully wired in later units: U11 Sparkle updater)
 
     private func checkForUpdatesPlaceholder() {
         NSLog("Whistle: Check for Updates requested (wired in U11 via Sparkle)")

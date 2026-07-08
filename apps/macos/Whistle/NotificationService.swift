@@ -80,9 +80,9 @@ public final class FakeUserNotificationCenter: UserNotificationCenting {
 public enum NotificationRoute: Equatable {
     /// Open the capture's deep link (calls `captures.markOpened` first).
     case openDeepLink(recordId: String)
-    /// Route to Settings -> API key. SettingsWindow itself is built in U10;
-    /// this is a clearly-marked placeholder action until then.
-    case openSettingsApiKeyPlaceholder
+    /// Route to Settings -> API key (the real SettingsWindow's API-key
+    /// section, U10).
+    case openSettingsApiKey
     /// Call `captures.retry` for this capture.
     case retry(recordId: String)
 }
@@ -170,7 +170,7 @@ public final class NotificationService: NSObject, NotificationServiceProtocol, U
                 identifier: "failed-auth-\(record.id)",
                 title: "Sign-in needed",
                 body: "Your Conductor API key needs attention.",
-                route: .openSettingsApiKeyPlaceholder
+                route: .openSettingsApiKey
             )
         } else {
             let message = record.error ?? "Something went wrong."
@@ -199,7 +199,7 @@ public final class NotificationService: NSObject, NotificationServiceProtocol, U
         switch route {
         case .openDeepLink(let recordId):
             return [UserInfoKey.route: RouteKind.deepLink.rawValue, UserInfoKey.recordId: recordId]
-        case .openSettingsApiKeyPlaceholder:
+        case .openSettingsApiKey:
             return [UserInfoKey.route: RouteKind.settingsApiKey.rawValue]
         case .retry(let recordId):
             return [UserInfoKey.route: RouteKind.retry.rawValue, UserInfoKey.recordId: recordId]
@@ -213,7 +213,7 @@ public final class NotificationService: NSObject, NotificationServiceProtocol, U
             guard let recordId = userInfo[UserInfoKey.recordId] else { return nil }
             return .openDeepLink(recordId: recordId)
         case .settingsApiKey:
-            return .openSettingsApiKeyPlaceholder
+            return .openSettingsApiKey
         case .retry:
             guard let recordId = userInfo[UserInfoKey.recordId] else { return nil }
             return .retry(recordId: recordId)

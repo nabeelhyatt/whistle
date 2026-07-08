@@ -339,6 +339,7 @@ public final class HistoryViewModel: ObservableObject {
 struct HistoryWindow: View {
     @ObservedObject var viewModel: HistoryViewModel
     var onDuplicate: (HistoryRowViewModel) -> Void
+    var onOpenSettings: () -> Void = {}
 
     var body: some View {
         VStack(spacing: 0) {
@@ -353,7 +354,8 @@ struct HistoryWindow: View {
                         onOpenDeepLink: { viewModel.openDeepLink(for: row) },
                         onArchive: { viewModel.archive(row) },
                         onRetry: { viewModel.retry(row) },
-                        onDuplicate: { onDuplicate(row) }
+                        onDuplicate: { onDuplicate(row) },
+                        onOpenSettings: onOpenSettings
                     )
                 }
                 .listStyle(.plain)
@@ -402,6 +404,10 @@ public final class HistoryWindowController: NSObject, NSWindowDelegate {
     /// (the U8 hook), resolving screenshot bytes first as needed.
     public var onDuplicate: (HistoryRowViewModel) -> Void = { _ in }
 
+    /// Auth-error rows' "Open Settings" affordance — wired by AppDelegate
+    /// to the real SettingsWindow's API-key section (U10).
+    public var onOpenSettings: () -> Void = {}
+
     public init(viewModel: HistoryViewModel) {
         self.viewModel = viewModel
         super.init()
@@ -414,9 +420,15 @@ public final class HistoryWindowController: NSObject, NSWindowDelegate {
             return
         }
 
-        let content = HistoryWindow(viewModel: viewModel, onDuplicate: { [weak self] row in
-            self?.onDuplicate(row)
-        })
+        let content = HistoryWindow(
+            viewModel: viewModel,
+            onDuplicate: { [weak self] row in
+                self?.onDuplicate(row)
+            },
+            onOpenSettings: { [weak self] in
+                self?.onOpenSettings()
+            }
+        )
         let hosting = NSHostingView(rootView: content)
         let newWindow = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 520, height: 460),

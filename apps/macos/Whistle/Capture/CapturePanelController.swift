@@ -79,6 +79,11 @@ public final class CapturePanelController: NSObject, NSWindowDelegate {
     public var onHistoryRequested: () -> Void = {}
     public var onSettingsRequested: () -> Void = {}
 
+    /// Fires after a capture is actually submitted (not on cancel/empty
+    /// refusal), with its clientId. U10's onboarding wizard uses this to
+    /// detect the first successful guided test capture (PRD F5.1 step 5→6).
+    public var onCaptureSubmitted: (String) -> Void = { _ in }
+
     /// Test-only accessors (internal, not `public` -- reachable only via
     /// `@testable import`) so `CaptureViewModelTests` can drive submit/
     /// dismiss through the real controller and assert the panel actually
@@ -255,8 +260,11 @@ public final class CapturePanelController: NSObject, NSWindowDelegate {
     // MARK: - Submit / dismiss
 
     private func handleSubmit() {
-        viewModel?.submit()
+        let result = viewModel?.submit()
         closePanel()
+        if case .submitted(let clientId)? = result {
+            onCaptureSubmitted(clientId)
+        }
     }
 
     private func handleEscape() {

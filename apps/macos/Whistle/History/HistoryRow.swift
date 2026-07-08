@@ -15,6 +15,10 @@ struct HistoryRow: View {
     var onArchive: () -> Void
     var onRetry: () -> Void
     var onDuplicate: () -> Void
+    /// Auth-error rows route to Settings → API key (TECH-SPEC §4.4). Wired
+    /// to the real SettingsWindow by U10; defaults to no-op so previews/
+    /// tests that don't care can omit it.
+    var onOpenSettings: () -> Void = {}
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -97,7 +101,7 @@ struct HistoryRow: View {
                 Button("Retry", action: onRetry)
                     .buttonStyle(.link)
             case .openSettingsApiKey:
-                Button("Open Settings", action: onOpenDeepLink)
+                Button("Open Settings", action: onOpenSettings)
                     .buttonStyle(.link)
             case .localRetry, .automatic, .none:
                 EmptyView()
