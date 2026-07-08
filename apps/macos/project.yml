@@ -92,6 +92,14 @@ targets:
       - package: WhistleCore
       - package: KeyboardShortcuts
       - package: Auth0
+      # System frameworks used by the U7 capture services
+      # (ScreenshotService, TranscriptionService/LegacySpeechTranscriber/
+      # SpeechAnalyzerTranscriber, AudioEngineTap). Linked explicitly
+      # rather than relying on implicit auto-linking so xcodebuild is
+      # robust to XcodeGen/toolchain differences.
+      - sdk: ScreenCaptureKit.framework
+      - sdk: Speech.framework
+      - sdk: AVFoundation.framework
 
   WhistleTests:
     type: bundle.unit-test
