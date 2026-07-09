@@ -66,6 +66,10 @@ public final class CapturePanelController: NSObject, NSWindowDelegate {
     private let store: CaptureStore
     private let screenshotService: ScreenshotService
     private let mode: CapturePanelMode
+    /// Threaded straight into every `CaptureViewModel` this controller
+    /// creates (fix #2) -- wired by `WhistleApp` to `ProjectsSyncCoordinator.
+    /// refreshIfStale()`.
+    private let refreshProjectsIfStale: () -> Void
 
     private var panel: NSPanel?
     private var viewModel: CaptureViewModel?
@@ -122,11 +126,13 @@ public final class CapturePanelController: NSObject, NSWindowDelegate {
     public init(
         store: CaptureStore,
         screenshotService: ScreenshotService = ScreenshotService(),
-        mode: CapturePanelMode = CapturePanelMode.current()
+        mode: CapturePanelMode = CapturePanelMode.current(),
+        refreshProjectsIfStale: @escaping () -> Void = {}
     ) {
         self.store = store
         self.screenshotService = screenshotService
         self.mode = mode
+        self.refreshProjectsIfStale = refreshProjectsIfStale
         super.init()
     }
 
@@ -212,7 +218,11 @@ public final class CapturePanelController: NSObject, NSWindowDelegate {
     // MARK: - Panel construction
 
     private func makePanel() -> (NSPanel, CaptureViewModel) {
-        let viewModel = CaptureViewModel(store: store, screenshotService: screenshotService)
+        let viewModel = CaptureViewModel(
+            store: store,
+            screenshotService: screenshotService,
+            refreshProjectsIfStale: refreshProjectsIfStale
+        )
 
         let captureView = CaptureView(
             viewModel: viewModel,
@@ -403,6 +413,16 @@ public final class CapturePanelController: NSObject, NSWindowDelegate {
         // "no X button", this + Esc are the only ways to leave without
         // submitting).
         dismissPreservingDraft()
+    }
+
+    public func windowDidBecomeKey(_ notification: Notification) {
+        // Fix #1b: a permission grant recovered via System Settings (e.g.
+        // toggling mic access off/on to force a fresh TCC grant tied to
+        // the current build's signature) must be reflected the moment the
+        // panel regains key status, without requiring an app relaunch --
+        // mirrors `OnboardingWindowController.windowDidBecomeKey`'s same
+        // fix for the onboarding permissions step.
+        viewModel?.refreshPermissions()
     }
 }
 

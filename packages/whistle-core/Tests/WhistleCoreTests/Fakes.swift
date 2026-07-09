@@ -3,6 +3,7 @@
 // per plan U5: "Fake ConvexService via the protocol — no network in tests."
 
 import Foundation
+import XCTest
 @testable import WhistleCore
 
 // MARK: - FakeConvexService
@@ -55,7 +56,11 @@ final class FakeConvexService: ConvexServiceProtocol, @unchecked Sendable {
 
     var validateKeyResult = true
     func conductorValidateKey(key: String?) async throws -> Bool { validateKeyResult }
-    func conductorRefreshProjects() async throws {}
+
+    private(set) var refreshProjectsCallCount = 0
+    func conductorRefreshProjects() async throws {
+        _ = record { refreshProjectsCallCount += 1 }
+    }
 
     // MARK: projects
 
@@ -66,7 +71,24 @@ final class FakeConvexService: ConvexServiceProtocol, @unchecked Sendable {
         }
     }
 
-    func yieldProjects(_ projects: [Project]) {
+    /// `projectsList()`'s continuation is only registered once something
+    /// actually starts iterating the stream (e.g. once
+    /// `ProjectsSyncCoordinator.start()`'s unstructured `Task` gets
+    /// scheduled) -- since that's asynchronous, a caller that immediately
+    /// does `coordinator.start(); convex.yieldProjects(...)` synchronously
+    /// can otherwise race ahead of subscription and drop the yield (no
+    /// continuation registered yet to receive it). Bounded-wait for a
+    /// subscriber first, mirroring `FakeHistoryConvexService.yield`'s same
+    /// fix for the identical race on `capturesListRecent`.
+    func yieldProjects(_ projects: [Project], timeout: TimeInterval = 2) async {
+        let deadline = Date().addingTimeInterval(timeout)
+        while projectsContinuation == nil {
+            if Date() >= deadline {
+                XCTFail("FakeConvexService.yieldProjects timed out waiting for a subscriber")
+                return
+            }
+            try? await Task.sleep(nanoseconds: 2_000_000)
+        }
         projectsContinuation?.yield(projects)
     }
 

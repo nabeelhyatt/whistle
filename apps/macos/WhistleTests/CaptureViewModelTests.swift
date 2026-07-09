@@ -18,6 +18,7 @@
 //     transcript/notes/screenshot and focuses the project picker, with a
 //     freshly minted clientId.
 
+import AppKit
 import CoreGraphics
 import XCTest
 @testable import Whistle
@@ -573,6 +574,139 @@ final class CaptureViewModelTests: XCTestCase {
 
         XCTAssertFalse(viewModel.focusProjectPicker)
     }
+
+    // MARK: Fix #2 (project-picker "No projects" bug): opening the panel
+    // triggers the stale-projects-refresh hook (wired in the real app to
+    // `ProjectsSyncCoordinator.refreshIfStale()`) -- both a brand-new
+    // capture and resuming a preserved draft count as "picker open" per
+    // TECH-SPEC §7 ("conductor.refreshProjects ... called ... on picker
+    // open").
+
+    @MainActor
+    func testBeginCaptureAndResumeDraftTriggerStaleProjectsRefresh() throws {
+        let (store, tempDir) = try TestSupport.makeStore()
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        var refreshCallCount = 0
+        let viewModel = CaptureViewModel(
+            store: store,
+            transcriptionServiceFactory: { FakeTranscriptionService() },
+            micPermissionChecker: { true },
+            speechPermissionChecker: { true },
+            refreshProjectsIfStale: { refreshCallCount += 1 }
+        )
+
+        viewModel.beginCapture()
+        XCTAssertEqual(refreshCallCount, 1, "beginCapture (a fresh panel open) must trigger the stale-refresh hook")
+
+        viewModel.resumeDraft()
+        XCTAssertEqual(refreshCallCount, 2, "resumeDraft (reopening with a preserved draft) must also trigger it")
+    }
+
+    // MARK: Fix #1b: permission recovered via System Settings must be
+    // picked up without an app relaunch -- `refreshPermissions()` (wired to
+    // the panel's window regaining key status) re-checks fresh and, if a
+    // previously-denied permission is now granted, starts transcription.
+
+    @MainActor
+    func testRefreshPermissionsPicksUpRecoveredMicGrantAndStartsTranscription() async throws {
+        let (store, tempDir) = try TestSupport.makeStore()
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        var micAuthorized = false
+        let fake = FakeTranscriptionService()
+        let viewModel = CaptureViewModel(
+            store: store,
+            transcriptionServiceFactory: { fake },
+            micPermissionChecker: { micAuthorized },
+            speechPermissionChecker: { true }
+        )
+
+        viewModel.beginCapture()
+        XCTAssertTrue(viewModel.isMicDenied)
+        let initialStartCount = await fake.startCallCount
+        XCTAssertEqual(initialStartCount, 0)
+
+        // Simulate the user toggling mic access off/on in System Settings
+        // while the app keeps running -- no relaunch.
+        micAuthorized = true
+        viewModel.refreshPermissions()
+
+        XCTAssertFalse(viewModel.isMicDenied, "refreshPermissions must re-check fresh, not reuse the latched flag")
+        try await pollStartCallCount(fake, atLeast: 1)
+        let startCount = await fake.startCallCount
+        XCTAssertEqual(startCount, 1, "transcription should start once the recovered grant is observed")
+    }
+
+    @MainActor
+    func testRefreshPermissionsPicksUpRecoveredSpeechGrantAndStartsTranscription() async throws {
+        let (store, tempDir) = try TestSupport.makeStore()
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        var speechAuthorized = false
+        let fake = FakeTranscriptionService()
+        let viewModel = CaptureViewModel(
+            store: store,
+            transcriptionServiceFactory: { fake },
+            micPermissionChecker: { true },
+            speechPermissionChecker: { speechAuthorized }
+        )
+
+        viewModel.beginCapture()
+        XCTAssertTrue(viewModel.isSpeechRecognitionDenied)
+        XCTAssertFalse(viewModel.isMicDenied)
+
+        speechAuthorized = true
+        viewModel.refreshPermissions()
+
+        XCTAssertFalse(viewModel.isSpeechRecognitionDenied)
+        try await pollStartCallCount(fake, atLeast: 1)
+        let startCount = await fake.startCallCount
+        XCTAssertEqual(startCount, 1)
+    }
+
+    @MainActor
+    func testRefreshPermissionsDoesNotRestartAlreadyRunningTranscription() async throws {
+        let (store, tempDir) = try TestSupport.makeStore()
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let fake = FakeTranscriptionService()
+        let viewModel = CaptureViewModel(
+            store: store,
+            transcriptionServiceFactory: { fake },
+            micPermissionChecker: { true },
+            speechPermissionChecker: { true }
+        )
+
+        viewModel.beginCapture()
+        try await pollStartCallCount(fake, atLeast: 1)
+        let startCountAfterOpen = await fake.startCallCount
+        XCTAssertEqual(startCountAfterOpen, 1)
+
+        // Nothing changed -- a window-key-regain recheck with unchanged,
+        // already-authorized permissions must not spin up a second
+        // transcription task.
+        viewModel.refreshPermissions()
+        try await Task.sleep(nanoseconds: 50_000_000) // give any (incorrect) restart a chance to happen
+        let startCountAfterRefresh = await fake.startCallCount
+        XCTAssertEqual(startCountAfterRefresh, 1, "must not restart transcription that's already running")
+    }
+}
+
+/// Polls a `FakeTranscriptionService`'s actor-isolated `startCallCount`
+/// until it reaches `expected` or the timeout elapses -- needed because
+/// `CaptureViewModel` kicks off `service.start()` from an unstructured
+/// `Task`, so it can lag slightly behind a synchronous call to
+/// `beginCapture()`/`refreshPermissions()`.
+private func pollStartCallCount(
+    _ service: FakeTranscriptionService,
+    atLeast expected: Int,
+    timeout: TimeInterval = 1
+) async throws {
+    let deadline = Date().addingTimeInterval(timeout)
+    while await service.startCallCount < expected, Date() < deadline {
+        try await Task.sleep(nanoseconds: 10_000_000)
+    }
 }
 
 // MARK: - CapturePanelController: duplicate-trigger + both panel modes
@@ -734,6 +868,59 @@ final class CapturePanelControllerTests: XCTestCase {
 
         XCTAssertEqual(controller.currentViewModel?.transcriptText, "", "next capture after submit starts empty")
         XCTAssertEqual(counter.count, 2, "next capture after submit takes a brand-new screenshot")
+    }
+
+    // MARK: Fix #1b: the window regaining key status re-checks permissions
+    // without needing a full `beginCapture`/`resumeDraft` (mirrors
+    // `OnboardingWindowController.windowDidBecomeKey`'s existing fix for
+    // the same class of bug on the onboarding permissions step).
+
+    @MainActor
+    func testWindowDidBecomeKeyForwardsToViewModelRefreshPermissions() async throws {
+        let (store, tempDir) = try makeStore()
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let controller = CapturePanelController(store: store)
+        controller.trigger()
+        try await Whistle_waitUntil { controller.isPanelOpen }
+
+        // beginCapture() already ran with the real (permitted-in-test-host
+        // or denied, whichever) mic checker; force the view model into a
+        // known "denied" state to observe windowDidBecomeKey's effect
+        // deterministically, independent of the test host's actual mic
+        // authorization.
+        XCTAssertNotNil(controller.currentViewModel)
+
+        // windowDidBecomeKey must be safe to call directly (as
+        // OnboardingWindowController's equivalent test does) and must not
+        // crash/no-op silently -- it forwards straight to
+        // `refreshPermissions()`, which is exercised in isolation by
+        // `CaptureViewModelTests.testRefreshPermissionsPicksUp...` above.
+        controller.windowDidBecomeKey(Notification(name: NSWindow.didBecomeKeyNotification))
+    }
+
+    // MARK: Fix #2: the controller threads `refreshProjectsIfStale` into
+    // every view model it creates.
+
+    @MainActor
+    func testRefreshProjectsIfStaleIsThreadedIntoTheViewModelOnEveryTrigger() async throws {
+        let (store, tempDir) = try makeStore()
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        var refreshCallCount = 0
+        let controller = CapturePanelController(
+            store: store,
+            refreshProjectsIfStale: { refreshCallCount += 1 }
+        )
+
+        controller.trigger()
+        try await Whistle_waitUntil { controller.isPanelOpen }
+        XCTAssertEqual(refreshCallCount, 1, "a brand-new capture (beginCapture) must trigger the stale-refresh hook")
+
+        controller.dismissPreservingDraftForTesting()
+        controller.trigger() // reopen -> resumeDraft()
+        try await Whistle_waitUntil { controller.isPanelOpen }
+        XCTAssertEqual(refreshCallCount, 2, "reopening a preserved draft (resumeDraft) must also trigger it")
     }
 }
 

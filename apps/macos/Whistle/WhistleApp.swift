@@ -33,6 +33,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var capturePanelController: CapturePanelController?
     private var captureStore: CaptureStore?
     private var convexService: (any ConvexServiceProtocol)?
+    /// App-wide `projects.list` subscription that persists every yield into
+    /// `CaptureStore.projects_snapshot` (fix: the capture panel's
+    /// `ProjectPicker` showed "No projects" while Settings' own separate
+    /// subscription displayed them fine -- nothing was ever writing into
+    /// the snapshot table the picker actually reads). Started once at
+    /// launch, independent of any window being open.
+    private var projectsSyncCoordinator: ProjectsSyncCoordinator?
     private var historyViewModel: HistoryViewModel?
     private var historyWindowController: HistoryWindowController?
     private var notificationService: NotificationService?
@@ -96,6 +103,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let store = Self.makeCaptureStore()
         self.captureStore = store
 
+        // App-wide, not scoped to Settings being open (fix: see
+        // `projectsSyncCoordinator`'s declaration comment above).
+        let projectsSyncCoordinator = ProjectsSyncCoordinator(store: store, convex: convexService)
+        self.projectsSyncCoordinator = projectsSyncCoordinator
+        Task { await projectsSyncCoordinator.start() }
+
         let notificationService = NotificationService()
         self.notificationService = notificationService
 
@@ -122,7 +135,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let historyWindow = HistoryWindowController(viewModel: historyViewModel)
         self.historyWindowController = historyWindow
 
-        let capturePanel = CapturePanelController(store: store)
+        let capturePanel = CapturePanelController(
+            store: store,
+            refreshProjectsIfStale: { [weak projectsSyncCoordinator] in
+                Task { await projectsSyncCoordinator?.refreshIfStale() }
+            }
+        )
         capturePanel.onHistoryRequested = { [weak self] in self?.showHistory() }
         capturePanel.onSettingsRequested = { [weak self] in self?.showSettings() }
         // Fix #2: anchor the panel beneath the real status item icon rather

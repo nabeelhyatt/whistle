@@ -74,6 +74,106 @@ final class FakeSpeechRecognitionEngine: SpeechRecognitionEngine, @unchecked Sen
     func cancelAll() {}
 }
 
+// MARK: - Fake AudioTapping (mic-permission fix)
+
+/// Records which tap methods were called so tests can assert that the
+/// microphone-activating path is hit ONLY on a real capture `start()`,
+/// never on construction/`prewarm()`. `startCallCount` stands in for "the
+/// permission-requesting path was reached": `AudioEngineTap.start()` is the
+/// sole place that touches `engine.inputNode` / installs a tap / starts the
+/// engine, i.e. the only thing that can trigger the mic TCC prompt.
+final class FakeAudioTap: AudioTapping, @unchecked Sendable {
+    private let lock = NSLock()
+    private var _prewarmCallCount = 0
+    private var _startCallCount = 0
+    private var _stopCallCount = 0
+
+    var prewarmCallCount: Int { lock.lock(); defer { lock.unlock() }; return _prewarmCallCount }
+    var startCallCount: Int { lock.lock(); defer { lock.unlock() }; return _startCallCount }
+    var stopCallCount: Int { lock.lock(); defer { lock.unlock() }; return _stopCallCount }
+
+    func prewarm() {
+        lock.lock(); _prewarmCallCount += 1; lock.unlock()
+    }
+
+    func start(onBuffer: @escaping (AVAudioPCMBuffer, AVAudioTime) -> Void) throws {
+        lock.lock(); _startCallCount += 1; lock.unlock()
+    }
+
+    func stop() {
+        lock.lock(); _stopCallCount += 1; lock.unlock()
+    }
+}
+
+// MARK: - Mic-permission-deferral tests
+//
+// Root cause fixed here: constructing/prewarming the transcription stack
+// used to install a tap on `AVAudioEngine.inputNode`, which activates the
+// mic and triggers the TCC permission prompt — before the user ever asked
+// to record. On an ad-hoc-signed Debug build (whose TCC grant is
+// invalidated on every rebuild) that produced an endless prompt loop. The
+// fix defers ALL mic access to `start()` (first real capture); `prewarm()`
+// is now mic-free. These tests pin that contract via `FakeAudioTap`.
+
+final class MicPermissionDeferralTests: XCTestCase {
+    func testConstructingAndPrewarmingLegacyTranscriberNeverActivatesTheMic() async {
+        let tap = FakeAudioTap()
+        let fakeEngine = FakeSpeechRecognitionEngine(segments: [])
+
+        _ = LegacySpeechTranscriber(audioTap: tap, engineFactory: { fakeEngine })
+
+        XCTAssertEqual(tap.prewarmCallCount, 1, "construction should prewarm the tap")
+        XCTAssertEqual(
+            tap.startCallCount, 0,
+            "prewarm must NOT activate the microphone / reach the permission-requesting path"
+        )
+    }
+
+    func testStartingLegacyCaptureActivatesTheMic() async {
+        let tap = FakeAudioTap()
+        let fakeEngine = FakeSpeechRecognitionEngine(segments: [[]])
+        let transcriber = LegacySpeechTranscriber(audioTap: tap, engineFactory: { fakeEngine })
+
+        XCTAssertEqual(tap.startCallCount, 0, "no mic access until a real capture begins")
+
+        _ = await transcriber.start()
+
+        XCTAssertEqual(
+            tap.startCallCount, 1,
+            "the FIRST real capture is what activates the mic (and triggers the one-time prompt)"
+        )
+
+        await transcriber.stop()
+    }
+
+    func testConstructingAndPrewarmingSpeechAnalyzerTranscriberNeverActivatesTheMic() async {
+        let tap = FakeAudioTap()
+        let fakeEngine = FakeSpeechAnalyzerEngine(events: [])
+
+        _ = SpeechAnalyzerTranscriber(audioTap: tap, engineFactory: { fakeEngine })
+
+        XCTAssertEqual(tap.prewarmCallCount, 1, "construction should prewarm the tap")
+        XCTAssertEqual(
+            tap.startCallCount, 0,
+            "prewarm must NOT activate the microphone / reach the permission-requesting path"
+        )
+    }
+
+    func testStartingSpeechAnalyzerCaptureActivatesTheMic() async {
+        let tap = FakeAudioTap()
+        let fakeEngine = FakeSpeechAnalyzerEngine(events: [])
+        let transcriber = SpeechAnalyzerTranscriber(audioTap: tap, engineFactory: { fakeEngine })
+
+        XCTAssertEqual(tap.startCallCount, 0, "no mic access until a real capture begins")
+
+        _ = await transcriber.start()
+
+        XCTAssertEqual(tap.startCallCount, 1, "the FIRST real capture activates the mic")
+
+        await transcriber.stop()
+    }
+}
+
 // MARK: - Test helpers
 
 /// Collects `TranscriptUpdate`s from a stream until `stop()` finishes it,
@@ -114,7 +214,7 @@ final class TranscriptStitchingTests: XCTestCase {
             ],
             [], // second segment starts but yields nothing further in this test
         ])
-        let transcriber = LegacySpeechTranscriber(engineFactory: { fake })
+        let transcriber = LegacySpeechTranscriber(audioTap: FakeAudioTap(), engineFactory: { fake })
 
         let stream = await transcriber.start()
         var updates: [TranscriptUpdate] = []
@@ -165,7 +265,7 @@ final class TranscriptStitchingTests: XCTestCase {
             // pattern in `testThreeConsecutiveFinalizationsConcatenateInOrder`.
             [],
         ])
-        let transcriber = LegacySpeechTranscriber(engineFactory: { fake })
+        let transcriber = LegacySpeechTranscriber(audioTap: FakeAudioTap(), engineFactory: { fake })
 
         let stream = await transcriber.start()
         var updates: [TranscriptUpdate] = []
@@ -200,7 +300,7 @@ final class TranscriptStitchingTests: XCTestCase {
             [.event(SpeechRecognitionEvent(text: "three", isFinal: true))],
             [],
         ])
-        let transcriber = LegacySpeechTranscriber(engineFactory: { fake })
+        let transcriber = LegacySpeechTranscriber(audioTap: FakeAudioTap(), engineFactory: { fake })
 
         let stream = await transcriber.start()
         var updates: [TranscriptUpdate] = []
@@ -228,7 +328,7 @@ final class TranscriptStitchingTests: XCTestCase {
                 .event(SpeechRecognitionEvent(text: "trailing live hypothesis", isFinal: false)),
             ],
         ])
-        let transcriber = LegacySpeechTranscriber(engineFactory: { fake })
+        let transcriber = LegacySpeechTranscriber(audioTap: FakeAudioTap(), engineFactory: { fake })
 
         let stream = await transcriber.start()
         var iterator = stream.makeAsyncIterator()
@@ -336,7 +436,7 @@ final class SpeechAnalyzerTranscriberStitchingTests: XCTestCase {
             .event(SpeechAnalyzerResultEvent(text: "hello world", isFinalized: false)),
             .event(SpeechAnalyzerResultEvent(text: "hello world final", isFinalized: true)),
         ])
-        let transcriber = SpeechAnalyzerTranscriber(engineFactory: { fake })
+        let transcriber = SpeechAnalyzerTranscriber(audioTap: FakeAudioTap(), engineFactory: { fake })
 
         let stream = await transcriber.start()
         var updates: [TranscriptUpdate] = []
@@ -359,7 +459,7 @@ final class SpeechAnalyzerTranscriberStitchingTests: XCTestCase {
             .event(SpeechAnalyzerResultEvent(text: "partial", isFinalized: false)),
             .error(FakeError()),
         ])
-        let transcriber = SpeechAnalyzerTranscriber(engineFactory: { fake })
+        let transcriber = SpeechAnalyzerTranscriber(audioTap: FakeAudioTap(), engineFactory: { fake })
 
         let stream = await transcriber.start()
         var updates: [TranscriptUpdate] = []
@@ -381,7 +481,7 @@ final class SpeechAnalyzerTranscriberStitchingTests: XCTestCase {
             .event(SpeechAnalyzerResultEvent(text: "two", isFinalized: true)),
             .event(SpeechAnalyzerResultEvent(text: "three", isFinalized: true)),
         ])
-        let transcriber = SpeechAnalyzerTranscriber(engineFactory: { fake })
+        let transcriber = SpeechAnalyzerTranscriber(audioTap: FakeAudioTap(), engineFactory: { fake })
 
         let stream = await transcriber.start()
         var updates: [TranscriptUpdate] = []
@@ -402,7 +502,7 @@ final class SpeechAnalyzerTranscriberStitchingTests: XCTestCase {
             .event(SpeechAnalyzerResultEvent(text: "committed part", isFinalized: true)),
             .event(SpeechAnalyzerResultEvent(text: "trailing live hypothesis", isFinalized: false)),
         ])
-        let transcriber = SpeechAnalyzerTranscriber(engineFactory: { fake })
+        let transcriber = SpeechAnalyzerTranscriber(audioTap: FakeAudioTap(), engineFactory: { fake })
 
         let stream = await transcriber.start()
         var iterator = stream.makeAsyncIterator()

@@ -71,6 +71,12 @@ public final class CaptureViewModel: ObservableObject {
     /// actually starts the service; `false` on `stopTranscription()` and
     /// when the update stream itself ends (service-side stop/error).
     @Published public private(set) var isListening: Bool = false
+    /// Speech-recognition (SFSpeechRecognizer) authorization, tracked
+    /// separately from `isMicDenied` (fix #1d) -- mic can be authorized
+    /// while speech recognition alone is denied, which needs its own
+    /// banner + System Settings deep link (Privacy_SpeechRecognition, not
+    /// Privacy_Microphone).
+    @Published public private(set) var isSpeechRecognitionDenied: Bool = false
     @Published public var selectedProjectId: String?
     @Published public private(set) var projects: [Project] = []
     @Published public var focusProjectPicker: Bool = false
@@ -115,6 +121,14 @@ public final class CaptureViewModel: ObservableObject {
     /// that immediately errors on every restart when speech isn't
     /// authorized).
     private let speechPermissionChecker: () -> Bool
+    /// Fires whenever the panel opens (fix #2): lets the caller (wired by
+    /// `CapturePanelController`/`WhistleApp` to `ProjectsSyncCoordinator.
+    /// refreshIfStale()`) trigger a `conductor.refreshProjects` server call
+    /// if the local `projects_snapshot` cache is stale (>1h) or missing,
+    /// per TECH-SPEC §7. A plain synchronous closure -- `CaptureViewModel`
+    /// itself never touches Convex/actors directly, matching the seam
+    /// style of `micPermissionChecker`/`speechPermissionChecker` above.
+    private let refreshProjectsIfStale: () -> Void
     private let defaultAgent: String
     private let defaultModel: String?
 
@@ -136,6 +150,7 @@ public final class CaptureViewModel: ObservableObject {
         transcriptionServiceFactory: @escaping () -> any TranscriptionService = { TranscriptionServiceFactory.make() },
         micPermissionChecker: @escaping () -> Bool = { MicPermission.isAuthorized() },
         speechPermissionChecker: @escaping () -> Bool = { SpeechRecognitionPermission.isAuthorized() },
+        refreshProjectsIfStale: @escaping () -> Void = {},
         defaultAgent: String = "claude",
         defaultModel: String? = nil
     ) {
@@ -144,6 +159,7 @@ public final class CaptureViewModel: ObservableObject {
         self.transcriptionServiceFactory = transcriptionServiceFactory
         self.micPermissionChecker = micPermissionChecker
         self.speechPermissionChecker = speechPermissionChecker
+        self.refreshProjectsIfStale = refreshProjectsIfStale
         self.defaultAgent = defaultAgent
         self.defaultModel = defaultModel
     }
@@ -170,9 +186,20 @@ public final class CaptureViewModel: ObservableObject {
         screenshotData = preFill?.screenshotData
         focusProjectPicker = preFill?.focusProjectPicker ?? false
         lastServiceText = ""
+        // Fix #1b: re-check both permissions fresh from the OS on every
+        // open rather than trusting whatever `isMicDenied`/
+        // `isSpeechRecognitionDenied` last held -- a grant recovered via
+        // System Settings (e.g. toggling mic access off/on to force a
+        // fresh TCC grant tied to the current build's signature) must be
+        // picked up without an app relaunch.
         isMicDenied = !micPermissionChecker()
+        isSpeechRecognitionDenied = !speechPermissionChecker()
 
         loadProjects()
+        // Fix #2: "on picker open" per TECH-SPEC §7 -- triggers
+        // `conductor.refreshProjects` if the local snapshot is stale/
+        // missing.
+        refreshProjectsIfStale()
         startTranscriptionIfPermitted()
         requestTranscriptFocus()
     }
@@ -194,8 +221,31 @@ public final class CaptureViewModel: ObservableObject {
         captureBeganAt = Date()
         lastServiceText = ""
         isMicDenied = !micPermissionChecker()
+        isSpeechRecognitionDenied = !speechPermissionChecker()
+        refreshProjectsIfStale()
         startTranscriptionIfPermitted()
         requestTranscriptFocus()
+    }
+
+    /// Re-checks mic + speech-recognition authorization fresh from the OS
+    /// (fix #1b), independent of a full `beginCapture`/`resumeDraft`.
+    /// Wired by `CapturePanelController.windowDidBecomeKey` so a
+    /// permission grant recovered via System Settings is picked up the
+    /// moment the panel's window regains key status, even on a path that
+    /// doesn't go through `trigger()` at all. If a previously-denied
+    /// permission is now granted and transcription isn't already running,
+    /// starts it -- the user shouldn't have to dismiss/reopen the panel to
+    /// benefit from a permission they just granted.
+    public func refreshPermissions() {
+        let wasMicDenied = isMicDenied
+        let wasSpeechDenied = isSpeechRecognitionDenied
+        isMicDenied = !micPermissionChecker()
+        isSpeechRecognitionDenied = !speechPermissionChecker()
+
+        let recovered = (wasMicDenied && !isMicDenied) || (wasSpeechDenied && !isSpeechRecognitionDenied)
+        if recovered, transcriptionService == nil {
+            startTranscriptionIfPermitted()
+        }
     }
 
     /// "Clear" button (plan U8 fix #4a): empties transcript, notes, and
@@ -234,7 +284,7 @@ public final class CaptureViewModel: ObservableObject {
         // every task error). Degrading silently to type-only mode here
         // matches the mic-denied behavior and keeps this gate consistent
         // with what onboarding's permission row displays.
-        guard !isMicDenied, speechPermissionChecker() else { return }
+        guard !isMicDenied, !isSpeechRecognitionDenied else { return }
         let service = transcriptionServiceFactory()
         transcriptionService = service
         isListening = true
@@ -318,24 +368,33 @@ public final class CaptureViewModel: ObservableObject {
     // MARK: - Projects
 
     private func loadProjects() {
-        projects = (try? store.projectsSnapshot()) ?? []
-        if let lastUsed = try? store.lastUsedProjectId(), projects.contains(where: { $0.id == lastUsed }) {
-            selectedProjectId = lastUsed
-        } else {
-            selectedProjectId = projects.first?.id
-        }
+        applyProjectsUpdate((try? store.projectsSnapshot()) ?? [])
 
         projectsTask?.cancel()
         projectsTask = Task { [weak self] in
             guard let self else { return }
             for await updated in self.store.projectsUpdates() {
                 await MainActor.run {
-                    self.projects = updated
-                    if self.selectedProjectId == nil {
-                        self.selectedProjectId = updated.first?.id
-                    }
+                    self.applyProjectsUpdate(updated)
                 }
             }
+        }
+    }
+
+    /// Applies a fresh projects list (initial snapshot read or a later
+    /// `projectsUpdates()` yield -- e.g. the app-wide `ProjectsSyncCoordinator`
+    /// persisting a `projects.list` subscription result into `CaptureStore`
+    /// for the first time after the picker opened with an empty/stale
+    /// snapshot, fix #2) and ensures a selection exists once projects do:
+    /// keeps the current selection if it's still valid, otherwise prefers
+    /// the last-used project, falling back to the first.
+    private func applyProjectsUpdate(_ updated: [Project]) {
+        projects = updated
+        guard selectedProjectId == nil || !updated.contains(where: { $0.id == selectedProjectId }) else { return }
+        if let lastUsed = try? store.lastUsedProjectId(), updated.contains(where: { $0.id == lastUsed }) {
+            selectedProjectId = lastUsed
+        } else {
+            selectedProjectId = updated.first?.id
         }
     }
 
