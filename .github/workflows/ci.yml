@@ -1,0 +1,73 @@
+# ci.yml — PR/push test suite (U11, TECH-SPEC §10).
+#
+# Three suites, mirroring the local verification ladder (TECH-SPEC §2a
+# Definition of done):
+#   backend       — vitest/convex-test matrix (packages/backend)
+#   whistle-core  — plain SPM `swift test` (no Xcode project needed)
+#   app           — xcodegen + `xcodebuild test` for the Whistle app target
+#
+# No secrets required: Debug builds are ad-hoc signed (project.yml), the
+# backend tests run against a fully mocked Conductor, and auth is
+# MockAuthProvider throughout (TECH-SPEC §9).
+#
+# Runner note: the app target compiles SpeechAnalyzerTranscriber against
+# the macOS 26 SDK behind #available (U7), so the mac jobs need an Xcode
+# that carries that SDK — hence the macos-26 image, whose default
+# /Applications/Xcode.app is a 26.x toolchain.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend:
+    name: Backend (vitest / convex-test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm --filter backend test
+
+  whistle-core:
+    name: WhistleCore (swift test)
+    runs-on: macos-26
+    env:
+      DEVELOPER_DIR: /Applications/Xcode.app/Contents/Developer
+    steps:
+      - uses: actions/checkout@v4
+      - name: swift test
+        run: swift test --package-path packages/whistle-core
+
+  app:
+    name: Whistle app (xcodebuild test)
+    runs-on: macos-26
+    env:
+      DEVELOPER_DIR: /Applications/Xcode.app/Contents/Developer
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install xcodegen
+        run: brew install xcodegen
+      - name: Generate Xcode project
+        working-directory: apps/macos
+        run: xcodegen generate
+      - name: xcodebuild test
+        working-directory: apps/macos
+        run: |
+          set -o pipefail
+          xcodebuild test \
+            -project Whistle.xcodeproj \
+            -scheme Whistle \
+            -destination 'platform=macOS' \
+            | tail -n 60

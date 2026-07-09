@@ -1,0 +1,9 @@
+// Whistle.xcconfig
+// Umbrella build configuration for the Whistle app target — includes the
+// per-concern xcconfig files below so project.yml only needs to reference
+// one `configFiles` entry. Split into separate files (rather than one flat
+// file) so each concern's provenance/placeholder status stays obvious.
+
+#include "Auth0.xcconfig"
+#include "Convex.xcconfig"
+#include "Sparkle.xcconfig"

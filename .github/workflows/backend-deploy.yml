@@ -1,0 +1,51 @@
+# backend-deploy.yml — deploy the Convex backend on pushes to main
+# (U11, TECH-SPEC §10).
+#
+# ENV-GATED (TECH-SPEC §10): the deploy step runs only when the
+# CONVEX_DEPLOY_KEY secret is provisioned; until then the workflow succeeds
+# with a logged skip so it is authored-correct before secrets exist.
+#
+# Required secret (see SECRETS.md):
+#   CONVEX_DEPLOY_KEY — production deploy key for team `nabeelo`,
+#                       project `whistle` (Convex dashboard → Settings →
+#                       Deploy keys).
+
+name: Backend deploy
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "packages/backend/**"
+      - ".github/workflows/backend-deploy.yml"
+
+concurrency:
+  group: backend-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Convex deploy
+    runs-on: ubuntu-latest
+    env:
+      HAS_DEPLOY_KEY: ${{ secrets.CONVEX_DEPLOY_KEY != '' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+
+      - name: Deploy to Convex
+        if: env.HAS_DEPLOY_KEY == 'true'
+        working-directory: packages/backend
+        env:
+          CONVEX_DEPLOY_KEY: ${{ secrets.CONVEX_DEPLOY_KEY }}
+        run: npx convex deploy --yes
+
+      - name: Skip deploy (no CONVEX_DEPLOY_KEY)
+        if: env.HAS_DEPLOY_KEY != 'true'
+        run: |
+          echo "SKIP Convex deploy: CONVEX_DEPLOY_KEY secret not provisioned (see SECRETS.md)."

@@ -1,0 +1,19 @@
+{
+  "name": "backend",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "convex dev",
+    "deploy": "convex deploy",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "convex": "1.42.1"
+  },
+  "devDependencies": {
+    "@edge-runtime/vm": "5.0.0",
+    "convex-test": "0.0.54",
+    "typescript": "5.9.3",
+    "vitest": "4.1.10"
+  }
+}

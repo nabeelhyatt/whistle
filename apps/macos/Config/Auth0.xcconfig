@@ -1,0 +1,18 @@
+// Auth0.xcconfig
+// Auth0 tenant configuration — REAL provisioned tenant (public identifiers;
+// the domain and client ID are not secrets and are safe to commit, per
+// SECRETS.md's Auth0 section). Injected into Info.plist via project.yml so
+// Auth0AuthProvider reads them at runtime; never hardcoded in Swift.
+//
+// If these are ever reverted to placeholder values (e.g. a stripped-down
+// fork), Auth0Config.fromInfoPlist detects the placeholder shape and the
+// app degrades to the local dev sign-in fallback (DevSignInAuthProvider)
+// instead of attempting a doomed network call.
+//
+// The Auth0 application must allow the macOS callback URL documented in
+// SECRETS.md (Auth0.swift format:
+//   {bundleID}://{domain}/macos/{bundleID}/callback).
+// After changing values here, re-run `xcodegen generate`.
+
+AUTH0_DOMAIN = dev-jrm7z08z1lx4u3pg.us.auth0.com
+AUTH0_CLIENT_ID = jvCvc5uGUuTJjirvZMI7RAl7A3wrduYj

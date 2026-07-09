@@ -1,0 +1,139 @@
+# project.yml — XcodeGen spec for the Whistle macOS app (TECH-SPEC §3a).
+#
+# `Whistle.xcodeproj` is generated FROM this file — never hand-authored,
+# never committed. Regenerate after any edit here:
+#
+#   cd apps/macos && ./generate.sh
+#   # or: xcodegen generate
+#
+# Every build/test invocation against the generated project uses
+# `xcodebuild` with `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer`
+# set explicitly (TECH-SPEC §2a) — never plain `swift build`.
+
+name: Whistle
+
+options:
+  bundleIdPrefix: build.conductor.whistle
+  deploymentTarget:
+    macOS: "14.0"
+  createIntermediateGroups: true
+  # Swift language mode 5 (TECH-SPEC §4.1 concurrency note): the toolchain
+  # is Swift 6, but the app target intentionally opts out of full Swift 6
+  # strict concurrency checking — isolation is handled explicitly per
+  # module (targeted @MainActor, TranscriptionService as an actor, GRDB's
+  # own serial queue) rather than via the compiler's global mode.
+  # SWIFT_VERSION below (per-target build setting) is the mechanism that
+  # pins this; `options.developmentLanguage`/etc. left at XcodeGen defaults.
+
+settings:
+  base:
+    SWIFT_VERSION: "5"
+    MACOSX_DEPLOYMENT_TARGET: "14.0"
+    ENABLE_HARDENED_RUNTIME: YES
+    # Ad-hoc signing by default so `xcodegen generate` + `xcodebuild build`/
+    # `test` work non-interactively with no Apple Developer Program team
+    # configured (this repo has none) — Automatic signing with an empty
+    # DEVELOPMENT_TEAM fails hard ("requires a development team"). The
+    # per-target CODE_SIGN_IDENTITY override below opts the Whistle app
+    # target into the real Developer ID identity (TECH-SPEC §2a) for
+    # distribution builds (U11 packaging); local dev/test builds and
+    # WhistleTests stay ad-hoc.
+    CODE_SIGN_STYLE: Manual
+    CODE_SIGN_IDENTITY: "-"
+    DEVELOPMENT_TEAM: ""
+
+packages:
+  WhistleCore:
+    path: ../../packages/whistle-core
+  # sindresorhus/KeyboardShortcuts — macOS hotkey recorder UI + hotkey
+  # registration, used by SettingsWindow (U6+ wiring) and the capture
+  # trigger (U8). Pre-1.0-adjacent tooling but a stable, widely used
+  # single-maintainer package; pinned exact per the U5 pinning convention
+  # this plan applies to all beta/young SPM deps.
+  KeyboardShortcuts:
+    url: https://github.com/sindresorhus/KeyboardShortcuts
+    exactVersion: 3.0.1
+  # Auth0.swift — official Auth0 SDK. Wired but unexercised in this unit
+  # (TECH-SPEC §9): only Auth0AuthProvider touches it; all automated tests
+  # and the one-shot smoke run use WhistleCore's MockAuthProvider instead.
+  Auth0:
+    url: https://github.com/auth0/Auth0.swift
+    exactVersion: 2.24.1
+  # Sparkle 2 — software update framework (TECH-SPEC §10, plan U11).
+  # 2.9.4 is the latest tagged GitHub release as of this integration
+  # (checked via `gh api repos/sparkle-project/Sparkle/releases/latest`);
+  # pinned exact per the U5 pinning convention this plan applies to all
+  # beta/young SPM deps (Sparkle 2 is stable/1.0+, but pinning exact keeps
+  # the build reproducible regardless).
+  Sparkle:
+    url: https://github.com/sparkle-project/Sparkle
+    exactVersion: 2.9.4
+
+targets:
+  Whistle:
+    type: application
+    platform: macOS
+    deploymentTarget: "14.0"
+    sources:
+      - path: Whistle
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: build.conductor.whistle.app
+        PRODUCT_NAME: Whistle
+        INFOPLIST_FILE: Whistle/Info.plist
+        CODE_SIGN_ENTITLEMENTS: Whistle/Whistle.entitlements
+        GENERATE_INFOPLIST_FILE: NO
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        MARKETING_VERSION: "1.0.0"
+        CURRENT_PROJECT_VERSION: "1"
+      # Real Developer ID signing identity is present in the keychain
+      # (TECH-SPEC §2a) and pre-authorized for unattended use — used for
+      # Release (distribution/notarization, U11 packaging) only. Debug
+      # inherits the project-base ad-hoc identity so local `xcodebuild
+      # build`/`test` runs work non-interactively with no team configured.
+      configs:
+        Release:
+          CODE_SIGN_IDENTITY: "Developer ID Application"
+    configFiles:
+      Debug: Config/Whistle.xcconfig
+      Release: Config/Whistle.xcconfig
+    dependencies:
+      - package: WhistleCore
+      - package: KeyboardShortcuts
+      - package: Auth0
+      - package: Sparkle
+      # System frameworks used by the U7 capture services
+      # (ScreenshotService, TranscriptionService/LegacySpeechTranscriber/
+      # SpeechAnalyzerTranscriber, AudioEngineTap). Linked explicitly
+      # rather than relying on implicit auto-linking so xcodebuild is
+      # robust to XcodeGen/toolchain differences.
+      - sdk: ScreenCaptureKit.framework
+      - sdk: Speech.framework
+      - sdk: AVFoundation.framework
+
+  WhistleTests:
+    type: bundle.unit-test
+    platform: macOS
+    deploymentTarget: "14.0"
+    sources:
+      - path: WhistleTests
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: build.conductor.whistle.tests
+        GENERATE_INFOPLIST_FILE: YES
+    dependencies:
+      - target: Whistle
+      - package: WhistleCore
+
+schemes:
+  Whistle:
+    build:
+      targets:
+        Whistle: all
+        WhistleTests: [test]
+    test:
+      config: Debug
+      targets:
+        - WhistleTests
+    run:
+      config: Debug
