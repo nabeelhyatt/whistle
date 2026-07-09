@@ -50,8 +50,17 @@ public final class StatusItemController: NSObject {
 
     private func configureButton() {
         guard let button = statusItem.button else { return }
+        // Defensive fallback: if the asset catalog lookup somehow fails
+        // (missing/corrupt Assets.car), fall back to an SF Symbol so the
+        // status item can never render as an invisible empty square.
         let icon = NSImage(named: "MenuBarIcon")
+            ?? NSImage(systemSymbolName: "mic.circle", accessibilityDescription: "Whistle")
         icon?.isTemplate = true
+        // Pin the point size explicitly to the standard menu bar glyph size
+        // rather than trusting the asset's intrinsic size — a wrong-DPI or
+        // mis-sized source PNG would otherwise render tiny (or oversized
+        // and clipped) in the status bar.
+        icon?.size = NSSize(width: 18, height: 18)
         button.image = icon
         button.toolTip = "Whistle"
         button.target = self
@@ -142,7 +151,7 @@ public final class StatusItemController: NSObject {
         let title: String
         switch authController.state {
         case .signedIn:
-            title = "Signed in"
+            title = authController.isDevSignIn ? "Dev sign-in" : "Signed in"
         case .signingIn:
             title = "Signing in…"
         case .reauthRequired:

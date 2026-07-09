@@ -13,9 +13,11 @@
 //
 // Config (domain/client ID) is read from Info.plist keys injected via
 // xcconfig build settings (`AUTH0_DOMAIN` / `AUTH0_CLIENT_ID`, see
-// project.yml + Config/*.xcconfig) — never hardcoded here. No real Auth0
-// tenant exists yet; the checked-in xcconfig values are placeholders
-// (documented in SECRETS.md, added in a later unit).
+// project.yml + Config/*.xcconfig) — never hardcoded here. The checked-in
+// xcconfig now carries the real tenant's public identifiers (SECRETS.md);
+// if a checkout ever reverts to placeholder values, `Auth0Config`
+// detects them and the app degrades to the local dev sign-in fallback
+// (`DevSignInAuthProvider`) instead of attempting a doomed network call.
 
 import Foundation
 import WhistleCore
@@ -26,8 +28,7 @@ import WhistleCore
 
 /// Reads Auth0 tenant configuration from the app's Info.plist (populated at
 /// build time from xcconfig `AUTH0_DOMAIN` / `AUTH0_CLIENT_ID` — see
-/// `apps/macos/project.yml`). Both are placeholder values in this one-shot
-/// build; there is no real Auth0 tenant yet.
+/// `apps/macos/project.yml` and `Config/Auth0.xcconfig`).
 public struct Auth0Config: Sendable {
     public let domain: String
     public let clientId: String
@@ -38,20 +39,41 @@ public struct Auth0Config: Sendable {
     }
 
     /// Reads `AUTH0_DOMAIN` / `AUTH0_CLIENT_ID` from the given bundle's
-    /// Info.plist. Returns `nil` if either key is missing or still the
-    /// unfilled `$(AUTH0_DOMAIN)`-style xcconfig placeholder token (i.e. the
-    /// xcconfig substitution never ran), so callers can degrade cleanly
-    /// instead of attempting a doomed network call.
+    /// Info.plist. Returns `nil` if either key is missing or is still a
+    /// placeholder — either the unfilled `$(AUTH0_DOMAIN)`-style xcconfig
+    /// substitution token, or the literal placeholder values checked into
+    /// `Config/Auth0.xcconfig` before a real tenant was provisioned
+    /// ("your-tenant.us.auth0.com" / "REPLACE_WITH_…"). Rejecting both
+    /// shapes lets callers degrade cleanly (dev sign-in fallback) instead
+    /// of attempting a doomed network call against a nonexistent host.
     public static func fromInfoPlist(bundle: Bundle = .main) -> Auth0Config? {
         guard
             let domain = bundle.object(forInfoDictionaryKey: "AUTH0_DOMAIN") as? String,
-            let clientId = bundle.object(forInfoDictionaryKey: "AUTH0_CLIENT_ID") as? String,
-            !domain.isEmpty, !clientId.isEmpty,
-            !domain.hasPrefix("$("), !clientId.hasPrefix("$(")
+            let clientId = bundle.object(forInfoDictionaryKey: "AUTH0_CLIENT_ID") as? String
+        else {
+            return nil
+        }
+        return validated(domain: domain, clientId: clientId)
+    }
+
+    /// Placeholder/shape validation, separated from the Bundle read so it's
+    /// directly unit-testable. Returns `nil` for empty values, unfilled
+    /// `$(…)` xcconfig tokens, and the literal pre-provisioning
+    /// placeholders.
+    static func validated(domain: String, clientId: String) -> Auth0Config? {
+        guard !domain.isEmpty, !clientId.isEmpty,
+              !isPlaceholder(domain), !isPlaceholder(clientId)
         else {
             return nil
         }
         return Auth0Config(domain: domain, clientId: clientId)
+    }
+
+    private static func isPlaceholder(_ value: String) -> Bool {
+        value.hasPrefix("$(")
+            || value.hasPrefix("REPLACE_WITH")
+            || value.hasPrefix("your-tenant.")
+            || value.hasPrefix("placeholder.")
     }
 }
 

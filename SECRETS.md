@@ -95,6 +95,58 @@ To turn crash reporting on later:
 gh secret set SENTRY_DSN          # paste the DSN
 ```
 
+## 6. Auth0 tenant — PROVISIONED (2026-07-08)
+
+A real Auth0 tenant now backs sign-in. The identifiers below are **public**
+(an OAuth native-app domain + client ID are not secrets — there is no
+client secret in a native PKCE flow) and are committed in
+`apps/macos/Config/Auth0.xcconfig`:
+
+- `AUTH0_DOMAIN` = `dev-jrm7z08z1lx4u3pg.us.auth0.com`
+- `AUTH0_CLIENT_ID` = `jvCvc5uGUuTJjirvZMI7RAl7A3wrduYj`
+
+The same values are set on the Convex dev deployment
+(`grandiose-alpaca-243`) so the backend validates the app's Auth0 ID
+tokens (`packages/backend/convex/auth.config.ts` uses `AUTH0_AUDIENCE` as
+the provider `applicationID`, which for ID-token validation is the client
+ID):
+
+```sh
+cd packages/backend
+npx convex env set AUTH0_DOMAIN dev-jrm7z08z1lx4u3pg.us.auth0.com
+npx convex env set AUTH0_AUDIENCE jvCvc5uGUuTJjirvZMI7RAl7A3wrduYj
+npx convex dev --once   # redeploy so auth.config.ts picks the values up
+```
+
+### Auth0 application settings (dashboard)
+
+Application type: **Native**. Auth0.swift 2.24.1 on macOS builds the
+WebAuth redirect URL as (verbatim format from
+`Auth0WebAuth.redirectURL`, custom-scheme path — the app does not call
+`useHTTPS()`):
+
+```
+{bundleIdentifier}://{AUTH0_DOMAIN}/macos/{bundleIdentifier}/callback
+```
+
+With our bundle ID (`build.conductor.whistle.app`) the exact value to
+allowlist in **Allowed Callback URLs** (and Allowed Logout URLs) is:
+
+```
+build.conductor.whistle.app://dev-jrm7z08z1lx4u3pg.us.auth0.com/macos/build.conductor.whistle.app/callback
+```
+
+The app requests scope `openid profile email offline_access` — the
+`offline_access` scope means a **refresh token** is issued and stored by
+Auth0.swift's `CredentialsManager` in the Keychain, so the Auth0
+application must have the **Refresh Token** grant type enabled
+(Application → Advanced Settings → Grant Types; it is on by default for
+Native apps).
+
+If the xcconfig values are ever reverted to placeholders, the app detects
+that (`Auth0Config.fromInfoPlist`) and degrades to a clearly-labeled local
+"Dev sign-in" fallback instead of a doomed network call.
+
 ---
 
 ## Quick verification after provisioning

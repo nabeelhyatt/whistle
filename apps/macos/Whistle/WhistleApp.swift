@@ -72,7 +72,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             authProvider: authProvider,
             convexService: convexService,
             breadcrumbStore: KeychainAuthBreadcrumbStore(),
-            performInteractiveLogin: Self.makeInteractiveLogin(authProvider: authProvider)
+            performInteractiveLogin: Self.makeInteractiveLogin(authProvider: authProvider),
+            isDevSignIn: authProvider is DevSignInAuthProvider
         )
         self.authController = auth
 
@@ -255,16 +256,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - Wiring
 
     private static func makeAuthProvider() -> any WhistleAuthProvider {
-        // Real Auth0 wiring, per plan U6: config comes from Info.plist
-        // placeholders (no real tenant exists yet). This provider is wired
-        // but not exercised by any automated test in this unit.
-        Auth0AuthProvider()
+        // Real Auth0 wiring when the xcconfig-injected tenant config is
+        // present and non-placeholder; otherwise the local dev sign-in
+        // fallback, so a fresh checkout with placeholder Auth0.xcconfig
+        // values still gets a working (clearly-labeled) sign-in path
+        // instead of a doomed network call against a nonexistent host.
+        if let config = Auth0Config.fromInfoPlist() {
+            return Auth0AuthProvider(config: config)
+        }
+        NSLog("Whistle: Auth0 is not configured (placeholder AUTH0_DOMAIN/AUTH0_CLIENT_ID) — using local dev sign-in fallback")
+        return DevSignInAuthProvider()
     }
 
     private static func makeInteractiveLogin(authProvider: any WhistleAuthProvider) -> @Sendable () async throws -> Void {
         {
-            guard let auth0Provider = authProvider as? Auth0AuthProvider else { return }
-            try await auth0Provider.login()
+            if let auth0Provider = authProvider as? Auth0AuthProvider {
+                try await auth0Provider.login()
+            } else if let devProvider = authProvider as? DevSignInAuthProvider {
+                await devProvider.login()
+            }
         }
     }
 

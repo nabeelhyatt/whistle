@@ -107,6 +107,13 @@ public final class AuthController: ObservableObject {
     /// is exactly 1 per successful sign-in (plan U6 happy-path scenario).
     @Published public private(set) var usersEnsureCallCount = 0
 
+    /// True when this controller is driving the local dev sign-in fallback
+    /// (`DevSignInAuthProvider`, used when no real Auth0 tenant is
+    /// configured). UI surfaces label the signed-in state "Dev sign-in"
+    /// instead of "Signed in" so a mock session is never mistaken for a
+    /// real one.
+    public let isDevSignIn: Bool
+
     private let authProvider: any WhistleAuthProvider
     private let convexService: any ConvexServiceProtocol
     private let breadcrumbStore: any AuthBreadcrumbStore
@@ -123,12 +130,14 @@ public final class AuthController: ObservableObject {
         authProvider: any WhistleAuthProvider,
         convexService: any ConvexServiceProtocol,
         breadcrumbStore: any AuthBreadcrumbStore = InMemoryAuthBreadcrumbStore(),
-        performInteractiveLogin: @escaping @Sendable () async throws -> Void = {}
+        performInteractiveLogin: @escaping @Sendable () async throws -> Void = {},
+        isDevSignIn: Bool = false
     ) {
         self.authProvider = authProvider
         self.convexService = convexService
         self.breadcrumbStore = breadcrumbStore
         self.performInteractiveLogin = performInteractiveLogin
+        self.isDevSignIn = isDevSignIn
     }
 
     /// Called at app launch: if a token is already available (cached
@@ -188,6 +197,16 @@ public final class AuthController: ObservableObject {
             breadcrumbStore.setHasSignedInBefore(true)
             state = .signedIn
         } catch {
+            // Dev sign-in is a purely local affordance: its mock token is
+            // not a real JWT, so the backend rejecting `users.ensure` is
+            // expected — complete the sign-in anyway (the UI labels the
+            // state "Dev sign-in" so it can't be mistaken for a real
+            // session).
+            if isDevSignIn {
+                breadcrumbStore.setHasSignedInBefore(true)
+                state = .signedIn
+                return
+            }
             // users.ensure failing (e.g. transient network) shouldn't strand
             // the user in a half-signed-in state with no way forward —
             // treat as a re-auth-required condition so the menu offers a

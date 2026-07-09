@@ -171,6 +171,10 @@ public final class SettingsViewModel: ObservableObject {
 
     public var authState: AuthState { auth.state }
 
+    /// True when the signed-in session is the local dev fallback (no real
+    /// Auth0 tenant configured) — Account status shows "Dev sign-in".
+    public var isDevSignIn: Bool { auth.isDevSignIn }
+
     public func signOut() async {
         await auth.signOut()
     }
@@ -300,7 +304,7 @@ struct SettingsView: View {
             Section("Account") {
                 switch viewModel.authState {
                 case .signedIn:
-                    LabeledContent("Status:", value: "Signed in")
+                    LabeledContent("Status:", value: viewModel.isDevSignIn ? "Dev sign-in" : "Signed in")
                     Button("Sign Out", role: .destructive) {
                         Task { await viewModel.signOut() }
                     }

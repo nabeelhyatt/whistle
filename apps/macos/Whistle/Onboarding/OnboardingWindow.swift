@@ -137,6 +137,12 @@ public final class OnboardingViewModel: ObservableObject {
     /// the wizard on first run only).
     public var isCompleted: Bool { state.completed }
 
+    /// True when the app is running without a configured Auth0 tenant and
+    /// sign-in goes through the local dev fallback (`DevSignInAuthProvider`)
+    /// — the sign-in step shows an explanatory message and a "Continue with
+    /// local dev sign-in" button instead of the real Sign In button.
+    public var usesDevSignIn: Bool { auth.isDevSignIn }
+
     /// Whether the test capture has been submitted at least once — gates
     /// the screenshot upsell (PRD F5.1 step 6: AFTER first successful test
     /// capture, not before).
@@ -444,24 +450,46 @@ struct OnboardingView: View {
                 .font(.system(size: 40))
             Text("Welcome to Whistle")
                 .font(.title.bold())
-            Text("One keystroke turns a fleeting idea into a researched plan waiting in Conductor.")
+            Text("A quick little app to signal Conductor to get to work on something")
                 .multilineTextAlignment(.center)
                 .foregroundStyle(.secondary)
                 .padding(.horizontal, 32)
             if let error = viewModel.signInError {
                 Text(error).foregroundStyle(.red).font(.callout)
             }
-            Button {
-                Task { await viewModel.signIn() }
-            } label: {
-                if viewModel.isSigningIn {
-                    ProgressView().controlSize(.small)
-                } else {
-                    Text("Sign In")
+            if viewModel.usesDevSignIn {
+                // No Auth0 tenant configured in this build (placeholder
+                // xcconfig values) — offer the local dev fallback instead
+                // of a Sign In button that would fail with a network error.
+                Text("Auth0 isn't configured in this build, so real sign-in is unavailable. You can continue with a local dev session instead.")
+                    .multilineTextAlignment(.center)
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 32)
+                Button {
+                    Task { await viewModel.signIn() }
+                } label: {
+                    if viewModel.isSigningIn {
+                        ProgressView().controlSize(.small)
+                    } else {
+                        Text("Continue with local dev sign-in")
+                    }
                 }
+                .keyboardShortcut(.defaultAction)
+                .disabled(viewModel.isSigningIn)
+            } else {
+                Button {
+                    Task { await viewModel.signIn() }
+                } label: {
+                    if viewModel.isSigningIn {
+                        ProgressView().controlSize(.small)
+                    } else {
+                        Text("Sign In")
+                    }
+                }
+                .keyboardShortcut(.defaultAction)
+                .disabled(viewModel.isSigningIn)
             }
-            .keyboardShortcut(.defaultAction)
-            .disabled(viewModel.isSigningIn)
             Spacer()
         }
         .padding(24)
