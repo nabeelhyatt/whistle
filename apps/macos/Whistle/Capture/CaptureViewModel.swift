@@ -12,6 +12,7 @@
 
 import AVFoundation
 import Foundation
+import Speech
 import WhistleCore
 
 /// Optional pre-fill used by the "Duplicate as new capture" entry point
@@ -55,13 +56,6 @@ public enum CaptureSubmitResult: Equatable {
     case refusedEmpty
 }
 
-/// What Esc should do, given current panel content (plan U8: "Esc with
-/// content -> confirm; Esc empty -> close").
-public enum EscAction: Equatable {
-    case close
-    case confirmThenClose
-}
-
 @MainActor
 public final class CaptureViewModel: ObservableObject {
     // MARK: - Published UI state
@@ -81,6 +75,20 @@ public final class CaptureViewModel: ObservableObject {
     @Published public private(set) var projects: [Project] = []
     @Published public var focusProjectPicker: Bool = false
 
+    /// Bumped every time the panel is shown -- fresh open, a resumed draft
+    /// (fix #4b/c), or a refocus while already open -- so `CaptureView` can
+    /// re-engage its `@FocusState` via `.onChange` even when SwiftUI's own
+    /// `.onAppear` doesn't refire (it won't for a panel that's merely
+    /// re-ordered front after being hidden, since the hosted view was never
+    /// removed from the window's view hierarchy). Plan U8 fix #3: "keyboard
+    /// focus must land in the main text box immediately... in BOTH panel
+    /// modes."
+    @Published public private(set) var focusRequestToken: Int = 0
+
+    public func requestTranscriptFocus() {
+        focusRequestToken += 1
+    }
+
     /// Debug-log-friendly timestamp captured at `beginCapture()` entry, used
     /// by `CapturePanelController` to compute (and log) the
     /// trigger-to-interactive latency called out in TECH-SPEC §4.2. Manual
@@ -99,6 +107,14 @@ public final class CaptureViewModel: ObservableObject {
     private let screenshotService: ScreenshotService
     private let transcriptionServiceFactory: () -> any TranscriptionService
     private let micPermissionChecker: () -> Bool
+    /// Real speech-recognition (SFSpeechRecognizer) TCC authorization,
+    /// separate from `micPermissionChecker` -- fix #5: transcription must
+    /// actually be gated on this, matching what the onboarding permission
+    /// row displays, rather than blindly attempting recognition regardless
+    /// of authorization (which would otherwise tight-loop retrying a task
+    /// that immediately errors on every restart when speech isn't
+    /// authorized).
+    private let speechPermissionChecker: () -> Bool
     private let defaultAgent: String
     private let defaultModel: String?
 
@@ -106,12 +122,12 @@ public final class CaptureViewModel: ObservableObject {
     private var transcriptionTask: Task<Void, Never>?
     private var projectsTask: Task<Void, Never>?
 
-    /// Committed transcript text accumulated by the transcription service,
-    /// kept separately from `transcriptText` so the user's manual edits
-    /// (the transcript field is editable per PRD F1.3) aren't clobbered by
-    /// a stray late update after the user has already started typing over
-    /// it. New transcription updates simply extend `transcriptText` as long
-    /// as the user hasn't diverged from what the service has produced.
+    /// The transcription service's own running display text as of the last
+    /// update, kept separately from `transcriptText` (the transcript field
+    /// is editable per PRD F1.3) so `applyTranscriptUpdate` can always
+    /// compute what's *newly* dictated and append just that, whether or not
+    /// the user has edited the field in the meantime -- the field must only
+    /// ever grow, never shrink or get silently rebuilt from scratch.
     private var lastServiceText: String = ""
 
     public init(
@@ -119,6 +135,7 @@ public final class CaptureViewModel: ObservableObject {
         screenshotService: ScreenshotService = ScreenshotService(),
         transcriptionServiceFactory: @escaping () -> any TranscriptionService = { TranscriptionServiceFactory.make() },
         micPermissionChecker: @escaping () -> Bool = { MicPermission.isAuthorized() },
+        speechPermissionChecker: @escaping () -> Bool = { SpeechRecognitionPermission.isAuthorized() },
         defaultAgent: String = "claude",
         defaultModel: String? = nil
     ) {
@@ -126,6 +143,7 @@ public final class CaptureViewModel: ObservableObject {
         self.screenshotService = screenshotService
         self.transcriptionServiceFactory = transcriptionServiceFactory
         self.micPermissionChecker = micPermissionChecker
+        self.speechPermissionChecker = speechPermissionChecker
         self.defaultAgent = defaultAgent
         self.defaultModel = defaultModel
     }
@@ -156,6 +174,42 @@ public final class CaptureViewModel: ObservableObject {
 
         loadProjects()
         startTranscriptionIfPermitted()
+        requestTranscriptFocus()
+    }
+
+    /// Re-activates a preserved but unsent draft (plan U8 fix #4b/c): the
+    /// panel was dismissed (Esc, or losing key/focus) while `transcriptText`/
+    /// `notesText`/`screenshotData` held content, and is now reopening.
+    /// Unlike `beginCapture`, this must NEVER reset those fields or
+    /// `clientId` -- the whole point is that the draft survives until
+    /// `clear()` or `submit()` -- and it never touches `screenshotData`, so
+    /// the controller must not fire a new screenshot capture on this path
+    /// either (fix #4c: "do NOT retake the screenshot over the draft's").
+    /// Transcription itself does restart (it was stopped on dismiss);
+    /// `lastServiceText` resets to `""` so the fresh transcription stream's
+    /// output is appended after the existing draft text rather than
+    /// replacing it, via the same reconciliation `applyTranscriptUpdate`
+    /// already does for a mid-dictation manual edit.
+    public func resumeDraft() {
+        captureBeganAt = Date()
+        lastServiceText = ""
+        isMicDenied = !micPermissionChecker()
+        startTranscriptionIfPermitted()
+        requestTranscriptFocus()
+    }
+
+    /// "Clear" button (plan U8 fix #4a): empties transcript, notes, and
+    /// screenshot, and mints a fresh `clientId` so a subsequent submit is
+    /// recorded as a distinct capture. The panel stays open and
+    /// transcription keeps running -- `lastServiceText` resets so dictation
+    /// after a clear starts fresh instead of trying to diff against the
+    /// discarded text.
+    public func clear() {
+        transcriptText = ""
+        notesText = ""
+        screenshotData = nil
+        lastServiceText = ""
+        clientId = UUID().uuidString
     }
 
     /// Called by `CapturePanelController` when the pre-panel screenshot
@@ -173,7 +227,14 @@ public final class CaptureViewModel: ObservableObject {
     // MARK: - Transcription
 
     private func startTranscriptionIfPermitted() {
-        guard !isMicDenied else { return }
+        // Gate on BOTH mic and speech-recognition authorization (fix #5):
+        // starting a recognition task without real speech authorization
+        // would otherwise error immediately and restart in a tight loop
+        // (LegacySpeechTranscriber immediately begins a fresh segment on
+        // every task error). Degrading silently to type-only mode here
+        // matches the mic-denied behavior and keeps this gate consistent
+        // with what onboarding's permission row displays.
+        guard !isMicDenied, speechPermissionChecker() else { return }
         let service = transcriptionServiceFactory()
         transcriptionService = service
         isListening = true
@@ -194,15 +255,51 @@ public final class CaptureViewModel: ObservableObject {
         }
     }
 
+    /// Reconciles a fresh `TranscriptUpdate` against whatever's currently in
+    /// the box. The field must only ever grow, never shrink or get wiped
+    /// out from under the user (the "pause then resume wipes the box" bug
+    /// this guards against) -- and a manual mid-dictation edit must never be
+    /// clobbered by a later update.
     private func applyTranscriptUpdate(_ update: TranscriptUpdate) {
         let newServiceText = update.displayText
-        // Only auto-extend the field if the user hasn't diverged from the
-        // transcription service's own running text -- otherwise a manual
-        // edit mid-dictation would be silently overwritten.
-        if transcriptText == lastServiceText || transcriptText.isEmpty {
+        defer { lastServiceText = newServiceText }
+
+        if transcriptText.isEmpty || (transcriptText == lastServiceText && newServiceText.hasPrefix(lastServiceText)) {
+            // Common case: no user edits since the last update, and the
+            // service's own text is a clean extension of what it last
+            // reported -- adopt it wholesale.
             transcriptText = newServiceText
+            return
         }
-        lastServiceText = newServiceText
+
+        // Either the user has diverged from the dictated text (a manual
+        // edit mid-dictation), or the service's text didn't extend cleanly
+        // (e.g. a segment restart producing something that doesn't share
+        // the prior prefix). Either way, never rebuild the field from
+        // scratch: append only the newly-dictated material onto whatever is
+        // already on screen, so dictation extends the user's edits instead
+        // of overwriting them.
+        appendDictated(newServiceText)
+    }
+
+    /// Appends the portion of `newServiceText` that's new since
+    /// `lastServiceText` onto `transcriptText`, rather than replacing the
+    /// field outright.
+    private func appendDictated(_ newServiceText: String) {
+        let addition: String
+        if newServiceText.hasPrefix(lastServiceText) {
+            addition = String(newServiceText.dropFirst(lastServiceText.count))
+        } else {
+            addition = newServiceText
+        }
+        let trimmedAddition = addition.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedAddition.isEmpty else { return }
+
+        if transcriptText.isEmpty || transcriptText.hasSuffix(" ") {
+            transcriptText += trimmedAddition
+        } else {
+            transcriptText += " " + trimmedAddition
+        }
     }
 
     /// Stops the transcription service (e.g. panel closing). Safe to call
@@ -264,13 +361,6 @@ public final class CaptureViewModel: ObservableObject {
         !transcriptText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             || !notesText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             || screenshotData != nil
-    }
-
-    // MARK: - Esc handling
-
-    /// Plan U8: "Esc with content -> confirm; Esc empty -> close."
-    public func escAction() -> EscAction {
-        hasContent ? .confirmThenClose : .close
     }
 
     // MARK: - Submit
@@ -351,5 +441,18 @@ public final class CaptureViewModel: ObservableObject {
 public enum MicPermission {
     public static func isAuthorized() -> Bool {
         AVCaptureDevice.authorizationStatus(for: .audio) == .authorized
+    }
+}
+
+// MARK: - Speech recognition permission seam
+
+/// Seam over `SFSpeechRecognizer.authorizationStatus()` (fix #5) -- the
+/// same real status `PermissionStep.swift`'s onboarding row displays, so
+/// transcription's gating and the onboarding display can never disagree.
+/// Status-only, like `MicPermission`: never itself prompts (onboarding owns
+/// requesting).
+public enum SpeechRecognitionPermission {
+    public static func isAuthorized() -> Bool {
+        SFSpeechRecognizer.authorizationStatus() == .authorized
     }
 }

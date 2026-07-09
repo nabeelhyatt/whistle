@@ -130,10 +130,21 @@ final class TranscriptStitchingTests: XCTestCase {
         await transcriber.stop()
     }
 
-    // MARK: Edge: task error mid-utterance -> new task starts, committed
-    // preserved, no dropped join-space or duplicated words
+    // MARK: Edge: task error mid-utterance -> new task starts, volatile
+    // text folded into committed (not dropped), no dropped join-space or
+    // duplicated words
+    //
+    // Regression coverage for the real-world "pause then resume wipes the
+    // box" bug: a real SFSpeechRecognizer commonly cancels the current task
+    // with an error (e.g. code 1110 "no speech detected") when the user
+    // pauses speaking for a beat *before* any `isFinal` result has fired for
+    // the in-flight utterance -- at that moment the spoken words exist only
+    // in `liveSegment`. The previous behavior discarded `liveSegment`
+    // outright on error, silently losing everything the user had just said.
+    // It must instead be folded into `committedTranscript`, exactly like
+    // `stop()` already does for the "stop mid-live-segment" case.
 
-    func testTaskErrorMidUtterancePreservesCommittedAndStartsFreshSegment() async {
+    func testTaskErrorMidUtteranceFoldsLiveIntoCommittedAndStartsFreshSegment() async {
         struct FakeError: Error {}
         let fake = FakeSpeechRecognitionEngine(segments: [
             [
@@ -165,12 +176,15 @@ final class TranscriptStitchingTests: XCTestCase {
 
         XCTAssertEqual(updates[0], TranscriptUpdate(committed: "first segment", live: ""))
         XCTAssertEqual(updates[1], TranscriptUpdate(committed: "first segment", live: "partial before error"))
-        // Error: committed preserved untouched, live cleared (not merged),
-        // so nothing from the aborted partial is duplicated later.
-        XCTAssertEqual(updates[2], TranscriptUpdate(committed: "first segment", live: ""))
+        // Error: the volatile hypothesis is folded into committed -- not
+        // dropped -- so the words the user just spoke survive the pause.
+        XCTAssertEqual(updates[2], TranscriptUpdate(committed: "first segment partial before error", live: ""))
         // Third segment's final text joins with exactly one space and no
         // duplicated words.
-        XCTAssertEqual(updates[3], TranscriptUpdate(committed: "first segment second segment", live: ""))
+        XCTAssertEqual(
+            updates[3],
+            TranscriptUpdate(committed: "first segment partial before error second segment", live: "")
+        )
 
         await transcriber.stop()
         let startTaskCallCount = await fake.state.startTaskCallCount

@@ -488,19 +488,24 @@ public struct CaptureCreateInput: Equatable, Sendable {
         }
 
         public func capturesRetry(id: String) async throws {
-            try await authedMutation("captures:retry", with: ["id": id])
+            // Arg key fixed to match the backend validator (`captures.retry`
+            // takes `captureId`, not `id`) -- same class of bug as
+            // `capturesGet` above: the call would otherwise fail with an
+            // ArgumentValidationError regardless of routing to the right
+            // endpoint.
+            try await authedMutation("captures:retry", with: ["captureId": id])
         }
 
         public func capturesDeleteScreenshot(id: String) async throws {
-            try await authedMutation("captures:deleteScreenshot", with: ["id": id])
+            try await authedMutation("captures:deleteScreenshot", with: ["captureId": id])
         }
 
         public func capturesMarkOpened(id: String) async throws {
-            try await authedMutation("captures:markOpened", with: ["id": id])
+            try await authedMutation("captures:markOpened", with: ["captureId": id])
         }
 
         public func capturesArchive(id: String) async throws {
-            try await authedMutation("captures:archive", with: ["id": id])
+            try await authedMutation("captures:archive", with: ["captureId": id])
         }
 
         // MARK: - Combine -> AsyncStream bridge

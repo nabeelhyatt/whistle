@@ -39,6 +39,15 @@ public final class StatusItemController: NSObject {
         didSet { updateReadyBadge() }
     }
 
+    /// The status item button's actual on-screen window frame -- consumed
+    /// by `CapturePanelController` (plan U8 fix #2) to anchor the capture
+    /// panel directly beneath the menu bar icon instead of guessing a
+    /// screen corner. `nil` before the button has a window (e.g. very
+    /// early in launch, or a headless/test context).
+    public var buttonWindowFrame: NSRect? {
+        statusItem.button?.window?.frame
+    }
+
     public init(authController: AuthController) {
         self.statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         self.authController = authController

@@ -125,6 +125,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let capturePanel = CapturePanelController(store: store)
         capturePanel.onHistoryRequested = { [weak self] in self?.showHistory() }
         capturePanel.onSettingsRequested = { [weak self] in self?.showSettings() }
+        // Fix #2: anchor the panel beneath the real status item icon rather
+        // than a hardcoded screen-corner guess.
+        capturePanel.statusItemButtonFrameProvider = { [weak statusItem] in statusItem?.buttonWindowFrame }
         capturePanel.registerHotkey()
         self.capturePanelController = capturePanel
 

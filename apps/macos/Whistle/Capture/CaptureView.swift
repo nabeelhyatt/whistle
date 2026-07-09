@@ -58,10 +58,14 @@ struct CaptureView: View {
         // render for a dark host.
         .preferredColorScheme(.dark)
         .onAppear {
-            transcriptFieldFocused = true
-            if viewModel.focusProjectPicker {
-                projectPickerFocused = true
-            }
+            applyInitialFocus()
+        }
+        .onChange(of: viewModel.focusRequestToken) { _, _ in
+            // Fires on every subsequent show -- fresh open, a resumed
+            // draft, or a plain refocus -- since `.onAppear` alone won't
+            // refire when a hidden-but-preserved panel is simply reordered
+            // front again (plan U8 fix #3).
+            applyInitialFocus()
         }
         .onExitCommand {
             onEscape()
@@ -69,6 +73,13 @@ struct CaptureView: View {
     }
 
     // MARK: - Header
+
+    private func applyInitialFocus() {
+        transcriptFieldFocused = true
+        if viewModel.focusProjectPicker {
+            projectPickerFocused = true
+        }
+    }
 
     private var header: some View {
         HStack(spacing: 8) {
@@ -219,6 +230,8 @@ struct CaptureView: View {
 
             Spacer(minLength: 8)
 
+            clearButton
+
             submitButton
         }
         .padding(.horizontal, 14)
@@ -229,6 +242,16 @@ struct CaptureView: View {
                 .fill(PanelTheme.borderHigh)
                 .frame(height: 1)
         }
+    }
+
+    private var clearButton: some View {
+        Button("Clear") {
+            viewModel.clear()
+        }
+        .font(.system(size: 12, weight: .medium))
+        .buttonStyle(.plain)
+        .foregroundStyle(PanelTheme.placeholderInk)
+        .disabled(!viewModel.hasContent)
     }
 
     private var submitButton: some View {

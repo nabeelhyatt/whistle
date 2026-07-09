@@ -19,6 +19,7 @@
 //   - Happy: screenshot upsell only after the first successful test
 //     capture; declining doesn't block completion.
 
+import AppKit
 import XCTest
 @testable import Whistle
 @testable import WhistleCore
@@ -314,6 +315,74 @@ final class OnboardingGatingTests: XCTestCase {
         viewModel.refreshPermissionStatuses()
         viewModel.continueFromPermissions()
         XCTAssertEqual(viewModel.step, .apiKey, "wizard never hard-blocks except sign-in and API key")
+    }
+
+    // MARK: Fix #5: the permissions row must reflect true live status, even
+    // if the user grants access in System Settings while this
+    // already-created window is merely backgrounded (the one-shot `.task`
+    // that normally refreshes on first appearance never reruns in that
+    // case) -- `OnboardingWindowController.windowDidBecomeKey` must
+    // re-trigger the refresh whenever the wizard regains focus on the
+    // permissions step, and must NOT do so on other steps.
+
+    func testWindowRegainingKeyStatusRefreshesStalePermissionRowOnPermissionsStep() async throws {
+        final class MutableFlag: @unchecked Sendable {
+            var granted = false
+        }
+        let speechFlag = MutableFlag()
+
+        let convex = FakeOnboardingConvexService()
+        let auth = AuthController(
+            authProvider: MockAuthProvider(),
+            convexService: convex,
+            breadcrumbStore: InMemoryAuthBreadcrumbStore()
+        )
+        let permissions = OnboardingPermissions(
+            micStatus: { .granted },
+            requestMic: { true },
+            speechStatus: { speechFlag.granted ? .granted : .denied },
+            requestSpeech: { speechFlag.granted },
+            speechModelAvailability: { .available }
+        )
+        let screenRecording = ScreenRecordingAccess(
+            isGranted: { false }, request: { false }, openSystemSettings: {}, relaunchApp: {}
+        )
+        let viewModel = OnboardingViewModel(
+            auth: auth,
+            convex: convex,
+            permissions: permissions,
+            screenRecording: screenRecording,
+            stateStore: InMemoryOnboardingStateStore()
+        )
+        let controller = OnboardingWindowController(viewModel: viewModel)
+
+        await viewModel.signIn()
+        viewModel.refreshPermissionStatuses()
+        XCTAssertEqual(viewModel.step, .permissions)
+        XCTAssertEqual(viewModel.speechState, .denied, "stale row: speech wasn't granted yet at last refresh")
+
+        // The user grants speech recognition in System Settings (outside
+        // this app) and switches back -- the window regains key status.
+        speechFlag.granted = true
+        controller.windowDidBecomeKey(Notification(name: NSWindow.didBecomeKeyNotification))
+
+        XCTAssertEqual(viewModel.speechState, .granted, "regaining key status on the permissions step must refresh")
+    }
+
+    func testWindowRegainingKeyStatusDoesNotRefreshOnOtherSteps() async throws {
+        let (viewModel, _, _, _) = OnboardingTestSupport.makeViewModel(speechGranted: false)
+        let controller = OnboardingWindowController(viewModel: viewModel)
+
+        await viewModel.signIn()
+        viewModel.refreshPermissionStatuses()
+        XCTAssertEqual(viewModel.speechState, .denied)
+        viewModel.continueFromPermissions()
+        XCTAssertEqual(viewModel.step, .apiKey)
+
+        // Regaining key status on a later step must not silently mutate
+        // permission state that's no longer being shown.
+        controller.windowDidBecomeKey(Notification(name: NSWindow.didBecomeKeyNotification))
+        XCTAssertEqual(viewModel.speechState, .denied)
     }
 
     func testSpeechModelUnavailableSurfacesSystemSettingsGuidanceButDoesNotBlock() async throws {
