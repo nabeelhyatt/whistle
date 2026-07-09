@@ -107,6 +107,14 @@ public final class AuthController: ObservableObject {
     /// is exactly 1 per successful sign-in (plan U6 happy-path scenario).
     @Published public private(set) var usersEnsureCallCount = 0
 
+    /// Human-readable reason the most recent sign-in attempt failed, for UI
+    /// surfaces (onboarding) to show instead of a generic "didn't complete"
+    /// message. `nil` while signing in and after a successful sign-in. The
+    /// underlying error is always NSLog'd as well — a sign-in failure must
+    /// never be silent (silent failure here is how the missing Convex
+    /// auth-attach bug went undiagnosed).
+    @Published public private(set) var lastSignInErrorMessage: String?
+
     /// True when this controller is driving the local dev sign-in fallback
     /// (`DevSignInAuthProvider`, used when no real Auth0 tenant is
     /// configured). UI surfaces label the signed-in state "Dev sign-in"
@@ -160,17 +168,22 @@ public final class AuthController: ObservableObject {
     public func signIn() async {
         guard state != .signingIn, state != .signedIn else { return }
         state = .signingIn
+        lastSignInErrorMessage = nil
         do {
             try await performInteractiveLogin()
         } catch {
             // Interactive login itself failed (user cancelled, network,
             // misconfigured tenant) — fall back to signed-out so the user
             // can retry, never crash.
+            NSLog("Whistle: interactive login failed: %@", String(describing: error))
+            lastSignInErrorMessage = "Sign-in didn't complete. Please try again."
             state = .signedOut
             return
         }
 
         guard await authProvider.currentIdToken() != nil else {
+            NSLog("Whistle: interactive login succeeded but no ID token is available from the credentials store")
+            lastSignInErrorMessage = "Signed in, but no session token was available. Please try again."
             state = .signedOut
             return
         }
@@ -195,6 +208,7 @@ public final class AuthController: ObservableObject {
             _ = try await convexService.usersEnsure()
             usersEnsureCallCount += 1
             breadcrumbStore.setHasSignedInBefore(true)
+            lastSignInErrorMessage = nil
             state = .signedIn
         } catch {
             // Dev sign-in is a purely local affordance: its mock token is
@@ -204,13 +218,24 @@ public final class AuthController: ObservableObject {
             // session).
             if isDevSignIn {
                 breadcrumbStore.setHasSignedInBefore(true)
+                lastSignInErrorMessage = nil
                 state = .signedIn
                 return
             }
-            // users.ensure failing (e.g. transient network) shouldn't strand
-            // the user in a half-signed-in state with no way forward —
-            // treat as a re-auth-required condition so the menu offers a
-            // retry affordance rather than silently doing nothing.
+            // NEVER swallow this error silently — log the underlying cause
+            // and publish a cause-specific message (backend auth rejection
+            // vs network/other) so the sign-in UI can say what actually
+            // went wrong.
+            NSLog("Whistle: users.ensure failed after sign-in: %@", String(describing: error))
+            if case ConvexServiceError.notAuthenticated = error {
+                lastSignInErrorMessage = "Signed in, but the Whistle backend couldn't verify the session. Please try signing in again."
+            } else {
+                lastSignInErrorMessage = "Signed in, but the Whistle backend couldn't be reached. Check your connection and try again."
+            }
+            // users.ensure failing shouldn't strand the user in a
+            // half-signed-in state with no way forward — treat as a
+            // re-auth-required condition so the menu offers a retry
+            // affordance rather than silently doing nothing.
             state = .reauthRequired
         }
     }

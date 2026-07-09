@@ -207,7 +207,9 @@ public final class OnboardingViewModel: ObservableObject {
         if auth.state == .signedIn {
             advance(to: .permissions)
         } else {
-            signInError = "Sign-in didn't complete. Please try again."
+            // Prefer the controller's cause-specific message (backend auth
+            // rejection vs network vs cancelled login) over the generic one.
+            signInError = auth.lastSignInErrorMessage ?? "Sign-in didn't complete. Please try again."
         }
     }
 

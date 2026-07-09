@@ -225,11 +225,11 @@ public struct CaptureCreateInput: Equatable, Sendable {
 // MARK: - LiveConvexService
 
 /// The real `ConvexServiceProtocol` implementation, backed by convex-swift's
-/// `ConvexClientWithAuth<Void>` (auth state is tracked by our own
-/// `WhistleAuthProvider`, so the generic payload convex-swift's
-/// `AuthProvider<T>` would normally carry isn't needed — we bridge our
-/// simpler `currentIdToken()` seam into convex-swift's callback-based
-/// `AuthProvider` internally).
+/// `ConvexClientWithAuth<String>` (the generic payload is the JWT itself —
+/// we bridge our simpler `currentIdToken()` seam into convex-swift's
+/// callback-based `AuthProvider` internally, and drive the client's
+/// `loginFromCache()` before authenticated calls so the token actually
+/// attaches to the websocket — see the "Auth attachment" section below).
 ///
 /// NOTE for U6: convex-swift's `subscribe` returns a Combine
 /// `AnyPublisher<T, ClientError>`, not an AsyncSequence. This wrapper
@@ -238,33 +238,121 @@ public struct CaptureCreateInput: Equatable, Sendable {
 /// deals in AsyncStream, matching `CaptureStore`'s idiom.
 #if canImport(ConvexMobile)
     public final class LiveConvexService: ConvexServiceProtocol, @unchecked Sendable {
-        private let client: ConvexClientWithAuth<Void>
+        private let client: ConvexClientWithAuth<String>
+        private let authGate = ConvexAuthAttachmentGate()
         private var cancellables: Set<AnyCancellable> = []
         private let lock = NSLock()
 
         /// - Parameters:
         ///   - deploymentUrl: Convex deployment URL (dashboard → Settings).
         ///   - authProvider: WhistleCore's own auth seam. Bridged internally
-        ///     into convex-swift's `AuthProvider<Void>` shape.
+        ///     into convex-swift's `AuthProvider<String>` shape.
         public init(deploymentUrl: String, authProvider: any WhistleAuthProvider) {
             let bridge = WhistleToConvexAuthProviderBridge(authProvider: authProvider)
             self.client = ConvexClientWithAuth(deploymentUrl: deploymentUrl, authProvider: bridge)
         }
 
+        // MARK: - Auth attachment
+        //
+        // convex-swift's `ConvexClientWithAuth` only attaches the JWT to the
+        // underlying websocket client inside its own `login()`/
+        // `loginFromCache()` — that is where `ffiClient.setAuthCallback` is
+        // invoked (see .build/checkouts/convex-swift ConvexMobile.swift).
+        // Constructing the client with an `AuthProvider` alone attaches
+        // NOTHING: every function call runs unauthenticated and the backend
+        // throws `NotAuthenticatedError` (this was the post-Auth0-sign-in
+        // "Sign-in didn't complete" bug). Every authenticated entry point
+        // below therefore drives `loginFromCache()` at least once before
+        // talking to the backend — covering both the fresh interactive-login
+        // path (AuthController calls `usersEnsure` right after Auth0 stores
+        // credentials) and the app-launch cached-session path — and
+        // re-attempts on the next call after a failed attach (e.g. token
+        // briefly unavailable).
+
+        private func ensureAuthAttached() async throws {
+            let attached = await authGate.runIfNeeded { [client] in
+                switch await client.loginFromCache() {
+                case .success:
+                    return true
+                case let .failure(error):
+                    NSLog("Whistle: attaching auth to Convex client failed: %@", String(describing: error))
+                    return false
+                }
+            }
+            guard attached else { throw ConvexServiceError.notAuthenticated }
+        }
+
+        /// Maps convex-swift's stringly server error for backend auth
+        /// rejections (`requireIdentity` throwing `NotAuthenticatedError`)
+        /// onto `ConvexServiceError.notAuthenticated`, so callers
+        /// (AuthController) can distinguish "backend rejected the session"
+        /// from network/transport failures.
+        private static func mapAuthError(_ error: Error) -> Error {
+            let description = String(describing: error)
+            if description.contains("NotAuthenticatedError") || description.contains("Not authenticated") {
+                return ConvexServiceError.notAuthenticated
+            }
+            return error
+        }
+
         // MARK: users
 
         public func usersEnsure() async throws -> String {
-            try await client.mutation("users:ensure")
+            try await ensureAuthAttached()
+            do {
+                return try await client.mutation("users:ensure")
+            } catch {
+                NSLog("Whistle: users:ensure failed: %@", String(describing: error))
+                throw Self.mapAuthError(error)
+            }
+        }
+
+        // MARK: - Authenticated call helpers (attach auth, then call)
+
+        private func authedMutation<T: Decodable>(
+            _ name: String, with args: [String: ConvexEncodable?]? = nil
+        ) async throws -> T {
+            try await ensureAuthAttached()
+            do {
+                return try await client.mutation(name, with: args)
+            } catch {
+                NSLog("Whistle: Convex mutation %@ failed: %@", name, String(describing: error))
+                throw Self.mapAuthError(error)
+            }
+        }
+
+        private func authedMutation(
+            _ name: String, with args: [String: ConvexEncodable?]? = nil
+        ) async throws {
+            let _: String? = try await authedMutation(name, with: args)
+        }
+
+        private func authedAction<T: Decodable>(
+            _ name: String, with args: [String: ConvexEncodable?]? = nil
+        ) async throws -> T {
+            try await ensureAuthAttached()
+            do {
+                return try await client.action(name, with: args)
+            } catch {
+                NSLog("Whistle: Convex action %@ failed: %@", name, String(describing: error))
+                throw Self.mapAuthError(error)
+            }
+        }
+
+        private func authedAction(
+            _ name: String, with args: [String: ConvexEncodable?]? = nil
+        ) async throws {
+            let _: String? = try await authedAction(name, with: args)
         }
 
         // MARK: settings
 
         public func settingsGet() async throws -> SettingsSnapshot {
-            try await client.mutation("settings:get")
+            try await authedMutation("settings:get")
         }
 
         public func settingsUpdate(_ patch: SettingsPatch) async throws {
-            try await client.mutation(
+            try await authedMutation(
                 "settings:update",
                 with: [
                     "defaultProjectId": patch.defaultProjectId,
@@ -276,17 +364,17 @@ public struct CaptureCreateInput: Equatable, Sendable {
         }
 
         public func settingsSetConductorKey(_ key: String) async throws {
-            try await client.mutation("settings:setConductorKey", with: ["conductorApiKey": key])
+            try await authedMutation("settings:setConductorKey", with: ["conductorApiKey": key])
         }
 
         // MARK: conductor
 
         public func conductorValidateKey(key: String?) async throws -> Bool {
-            try await client.action("conductor:validateKey", with: ["key": key])
+            try await authedAction("conductor:validateKey", with: ["key": key])
         }
 
         public func conductorRefreshProjects() async throws {
-            try await client.action("conductor:refreshProjects")
+            try await authedAction("conductor:refreshProjects")
         }
 
         // MARK: projects
@@ -298,27 +386,27 @@ public struct CaptureCreateInput: Equatable, Sendable {
         // MARK: templates
 
         public func templatesGet() async throws -> TemplateSnapshot {
-            try await client.mutation("templates:get")
+            try await authedMutation("templates:get")
         }
 
         public func templatesUpdate(body: String) async throws {
-            try await client.mutation("templates:update", with: ["body": body])
+            try await authedMutation("templates:update", with: ["body": body])
         }
 
         public func templatesReset() async throws {
-            try await client.mutation("templates:reset")
+            try await authedMutation("templates:reset")
         }
 
         // MARK: files
 
         public func filesGenerateUploadUrl() async throws -> String {
-            try await client.mutation("files:generateUploadUrl")
+            try await authedMutation("files:generateUploadUrl")
         }
 
         // MARK: captures
 
         public func capturesCreate(_ input: CaptureCreateInput) async throws -> String {
-            try await client.mutation(
+            try await authedMutation(
                 "captures:create",
                 with: [
                     "clientId": input.clientId,
@@ -335,31 +423,36 @@ public struct CaptureCreateInput: Equatable, Sendable {
         }
 
         public func capturesListRecent(limit: Int) -> AsyncStream<[ServerCaptureRecord]> {
-            asyncStream(subscribingTo: "captures:listRecent", args: ["limit": limit])
+            // `limit` MUST encode as a float64: the backend validator is
+            // `v.float64()` and convex-swift encodes Swift `Int` as an
+            // `$integer` (bigint), which Convex rejects with an
+            // ArgumentValidationError (observed repeatedly in deployment
+            // logs before this was fixed).
+            asyncStream(subscribingTo: "captures:listRecent", args: ["limit": Double(limit)])
         }
 
         public func capturesList() async throws -> [ServerCaptureRecord] {
-            try await client.mutation("captures:list")
+            try await authedMutation("captures:list")
         }
 
         public func capturesGet(id: String) async throws -> ServerCaptureRecord? {
-            try await client.mutation("captures:get", with: ["id": id])
+            try await authedMutation("captures:get", with: ["id": id])
         }
 
         public func capturesRetry(id: String) async throws {
-            try await client.mutation("captures:retry", with: ["id": id])
+            try await authedMutation("captures:retry", with: ["id": id])
         }
 
         public func capturesDeleteScreenshot(id: String) async throws {
-            try await client.mutation("captures:deleteScreenshot", with: ["id": id])
+            try await authedMutation("captures:deleteScreenshot", with: ["id": id])
         }
 
         public func capturesMarkOpened(id: String) async throws {
-            try await client.mutation("captures:markOpened", with: ["id": id])
+            try await authedMutation("captures:markOpened", with: ["id": id])
         }
 
         public func capturesArchive(id: String) async throws {
-            try await client.mutation("captures:archive", with: ["id": id])
+            try await authedMutation("captures:archive", with: ["id": id])
         }
 
         // MARK: - Combine -> AsyncStream bridge
@@ -369,29 +462,92 @@ public struct CaptureCreateInput: Equatable, Sendable {
             args: [String: ConvexEncodable?]? = nil
         ) -> AsyncStream<T> {
             AsyncStream { continuation in
-                let cancellable = self.client.subscribe(to: name, with: args, yielding: T.self)
-                    .sink(
-                        receiveCompletion: { _ in continuation.finish() },
-                        receiveValue: { value in continuation.yield(value) }
-                    )
-                self.lock.withLock { _ = self.cancellables.insert(cancellable) }
-                continuation.onTermination = { [weak self] _ in
-                    self?.lock.withLock { _ = self?.cancellables.remove(cancellable) }
-                    cancellable.cancel()
+                let subscriptionTask = Task { [weak self] in
+                    guard let self else {
+                        continuation.finish()
+                        return
+                    }
+                    // Best-effort auth attach BEFORE subscribing, so
+                    // authenticated queries don't land on the websocket
+                    // without a JWT. An unauthenticated subscribe still goes
+                    // through (matching prior behavior for the signed-out
+                    // state); the server then rejects it and the stream
+                    // finishes.
+                    try? await self.ensureAuthAttached()
+                    if Task.isCancelled {
+                        continuation.finish()
+                        return
+                    }
+                    let cancellable = self.client.subscribe(to: name, with: args, yielding: T.self)
+                        .sink(
+                            receiveCompletion: { completion in
+                                if case let .failure(error) = completion {
+                                    NSLog(
+                                        "Whistle: Convex subscription %@ failed: %@",
+                                        name, String(describing: error)
+                                    )
+                                }
+                                continuation.finish()
+                            },
+                            receiveValue: { value in continuation.yield(value) }
+                        )
+                    self.lock.withLock { _ = self.cancellables.insert(cancellable) }
+                    // Replaces the task-cancelling handler installed below;
+                    // by this point the task is finishing, so cancelling the
+                    // subscription itself is all termination needs to do.
+                    // (AsyncStream invokes a newly set onTermination
+                    // immediately if the stream already terminated, so the
+                    // subscription can't leak in that race.)
+                    continuation.onTermination = { [weak self] _ in
+                        self?.lock.withLock { _ = self?.cancellables.remove(cancellable) }
+                        cancellable.cancel()
+                    }
+                }
+                continuation.onTermination = { _ in
+                    subscriptionTask.cancel()
                 }
             }
         }
     }
 
+    /// Serializes "attach auth once; re-attempt after failure" semantics for
+    /// `LiveConvexService`. Internal (not private) so the sequencing
+    /// regression can be unit-tested without a live Convex client.
+    final class ConvexAuthAttachmentGate: @unchecked Sendable {
+        private let lock = NSLock()
+        private var attached = false
+
+        /// Runs `attach` unless a prior attempt already succeeded. Returns
+        /// the overall attached state. A failed attempt leaves the gate
+        /// open so the next call re-attempts.
+        func runIfNeeded(_ attach: () async -> Bool) async -> Bool {
+            if lock.withLock({ attached }) { return true }
+            let success = await attach()
+            if success {
+                lock.withLock { attached = true }
+            }
+            return success
+        }
+    }
+
     /// Bridges WhistleCore's pull-based `WhistleAuthProvider.currentIdToken()`
-    /// into convex-swift's push-based `AuthProvider<Void>` (login/logout/
+    /// into convex-swift's `AuthProvider<String>` (login/logout/
     /// loginFromCache with an `onIdToken` callback). WhistleCore never calls
     /// convex-swift's interactive `login()` UI flow itself — the app target
     /// owns presenting login UI (Auth0 or mock); this bridge only exists so
-    /// `ConvexClientWithAuth` can pull a current token via the same
-    /// `loginFromCache` path every time, which is all WhistleCore needs.
-    private final class WhistleToConvexAuthProviderBridge: AuthProvider, @unchecked Sendable {
-        typealias T = Void
+    /// `ConvexClientWithAuth.loginFromCache()` can pull a current token via
+    /// the same path every time, which is all WhistleCore needs.
+    ///
+    /// `T` is `String` — the JWT itself — because convex-swift's
+    /// `ConvexClientWithAuth.login(strategy:)` seeds its internal
+    /// `AuthTokenProviderBridge` with `extractIdToken(from: authData)`. The
+    /// previous `T == Void` version of this bridge returned `""` from
+    /// `extractIdToken`, which would have seeded the websocket auth
+    /// callback with an empty token; returning the real JWT makes the
+    /// token flow deterministic. Internal (not private) so the token
+    /// passthrough is unit-testable.
+    final class WhistleToConvexAuthProviderBridge: AuthProvider, @unchecked Sendable {
+        typealias T = String
 
         let authProvider: any WhistleAuthProvider
 
@@ -399,28 +555,31 @@ public struct CaptureCreateInput: Equatable, Sendable {
             self.authProvider = authProvider
         }
 
-        func login(onIdToken: @Sendable @escaping (String?) -> Void) async throws {
-            let token = await authProvider.currentIdToken()
-            onIdToken(token)
+        func login(onIdToken: @Sendable @escaping (String?) -> Void) async throws -> String {
+            try await currentToken(onIdToken: onIdToken)
         }
 
         func logout() async throws {}
 
-        func loginFromCache(onIdToken: @Sendable @escaping (String?) -> Void) async throws {
-            let token = await authProvider.currentIdToken()
-            onIdToken(token)
+        func loginFromCache(onIdToken: @Sendable @escaping (String?) -> Void) async throws -> String {
+            try await currentToken(onIdToken: onIdToken)
         }
 
-        func extractIdToken(from authResult: Void) -> String {
-            // convex-swift calls this to pull the token out of whatever
-            // `login`/`loginFromCache` returned; since our bridge never
-            // actually returns a token through `T` (it pushes eagerly via
-            // `onIdToken` instead), this is never meaningfully invoked with
-            // a token consumers rely on — return empty string. See U6 note
-            // below: this whole bridge should be revisited if convex-swift's
-            // token-pull path (`AuthTokenProviderBridge.fetchToken`) proves
-            // to need a real value here.
-            ""
+        func extractIdToken(from authResult: String) -> String {
+            authResult
+        }
+
+        private func currentToken(onIdToken: @Sendable @escaping (String?) -> Void) async throws -> String {
+            guard let token = await authProvider.currentIdToken() else {
+                // No token available (signed out / refresh failed). Throwing
+                // makes `ConvexClientWithAuth.loginFromCache()` resolve to
+                // `.failure` + `.unauthenticated`, which
+                // `LiveConvexService.ensureAuthAttached()` surfaces as
+                // `ConvexServiceError.notAuthenticated`.
+                throw ConvexServiceError.notAuthenticated
+            }
+            onIdToken(token)
+            return token
         }
     }
 #endif

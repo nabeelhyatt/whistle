@@ -173,6 +173,76 @@ final class AuthControllerTests: XCTestCase {
         XCTAssertEqual(convex.usersEnsureCallCount, 1)
     }
 
+    // MARK: Sign-in failure surfacing (regression: the Convex handshake
+    // failing after a SUCCESSFUL Auth0 login used to be silent — no log, no
+    // cause-specific message, just a generic "didn't complete").
+
+    func testBackendAuthRejectionSurfacesBackendSpecificErrorMessage() async {
+        let mockAuth = MockAuthProvider(fixedToken: "mock-id-token")
+        let convex = FakeConvexService()
+        convex.usersEnsureError = ConvexServiceError.notAuthenticated
+        let controller = AuthController(authProvider: mockAuth, convexService: convex)
+
+        await controller.signIn()
+
+        XCTAssertEqual(controller.state, .reauthRequired)
+        let message = controller.lastSignInErrorMessage
+        XCTAssertNotNil(message, "a backend auth rejection must publish a user-facing reason")
+        XCTAssertTrue(
+            message?.contains("backend couldn't verify") ?? false,
+            "backend-auth failure must be distinguishable from a network failure; got: \(message ?? "nil")"
+        )
+    }
+
+    func testNetworkishUsersEnsureFailureSurfacesConnectionErrorMessage() async {
+        let mockAuth = MockAuthProvider(fixedToken: "mock-id-token")
+        let convex = FakeConvexService()
+        convex.usersEnsureError = ConvexServiceError.requestFailed("socket closed")
+        let controller = AuthController(authProvider: mockAuth, convexService: convex)
+
+        await controller.signIn()
+
+        XCTAssertEqual(controller.state, .reauthRequired)
+        XCTAssertTrue(
+            controller.lastSignInErrorMessage?.contains("couldn't be reached") ?? false,
+            "non-auth failures should read as connection problems; got: \(controller.lastSignInErrorMessage ?? "nil")"
+        )
+    }
+
+    func testSuccessfulSignInClearsLastSignInErrorMessage() async {
+        let mockAuth = MockAuthProvider(fixedToken: "mock-id-token")
+        let convex = FakeConvexService()
+        convex.usersEnsureError = ConvexServiceError.notAuthenticated
+        let controller = AuthController(authProvider: mockAuth, convexService: convex)
+
+        await controller.signIn()
+        XCTAssertNotNil(controller.lastSignInErrorMessage)
+
+        // Retry with the backend healthy again (state is .reauthRequired,
+        // from which signIn() is a legal retry).
+        convex.usersEnsureError = nil
+        await controller.signIn()
+
+        XCTAssertEqual(controller.state, .signedIn)
+        XCTAssertNil(controller.lastSignInErrorMessage)
+    }
+
+    func testInteractiveLoginFailurePublishesRetryMessage() async {
+        let mockAuth = MockAuthProvider(fixedToken: nil)
+        let convex = FakeConvexService()
+        struct LoginCancelled: Error {}
+        let controller = AuthController(
+            authProvider: mockAuth,
+            convexService: convex,
+            performInteractiveLogin: { throw LoginCancelled() }
+        )
+
+        await controller.signIn()
+
+        XCTAssertEqual(controller.state, .signedOut)
+        XCTAssertNotNil(controller.lastSignInErrorMessage)
+    }
+
     func testSignOutClearsBreadcrumbAndReturnsToSignedOut() async {
         let mockAuth = MockAuthProvider(fixedToken: "mock-id-token")
         let convex = FakeConvexService()
