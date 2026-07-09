@@ -549,7 +549,7 @@ final class NotificationRoutingTests: XCTestCase {
         // Feed the pre-fill into a real CaptureViewModel the way
         // CapturePanelController.trigger(preFill:) does, and assert a fresh
         // clientId distinct from the original row's.
-        let captureViewModel = CaptureViewModel(store: store, transcriptionServiceFactory: { FakeTranscriptionService() }, micPermissionChecker: { true })
+        let captureViewModel = CaptureViewModel(store: store, transcriptionServiceFactory: { FakeTranscriptionService() }, micPermissionStatus: { .granted })
         captureViewModel.beginCapture(preFill: preFill)
 
         XCTAssertEqual(captureViewModel.transcriptText, "original transcript")

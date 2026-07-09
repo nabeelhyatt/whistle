@@ -70,6 +70,17 @@ public final class CapturePanelController: NSObject, NSWindowDelegate {
     /// creates (fix #2) -- wired by `WhistleApp` to `ProjectsSyncCoordinator.
     /// refreshIfStale()`.
     private let refreshProjectsIfStale: () -> Void
+    /// Permission seams (reset-deadlock fix), threaded straight into every
+    /// `CaptureViewModel` this controller creates -- default to the real
+    /// system implementations (matching `CaptureViewModel`'s own defaults)
+    /// so production is unaffected; tests override these with deterministic
+    /// (never `.notDetermined`) fakes so an automated `xcodebuild test` run
+    /// never fires a real TCC prompt via this controller's default-checker
+    /// tests.
+    private let micPermissionStatus: @MainActor () -> PermissionState
+    private let requestMicPermission: @MainActor () async -> Bool
+    private let speechPermissionStatus: @MainActor () -> PermissionState
+    private let requestSpeechPermission: @MainActor () async -> Bool
 
     private var panel: NSPanel?
     private var viewModel: CaptureViewModel?
@@ -127,12 +138,20 @@ public final class CapturePanelController: NSObject, NSWindowDelegate {
         store: CaptureStore,
         screenshotService: ScreenshotService = ScreenshotService(),
         mode: CapturePanelMode = CapturePanelMode.current(),
-        refreshProjectsIfStale: @escaping () -> Void = {}
+        refreshProjectsIfStale: @escaping () -> Void = {},
+        micPermissionStatus: @escaping @MainActor () -> PermissionState = { MicPermission.status() },
+        requestMicPermission: @escaping @MainActor () async -> Bool = { await MicPermission.request() },
+        speechPermissionStatus: @escaping @MainActor () -> PermissionState = { SpeechRecognitionPermission.status() },
+        requestSpeechPermission: @escaping @MainActor () async -> Bool = { await SpeechRecognitionPermission.request() }
     ) {
         self.store = store
         self.screenshotService = screenshotService
         self.mode = mode
         self.refreshProjectsIfStale = refreshProjectsIfStale
+        self.micPermissionStatus = micPermissionStatus
+        self.requestMicPermission = requestMicPermission
+        self.speechPermissionStatus = speechPermissionStatus
+        self.requestSpeechPermission = requestSpeechPermission
         super.init()
     }
 
@@ -221,6 +240,10 @@ public final class CapturePanelController: NSObject, NSWindowDelegate {
         let viewModel = CaptureViewModel(
             store: store,
             screenshotService: screenshotService,
+            micPermissionStatus: micPermissionStatus,
+            requestMicPermission: requestMicPermission,
+            speechPermissionStatus: speechPermissionStatus,
+            requestSpeechPermission: requestSpeechPermission,
             refreshProjectsIfStale: refreshProjectsIfStale
         )
 

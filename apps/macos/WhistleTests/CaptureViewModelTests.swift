@@ -115,18 +115,33 @@ private enum TestSupport {
     static let project1 = Project(id: "proj-1", name: "Project One", gitRemote: "git@example.com:one.git")
     static let project2 = Project(id: "proj-2", name: "Project Two", gitRemote: "git@example.com:two.git")
 
+    /// - Parameters:
+    ///   - micStatus/speechStatus: the tri-state TCC status each permission
+    ///     reports (reset-deadlock fix: `.notDetermined` is distinct from
+    ///     `.denied`). Defaults to `.granted` -- most tests don't care about
+    ///     permission gating at all.
+    ///   - micRequestResult/speechRequestResult: what `request()` resolves
+    ///     to, only exercised when the corresponding status is
+    ///     `.notDetermined`. Tests that need to observe `request()` being
+    ///     called (call counts, in-flight-vs-resolved banner state) instead
+    ///     construct `CaptureViewModel` directly with their own tracking
+    ///     closures -- see the dedicated notDetermined tests below.
     static func makeViewModel(
         store: CaptureStore,
-        micAuthorized: Bool = true,
-        speechAuthorized: Bool = true,
+        micStatus: PermissionState = .granted,
+        speechStatus: PermissionState = .granted,
+        micRequestResult: Bool = true,
+        speechRequestResult: Bool = true,
         transcriptionUpdates: [TranscriptUpdate] = []
     ) -> (viewModel: CaptureViewModel, transcription: FakeTranscriptionService) {
         let fake = FakeTranscriptionService(scriptedUpdates: transcriptionUpdates)
         let viewModel = CaptureViewModel(
             store: store,
             transcriptionServiceFactory: { fake },
-            micPermissionChecker: { micAuthorized },
-            speechPermissionChecker: { speechAuthorized }
+            micPermissionStatus: { micStatus },
+            requestMicPermission: { micRequestResult },
+            speechPermissionStatus: { speechStatus },
+            requestSpeechPermission: { speechRequestResult }
         )
         return (viewModel, fake)
     }
@@ -324,7 +339,7 @@ final class CaptureViewModelTests: XCTestCase {
         let (store, tempDir) = try TestSupport.makeStore()
         defer { try? FileManager.default.removeItem(at: tempDir) }
 
-        let (viewModel, transcription) = TestSupport.makeViewModel(store: store, micAuthorized: false)
+        let (viewModel, transcription) = TestSupport.makeViewModel(store: store, micStatus: .denied)
         viewModel.beginCapture()
 
         XCTAssertTrue(viewModel.isMicDenied)
@@ -355,8 +370,8 @@ final class CaptureViewModelTests: XCTestCase {
 
         let (viewModel, transcription) = TestSupport.makeViewModel(
             store: store,
-            micAuthorized: true,
-            speechAuthorized: false
+            micStatus: .granted,
+            speechStatus: .denied
         )
         viewModel.beginCapture()
 
@@ -376,7 +391,7 @@ final class CaptureViewModelTests: XCTestCase {
 
         let (viewModel, transcription) = TestSupport.makeViewModel(
             store: store,
-            micAuthorized: true,
+            micStatus: .granted,
             transcriptionUpdates: [
                 TranscriptUpdate(committed: "", live: "hello"),
                 TranscriptUpdate(committed: "hello world", live: ""),
@@ -393,6 +408,205 @@ final class CaptureViewModelTests: XCTestCase {
         XCTAssertEqual(viewModel.transcriptText, "hello world")
         let startCount = await transcription.startCallCount
         XCTAssertEqual(startCount, 1)
+    }
+
+    // MARK: Reset-deadlock fix -- `.notDetermined` at first capture must
+    // fire the real TCC request (which is what registers the app in System
+    // Settings -> Privacy in the first place), never render as the
+    // actionable "denied" banner while pending, and start transcription
+    // immediately on a granted callback with no relaunch/reopen needed.
+    // Root cause: after `tccutil reset Microphone` (or a fresh install),
+    // `AVCaptureDevice.authorizationStatus(for: .audio)` comes back
+    // `.notDetermined`; the old code treated anything != `.authorized` as
+    // denied and never called `requestAccess`, so the app never appeared in
+    // Settings and the user could never recover -- a genuine deadlock.
+
+    @MainActor
+    func testMicAuthorizedNeverCallsRequestAccess() async throws {
+        let (store, tempDir) = try TestSupport.makeStore()
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        var micRequestCallCount = 0
+        let fake = FakeTranscriptionService()
+        let viewModel = CaptureViewModel(
+            store: store,
+            transcriptionServiceFactory: { fake },
+            micPermissionStatus: { .granted },
+            requestMicPermission: {
+                micRequestCallCount += 1
+                return true
+            },
+            speechPermissionStatus: { .granted },
+            requestSpeechPermission: { true }
+        )
+
+        viewModel.beginCapture()
+        try await pollStartCallCount(fake, atLeast: 1)
+
+        XCTAssertEqual(micRequestCallCount, 0, "already-authorized mic must never call requestAccess")
+        XCTAssertFalse(viewModel.isMicDenied)
+    }
+
+    @MainActor
+    func testMicNotDeterminedRequestsAccessAndStartsTranscriptionWhenGranted() async throws {
+        let (store, tempDir) = try TestSupport.makeStore()
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        var micRequestCallCount = 0
+        let fake = FakeTranscriptionService()
+        let viewModel = CaptureViewModel(
+            store: store,
+            transcriptionServiceFactory: { fake },
+            micPermissionStatus: { .notDetermined },
+            requestMicPermission: {
+                micRequestCallCount += 1
+                return true
+            },
+            speechPermissionStatus: { .granted },
+            requestSpeechPermission: { true }
+        )
+
+        viewModel.beginCapture()
+
+        // Pending (or just-granted) must NEVER render as the denied banner
+        // -- that's the exact bug being fixed.
+        XCTAssertFalse(viewModel.isMicDenied, "notDetermined must never show as denied, pending or granted")
+
+        try await pollStartCallCount(fake, atLeast: 1)
+        XCTAssertEqual(micRequestCallCount, 1, "must call requestAccess exactly once for a notDetermined status")
+        XCTAssertFalse(viewModel.isMicDenied)
+    }
+
+    @MainActor
+    func testMicNotDeterminedRequestDeniedShowsBannerAndStaysTypeOnly() async throws {
+        let (store, tempDir) = try TestSupport.makeStore()
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        var micRequestCallCount = 0
+        let fake = FakeTranscriptionService()
+        let viewModel = CaptureViewModel(
+            store: store,
+            transcriptionServiceFactory: { fake },
+            micPermissionStatus: { .notDetermined },
+            requestMicPermission: {
+                micRequestCallCount += 1
+                return false
+            },
+            speechPermissionStatus: { .granted },
+            requestSpeechPermission: { true }
+        )
+
+        viewModel.beginCapture()
+        XCTAssertFalse(viewModel.isMicDenied, "must not show denied while the request is still in flight")
+
+        try await Whistle_waitUntil { viewModel.isMicDenied }
+        XCTAssertEqual(micRequestCallCount, 1)
+        let startCount = await fake.startCallCount
+        XCTAssertEqual(startCount, 0, "a denied request must never start transcription")
+
+        // Panel stays usable in type-only mode.
+        viewModel.notesText = "typed while mic denied"
+        XCTAssertTrue(viewModel.canSubmit)
+    }
+
+    @MainActor
+    func testSpeechNotDeterminedRequestsAuthorizationAndStartsTranscriptionWhenGranted() async throws {
+        let (store, tempDir) = try TestSupport.makeStore()
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        var speechRequestCallCount = 0
+        let fake = FakeTranscriptionService()
+        let viewModel = CaptureViewModel(
+            store: store,
+            transcriptionServiceFactory: { fake },
+            micPermissionStatus: { .granted },
+            requestMicPermission: { true },
+            speechPermissionStatus: { .notDetermined },
+            requestSpeechPermission: {
+                speechRequestCallCount += 1
+                return true
+            }
+        )
+
+        viewModel.beginCapture()
+        XCTAssertFalse(viewModel.isSpeechRecognitionDenied, "notDetermined must never show as denied, pending or granted")
+
+        try await pollStartCallCount(fake, atLeast: 1)
+        XCTAssertEqual(speechRequestCallCount, 1, "must call requestAuthorization exactly once for a notDetermined status")
+        XCTAssertFalse(viewModel.isSpeechRecognitionDenied)
+        XCTAssertFalse(viewModel.isMicDenied)
+    }
+
+    @MainActor
+    func testSpeechNotDeterminedRequestDeniedShowsBannerAndStaysTypeOnly() async throws {
+        let (store, tempDir) = try TestSupport.makeStore()
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        var speechRequestCallCount = 0
+        let fake = FakeTranscriptionService()
+        let viewModel = CaptureViewModel(
+            store: store,
+            transcriptionServiceFactory: { fake },
+            micPermissionStatus: { .granted },
+            requestMicPermission: { true },
+            speechPermissionStatus: { .notDetermined },
+            requestSpeechPermission: {
+                speechRequestCallCount += 1
+                return false
+            }
+        )
+
+        viewModel.beginCapture()
+        XCTAssertFalse(viewModel.isSpeechRecognitionDenied, "must not show denied while the request is still in flight")
+
+        try await Whistle_waitUntil { viewModel.isSpeechRecognitionDenied }
+        XCTAssertEqual(speechRequestCallCount, 1)
+        let startCount = await fake.startCallCount
+        XCTAssertEqual(startCount, 0, "a denied request must never start transcription")
+        XCTAssertFalse(viewModel.isMicDenied, "mic itself is authorized -- only speech recognition is denied here")
+    }
+
+    // MARK: Commit 5ff9c64 invariant (no mic access at app launch): merely
+    // constructing a `CaptureViewModel` -- the prewarm/launch path, before
+    // any real capture is ever triggered -- must never read mic/speech
+    // status or request access. Only `beginCapture`/`resumeDraft`/
+    // `refreshPermissions` (all first-real-capture-or-later paths) may.
+
+    @MainActor
+    func testConstructingViewModelNeverTouchesMicOrSpeechPermissions() throws {
+        let (store, tempDir) = try TestSupport.makeStore()
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        var micStatusCallCount = 0
+        var micRequestCallCount = 0
+        var speechStatusCallCount = 0
+        var speechRequestCallCount = 0
+
+        _ = CaptureViewModel(
+            store: store,
+            transcriptionServiceFactory: { FakeTranscriptionService() },
+            micPermissionStatus: {
+                micStatusCallCount += 1
+                return .notDetermined
+            },
+            requestMicPermission: {
+                micRequestCallCount += 1
+                return true
+            },
+            speechPermissionStatus: {
+                speechStatusCallCount += 1
+                return .notDetermined
+            },
+            requestSpeechPermission: {
+                speechRequestCallCount += 1
+                return true
+            }
+        )
+
+        XCTAssertEqual(micStatusCallCount, 0, "constructing alone must never check mic status (5ff9c64: no mic access at launch)")
+        XCTAssertEqual(micRequestCallCount, 0, "constructing alone must never request mic access")
+        XCTAssertEqual(speechStatusCallCount, 0, "constructing alone must never check speech status")
+        XCTAssertEqual(speechRequestCallCount, 0, "constructing alone must never request speech authorization")
     }
 
     // MARK: Regression: pause then resume must never wipe the transcript
@@ -414,8 +628,10 @@ final class CaptureViewModelTests: XCTestCase {
         let viewModel = CaptureViewModel(
             store: store,
             transcriptionServiceFactory: { manual },
-            micPermissionChecker: { true },
-            speechPermissionChecker: { true }
+            micPermissionStatus: { .granted },
+            requestMicPermission: { true },
+            speechPermissionStatus: { .granted },
+            requestSpeechPermission: { true }
         )
         viewModel.beginCapture()
 
@@ -459,8 +675,10 @@ final class CaptureViewModelTests: XCTestCase {
         let viewModel = CaptureViewModel(
             store: store,
             transcriptionServiceFactory: { manual },
-            micPermissionChecker: { true },
-            speechPermissionChecker: { true }
+            micPermissionStatus: { .granted },
+            requestMicPermission: { true },
+            speechPermissionStatus: { .granted },
+            requestSpeechPermission: { true }
         )
         viewModel.beginCapture()
 
@@ -591,8 +809,10 @@ final class CaptureViewModelTests: XCTestCase {
         let viewModel = CaptureViewModel(
             store: store,
             transcriptionServiceFactory: { FakeTranscriptionService() },
-            micPermissionChecker: { true },
-            speechPermissionChecker: { true },
+            micPermissionStatus: { .granted },
+            requestMicPermission: { true },
+            speechPermissionStatus: { .granted },
+            requestSpeechPermission: { true },
             refreshProjectsIfStale: { refreshCallCount += 1 }
         )
 
@@ -613,13 +833,15 @@ final class CaptureViewModelTests: XCTestCase {
         let (store, tempDir) = try TestSupport.makeStore()
         defer { try? FileManager.default.removeItem(at: tempDir) }
 
-        var micAuthorized = false
+        var micStatus: PermissionState = .denied
         let fake = FakeTranscriptionService()
         let viewModel = CaptureViewModel(
             store: store,
             transcriptionServiceFactory: { fake },
-            micPermissionChecker: { micAuthorized },
-            speechPermissionChecker: { true }
+            micPermissionStatus: { micStatus },
+            requestMicPermission: { true },
+            speechPermissionStatus: { .granted },
+            requestSpeechPermission: { true }
         )
 
         viewModel.beginCapture()
@@ -629,7 +851,7 @@ final class CaptureViewModelTests: XCTestCase {
 
         // Simulate the user toggling mic access off/on in System Settings
         // while the app keeps running -- no relaunch.
-        micAuthorized = true
+        micStatus = .granted
         viewModel.refreshPermissions()
 
         XCTAssertFalse(viewModel.isMicDenied, "refreshPermissions must re-check fresh, not reuse the latched flag")
@@ -643,20 +865,22 @@ final class CaptureViewModelTests: XCTestCase {
         let (store, tempDir) = try TestSupport.makeStore()
         defer { try? FileManager.default.removeItem(at: tempDir) }
 
-        var speechAuthorized = false
+        var speechStatus: PermissionState = .denied
         let fake = FakeTranscriptionService()
         let viewModel = CaptureViewModel(
             store: store,
             transcriptionServiceFactory: { fake },
-            micPermissionChecker: { true },
-            speechPermissionChecker: { speechAuthorized }
+            micPermissionStatus: { .granted },
+            requestMicPermission: { true },
+            speechPermissionStatus: { speechStatus },
+            requestSpeechPermission: { true }
         )
 
         viewModel.beginCapture()
         XCTAssertTrue(viewModel.isSpeechRecognitionDenied)
         XCTAssertFalse(viewModel.isMicDenied)
 
-        speechAuthorized = true
+        speechStatus = .granted
         viewModel.refreshPermissions()
 
         XCTAssertFalse(viewModel.isSpeechRecognitionDenied)
@@ -674,8 +898,10 @@ final class CaptureViewModelTests: XCTestCase {
         let viewModel = CaptureViewModel(
             store: store,
             transcriptionServiceFactory: { fake },
-            micPermissionChecker: { true },
-            speechPermissionChecker: { true }
+            micPermissionStatus: { .granted },
+            requestMicPermission: { true },
+            speechPermissionStatus: { .granted },
+            requestSpeechPermission: { true }
         )
 
         viewModel.beginCapture()
@@ -744,7 +970,7 @@ final class CapturePanelControllerTests: XCTestCase {
             defer { try? FileManager.default.removeItem(at: tempDir) }
             try store.saveProjectsSnapshot([TestSupport.project1])
 
-            let controller = CapturePanelController(store: store, mode: mode)
+            let controller = CapturePanelController(store: store, mode: mode, micPermissionStatus: { .granted }, speechPermissionStatus: { .granted })
             controller.trigger()
             // Poll rather than a fixed sleep: `.activating` mode's
             // NSApp.activate()/makeKeyAndOrderFront() can lag under
@@ -772,7 +998,7 @@ final class CapturePanelControllerTests: XCTestCase {
 
             let counter = CaptureCounter()
             let screenshotService = makeCountingScreenshotService(counter: counter)
-            let controller = CapturePanelController(store: store, screenshotService: screenshotService, mode: mode)
+            let controller = CapturePanelController(store: store, screenshotService: screenshotService, mode: mode, micPermissionStatus: { .granted }, speechPermissionStatus: { .granted })
 
             controller.trigger()
             // Allow the async screenshot capture task to run.
@@ -796,7 +1022,7 @@ final class CapturePanelControllerTests: XCTestCase {
 
             let counter = CaptureCounter()
             let screenshotService = makeCountingScreenshotService(counter: counter)
-            let controller = CapturePanelController(store: store, screenshotService: screenshotService, mode: mode)
+            let controller = CapturePanelController(store: store, screenshotService: screenshotService, mode: mode, micPermissionStatus: { .granted }, speechPermissionStatus: { .granted })
 
             controller.trigger()
             try await Task.sleep(nanoseconds: 20_000_000)
@@ -829,7 +1055,7 @@ final class CapturePanelControllerTests: XCTestCase {
         let (store, tempDir) = try makeStore()
         defer { try? FileManager.default.removeItem(at: tempDir) }
 
-        let controller = CapturePanelController(store: store)
+        let controller = CapturePanelController(store: store, micPermissionStatus: { .granted }, speechPermissionStatus: { .granted })
         controller.trigger()
         try await Whistle_waitUntil { controller.isPanelOpen }
 
@@ -850,7 +1076,7 @@ final class CapturePanelControllerTests: XCTestCase {
 
         let counter = CaptureCounter()
         let screenshotService = makeCountingScreenshotService(counter: counter)
-        let controller = CapturePanelController(store: store, screenshotService: screenshotService)
+        let controller = CapturePanelController(store: store, screenshotService: screenshotService, micPermissionStatus: { .granted }, speechPermissionStatus: { .granted })
 
         controller.trigger()
         try await Task.sleep(nanoseconds: 20_000_000)
@@ -880,15 +1106,14 @@ final class CapturePanelControllerTests: XCTestCase {
         let (store, tempDir) = try makeStore()
         defer { try? FileManager.default.removeItem(at: tempDir) }
 
-        let controller = CapturePanelController(store: store)
+        let controller = CapturePanelController(store: store, micPermissionStatus: { .granted }, speechPermissionStatus: { .granted })
         controller.trigger()
         try await Whistle_waitUntil { controller.isPanelOpen }
 
-        // beginCapture() already ran with the real (permitted-in-test-host
-        // or denied, whichever) mic checker; force the view model into a
-        // known "denied" state to observe windowDidBecomeKey's effect
-        // deterministically, independent of the test host's actual mic
-        // authorization.
+        // beginCapture() already ran with a deterministic granted mic/speech
+        // status (never the real system checkers -- the reset-deadlock fix
+        // means a real `.notDetermined` host would otherwise fire an actual
+        // TCC prompt during this automated run).
         XCTAssertNotNil(controller.currentViewModel)
 
         // windowDidBecomeKey must be safe to call directly (as
@@ -910,7 +1135,9 @@ final class CapturePanelControllerTests: XCTestCase {
         var refreshCallCount = 0
         let controller = CapturePanelController(
             store: store,
-            refreshProjectsIfStale: { refreshCallCount += 1 }
+            refreshProjectsIfStale: { refreshCallCount += 1 },
+            micPermissionStatus: { .granted },
+            speechPermissionStatus: { .granted }
         )
 
         controller.trigger()

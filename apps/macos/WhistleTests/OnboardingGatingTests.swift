@@ -597,7 +597,7 @@ final class OnboardingGatingTests: XCTestCase {
         let viewModel = CaptureViewModel(
             store: captureStore,
             transcriptionServiceFactory: { FakeTranscriptionService() },
-            micPermissionChecker: { true }
+            micPermissionStatus: { .granted }
         )
         viewModel.beginCapture()
         viewModel.notesText = "guided test capture"
