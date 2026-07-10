@@ -66,6 +66,8 @@ public final class CapturePanelController: NSObject, NSWindowDelegate {
     private let store: CaptureStore
     private let screenshotService: ScreenshotService
     private let mode: CapturePanelMode
+    private let transcriptionServiceFactory: () -> any TranscriptionService
+    private let micPermissionChecker: () -> Bool
 
     private var panel: NSPanel?
     private var viewModel: CaptureViewModel?
@@ -110,11 +112,15 @@ public final class CapturePanelController: NSObject, NSWindowDelegate {
     public init(
         store: CaptureStore,
         screenshotService: ScreenshotService = ScreenshotService(),
-        mode: CapturePanelMode = CapturePanelMode.current()
+        mode: CapturePanelMode = CapturePanelMode.current(),
+        transcriptionServiceFactory: @escaping () -> any TranscriptionService = { TranscriptionServiceFactory.make() },
+        micPermissionChecker: @escaping () -> Bool = { MicPermission.isAuthorized() }
     ) {
         self.store = store
         self.screenshotService = screenshotService
         self.mode = mode
+        self.transcriptionServiceFactory = transcriptionServiceFactory
+        self.micPermissionChecker = micPermissionChecker
         super.init()
     }
 
@@ -175,7 +181,12 @@ public final class CapturePanelController: NSObject, NSWindowDelegate {
     // MARK: - Panel construction
 
     private func makePanel() -> (NSPanel, CaptureViewModel) {
-        let viewModel = CaptureViewModel(store: store, screenshotService: screenshotService)
+        let viewModel = CaptureViewModel(
+            store: store,
+            screenshotService: screenshotService,
+            transcriptionServiceFactory: transcriptionServiceFactory,
+            micPermissionChecker: micPermissionChecker
+        )
 
         let captureView = CaptureView(
             viewModel: viewModel,

@@ -213,7 +213,7 @@ final class LiveSpeechAnalyzerEngine: SpeechAnalyzerResultsEngine, @unchecked Se
 /// 26 or a real `SpeechAnalyzer`.
 public actor SpeechAnalyzerTranscriber: TranscriptionService {
     private let locale: Locale
-    private let audioTap: AudioEngineTap
+    private let audioTap: any AudioTap
     private let engineFactory: () -> any SpeechAnalyzerResultsEngine
 
     private var engine: (any SpeechAnalyzerResultsEngine)?
@@ -224,7 +224,7 @@ public actor SpeechAnalyzerTranscriber: TranscriptionService {
 
     public init(
         locale: Locale = Locale(identifier: "en-US"),
-        audioTap: AudioEngineTap = AudioEngineTap(),
+        audioTap: any AudioTap = AudioEngineTap(),
         engineFactory: (() -> any SpeechAnalyzerResultsEngine)? = nil
     ) {
         self.locale = locale

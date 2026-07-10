@@ -13,6 +13,19 @@ import AVFoundation
 import XCTest
 @testable import Whistle
 
+// MARK: - Fake AudioTap (shared by both transcribers below)
+
+/// No-op `AudioTap`: these tests drive stitching entirely through fake
+/// recognition engines, so no real `AVAudioEngine` may be constructed — on
+/// hardware-less CI runners, a real tap's `prewarm()`/`start()` traps
+/// fatally inside AVFAudio (uncatchable), which previously looped
+/// xcodebuild's crash recovery for hours.
+final class NoOpAudioTap: AudioTap, @unchecked Sendable {
+    func prewarm() {}
+    func start(onBuffer: @escaping (AVAudioPCMBuffer, AVAudioTime) -> Void) throws {}
+    func stop() {}
+}
+
 // MARK: - Fake SpeechRecognitionEngine (LegacySpeechTranscriber)
 
 /// Scriptable fake for `SpeechRecognitionEngine`. Each call to
@@ -114,7 +127,7 @@ final class TranscriptStitchingTests: XCTestCase {
             ],
             [], // second segment starts but yields nothing further in this test
         ])
-        let transcriber = LegacySpeechTranscriber(engineFactory: { fake })
+        let transcriber = LegacySpeechTranscriber(audioTap: NoOpAudioTap(), engineFactory: { fake })
 
         let stream = await transcriber.start()
         var updates: [TranscriptUpdate] = []
@@ -154,7 +167,7 @@ final class TranscriptStitchingTests: XCTestCase {
             // pattern in `testThreeConsecutiveFinalizationsConcatenateInOrder`.
             [],
         ])
-        let transcriber = LegacySpeechTranscriber(engineFactory: { fake })
+        let transcriber = LegacySpeechTranscriber(audioTap: NoOpAudioTap(), engineFactory: { fake })
 
         let stream = await transcriber.start()
         var updates: [TranscriptUpdate] = []
@@ -186,7 +199,7 @@ final class TranscriptStitchingTests: XCTestCase {
             [.event(SpeechRecognitionEvent(text: "three", isFinal: true))],
             [],
         ])
-        let transcriber = LegacySpeechTranscriber(engineFactory: { fake })
+        let transcriber = LegacySpeechTranscriber(audioTap: NoOpAudioTap(), engineFactory: { fake })
 
         let stream = await transcriber.start()
         var updates: [TranscriptUpdate] = []
@@ -214,7 +227,7 @@ final class TranscriptStitchingTests: XCTestCase {
                 .event(SpeechRecognitionEvent(text: "trailing live hypothesis", isFinal: false)),
             ],
         ])
-        let transcriber = LegacySpeechTranscriber(engineFactory: { fake })
+        let transcriber = LegacySpeechTranscriber(audioTap: NoOpAudioTap(), engineFactory: { fake })
 
         let stream = await transcriber.start()
         var iterator = stream.makeAsyncIterator()
@@ -322,7 +335,7 @@ final class SpeechAnalyzerTranscriberStitchingTests: XCTestCase {
             .event(SpeechAnalyzerResultEvent(text: "hello world", isFinalized: false)),
             .event(SpeechAnalyzerResultEvent(text: "hello world final", isFinalized: true)),
         ])
-        let transcriber = SpeechAnalyzerTranscriber(engineFactory: { fake })
+        let transcriber = SpeechAnalyzerTranscriber(audioTap: NoOpAudioTap(), engineFactory: { fake })
 
         let stream = await transcriber.start()
         var updates: [TranscriptUpdate] = []
@@ -345,7 +358,7 @@ final class SpeechAnalyzerTranscriberStitchingTests: XCTestCase {
             .event(SpeechAnalyzerResultEvent(text: "partial", isFinalized: false)),
             .error(FakeError()),
         ])
-        let transcriber = SpeechAnalyzerTranscriber(engineFactory: { fake })
+        let transcriber = SpeechAnalyzerTranscriber(audioTap: NoOpAudioTap(), engineFactory: { fake })
 
         let stream = await transcriber.start()
         var updates: [TranscriptUpdate] = []
@@ -367,7 +380,7 @@ final class SpeechAnalyzerTranscriberStitchingTests: XCTestCase {
             .event(SpeechAnalyzerResultEvent(text: "two", isFinalized: true)),
             .event(SpeechAnalyzerResultEvent(text: "three", isFinalized: true)),
         ])
-        let transcriber = SpeechAnalyzerTranscriber(engineFactory: { fake })
+        let transcriber = SpeechAnalyzerTranscriber(audioTap: NoOpAudioTap(), engineFactory: { fake })
 
         let stream = await transcriber.start()
         var updates: [TranscriptUpdate] = []
@@ -388,7 +401,7 @@ final class SpeechAnalyzerTranscriberStitchingTests: XCTestCase {
             .event(SpeechAnalyzerResultEvent(text: "committed part", isFinalized: true)),
             .event(SpeechAnalyzerResultEvent(text: "trailing live hypothesis", isFinalized: false)),
         ])
-        let transcriber = SpeechAnalyzerTranscriber(engineFactory: { fake })
+        let transcriber = SpeechAnalyzerTranscriber(audioTap: NoOpAudioTap(), engineFactory: { fake })
 
         let stream = await transcriber.start()
         var iterator = stream.makeAsyncIterator()

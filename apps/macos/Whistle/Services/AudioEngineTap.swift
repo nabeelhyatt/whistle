@@ -12,12 +12,25 @@
 import AVFoundation
 import Foundation
 
+/// Injection seam for the audio-capture layer, mirroring how
+/// `SpeechRecognitionEngine` / `SpeechAnalyzerResultsEngine` abstract the
+/// recognition layer — lets tests inject a no-op tap so no real
+/// `AVAudioEngine` is ever touched (hardware-less CI runners have no input
+/// device, and a real engine's `prewarm()`/`start()` traps fatally deep
+/// inside AVFAudio rather than throwing, which no test-side do/catch can
+/// recover from).
+public protocol AudioTap: AnyObject {
+    func prewarm()
+    func start(onBuffer: @escaping (AVAudioPCMBuffer, AVAudioTime) -> Void) throws
+    func stop()
+}
+
 /// Thin wrapper around `AVAudioEngine` so `LegacySpeechTranscriber` /
 /// `SpeechAnalyzerTranscriber` don't each duplicate tap-install/engine
 /// lifecycle logic. Not an actor itself — it's always driven from inside
 /// the owning transcriber actor (TECH-SPEC §4.1 concurrency note), which is
 /// what actually serializes access.
-public final class AudioEngineTap {
+public final class AudioEngineTap: AudioTap {
     private let engine = AVAudioEngine()
     private var isTapInstalled = false
     private(set) var isRunning = false
@@ -26,7 +39,7 @@ public final class AudioEngineTap {
 
     /// Installs the input tap immediately (prewarm) but does not start the
     /// engine. Safe to call once, at owner-init time.
-    func prewarm() {
+    public func prewarm() {
         guard !isTapInstalled else { return }
         let input = engine.inputNode
         let format = input.outputFormat(forBus: 0)
@@ -52,7 +65,7 @@ public final class AudioEngineTap {
     /// lifetime (task-cycling per §4.1b re-uses the *engine*, not this
     /// method, across segments — this is only called once per capture
     /// session).
-    func start(onBuffer: @escaping (AVAudioPCMBuffer, AVAudioTime) -> Void) throws {
+    public func start(onBuffer: @escaping (AVAudioPCMBuffer, AVAudioTime) -> Void) throws {
         guard !isRunning else { return }
         let input = engine.inputNode
         let format = input.outputFormat(forBus: 0)
@@ -69,7 +82,7 @@ public final class AudioEngineTap {
     /// Stops the engine and removes the tap entirely (end of capture
     /// session — not used between task-cycling segments, since §4.1b
     /// requires the engine to never stop between segments).
-    func stop() {
+    public func stop() {
         guard isRunning else { return }
         engine.inputNode.removeTap(onBus: 0)
         engine.stop()

@@ -395,7 +395,12 @@ final class CapturePanelControllerTests: XCTestCase {
             defer { try? FileManager.default.removeItem(at: tempDir) }
             try store.saveProjectsSnapshot([TestSupport.project1])
 
-            let controller = CapturePanelController(store: store, mode: mode)
+            let controller = CapturePanelController(
+                store: store,
+                mode: mode,
+                transcriptionServiceFactory: { FakeTranscriptionService() },
+                micPermissionChecker: { true }
+            )
             controller.trigger()
             try await Task.sleep(nanoseconds: 20_000_000)
 
@@ -422,7 +427,13 @@ final class CapturePanelControllerTests: XCTestCase {
 
             let counter = CaptureCounter()
             let screenshotService = makeCountingScreenshotService(counter: counter)
-            let controller = CapturePanelController(store: store, screenshotService: screenshotService, mode: mode)
+            let controller = CapturePanelController(
+                store: store,
+                screenshotService: screenshotService,
+                mode: mode,
+                transcriptionServiceFactory: { FakeTranscriptionService() },
+                micPermissionChecker: { true }
+            )
 
             controller.trigger()
             // Allow the async screenshot capture task to run.

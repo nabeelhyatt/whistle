@@ -173,7 +173,7 @@ enum TranscriptionError: Error {
 public actor LegacySpeechTranscriber: TranscriptionService {
     private let locale: Locale
     private let engineFactory: () -> any SpeechRecognitionEngine
-    private let audioTap: AudioEngineTap
+    private let audioTap: any AudioTap
 
     private var recognitionEngine: (any SpeechRecognitionEngine)?
     private var committedTranscript = ""
@@ -189,7 +189,7 @@ public actor LegacySpeechTranscriber: TranscriptionService {
     /// runs with no mic and no TCC at all.
     public init(
         locale: Locale = Locale(identifier: "en-US"),
-        audioTap: AudioEngineTap = AudioEngineTap(),
+        audioTap: any AudioTap = AudioEngineTap(),
         engineFactory: (() -> any SpeechRecognitionEngine)? = nil
     ) {
         self.locale = locale
