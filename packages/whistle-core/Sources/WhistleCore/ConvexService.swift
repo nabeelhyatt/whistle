@@ -14,6 +14,11 @@
 //     client; `T` is whatever the AuthProvider's login returns.
 //   - `subscribe<T: Decodable>(to: String, with: [String: ConvexEncodable?]?, yielding:) -> AnyPublisher<T, ClientError>`
 //     — Combine-based, NOT AsyncSequence-based. `name` is "module:function".
+//     This is ALSO the only way to run a one-shot Convex *query*: 0.8.1
+//     exposes no `query(_:with:)` method at all (confirmed by reading
+//     ConvexMobile.swift — only `subscribe`, `mutation`, `action` exist on
+//     `ConvexClient`). Queries must therefore be driven through `subscribe`
+//     and reduced to a single value (see `LiveConvexService.firstValue`).
 //   - `mutation<T: Decodable>(_:with:) async throws -> T` and a
 //     void-returning overload.
 //   - `action<T: Decodable>(_:with:) async throws -> T` and a void-returning
@@ -345,10 +350,33 @@ public struct CaptureCreateInput: Equatable, Sendable {
             let _: String? = try await authedAction(name, with: args)
         }
 
+        /// Runs a one-shot Convex *query* (`settings:get`, `templates:get`,
+        /// `captures:list`, `captures:get`). convex-swift 0.8.1 has no
+        /// one-shot query method, so this subscribes via `client.subscribe`,
+        /// takes the first yielded value, and cancels — see
+        /// `LiveConvexService.firstValue` for the mechanics and
+        /// `ConvexOneShotQueryTests` for coverage of that helper against a
+        /// synthetic publisher (this method itself can't be driven
+        /// hermetically without a live `ConvexClient`, same constraint noted
+        /// in `ConvexAuthAttachmentTests`).
+        private func authedQuery<T: Decodable & Sendable>(
+            _ name: String, with args: [String: ConvexEncodable?]? = nil
+        ) async throws -> T {
+            try await ensureAuthAttached()
+            do {
+                return try await Self.firstValue(
+                    from: client.subscribe(to: name, with: args, yielding: T.self)
+                )
+            } catch {
+                NSLog("Whistle: Convex query %@ failed: %@", name, String(describing: error))
+                throw Self.mapAuthError(error)
+            }
+        }
+
         // MARK: settings
 
         public func settingsGet() async throws -> SettingsSnapshot {
-            try await authedMutation("settings:get")
+            try await authedQuery("settings:get")
         }
 
         public func settingsUpdate(_ patch: SettingsPatch) async throws {
@@ -370,11 +398,26 @@ public struct CaptureCreateInput: Equatable, Sendable {
         // MARK: conductor
 
         public func conductorValidateKey(key: String?) async throws -> Bool {
-            try await authedAction("conductor:validateKey", with: ["key": key])
+            // NOTE: this action lives in `projects.ts` on the backend (there
+            // is no `conductor` Convex module — `conductorClient.ts` is a
+            // plain helper, not a functions file), so the wire name is
+            // "projects:validateKey", not "conductor:validateKey" (the
+            // latter throws "Could not find function" on every call). The
+            // handler also returns `{ ok, error? }`, not a bare bool, and
+            // takes `apiKey`, not `key` — all three had to be fixed together
+            // for this call to actually reach and decode correctly.
+            let result: ConductorActionResult = try await authedAction(
+                "projects:validateKey", with: ["apiKey": key]
+            )
+            return result.ok
         }
 
         public func conductorRefreshProjects() async throws {
-            try await authedAction("conductor:refreshProjects")
+            // Same module-name correction as `conductorValidateKey` above;
+            // also decodes the actual `{ ok, error? }` response shape
+            // instead of the previous `String?` guess (which would have
+            // thrown a decoding error on every successful call).
+            let _: ConductorActionResult = try await authedAction("projects:refreshProjects")
         }
 
         // MARK: projects
@@ -386,7 +429,7 @@ public struct CaptureCreateInput: Equatable, Sendable {
         // MARK: templates
 
         public func templatesGet() async throws -> TemplateSnapshot {
-            try await authedMutation("templates:get")
+            try await authedQuery("templates:get")
         }
 
         public func templatesUpdate(body: String) async throws {
@@ -432,27 +475,37 @@ public struct CaptureCreateInput: Equatable, Sendable {
         }
 
         public func capturesList() async throws -> [ServerCaptureRecord] {
-            try await authedMutation("captures:list")
+            try await authedQuery("captures:list")
         }
 
         public func capturesGet(id: String) async throws -> ServerCaptureRecord? {
-            try await authedMutation("captures:get", with: ["id": id])
+            // Arg key fixed to match the backend validator (`captures.get`
+            // takes `captureId`, not `id`) — this had to be corrected
+            // alongside the call-type fix, since routing this to the right
+            // endpoint but with the wrong arg name would still fail with an
+            // ArgumentValidationError.
+            try await authedQuery("captures:get", with: ["captureId": id])
         }
 
         public func capturesRetry(id: String) async throws {
-            try await authedMutation("captures:retry", with: ["id": id])
+            // Arg key fixed to match the backend validator (`captures.retry`
+            // takes `captureId`, not `id`) -- same class of bug as
+            // `capturesGet` above: the call would otherwise fail with an
+            // ArgumentValidationError regardless of routing to the right
+            // endpoint.
+            try await authedMutation("captures:retry", with: ["captureId": id])
         }
 
         public func capturesDeleteScreenshot(id: String) async throws {
-            try await authedMutation("captures:deleteScreenshot", with: ["id": id])
+            try await authedMutation("captures:deleteScreenshot", with: ["captureId": id])
         }
 
         public func capturesMarkOpened(id: String) async throws {
-            try await authedMutation("captures:markOpened", with: ["id": id])
+            try await authedMutation("captures:markOpened", with: ["captureId": id])
         }
 
         public func capturesArchive(id: String) async throws {
-            try await authedMutation("captures:archive", with: ["id": id])
+            try await authedMutation("captures:archive", with: ["captureId": id])
         }
 
         // MARK: - Combine -> AsyncStream bridge
@@ -508,6 +561,59 @@ public struct CaptureCreateInput: Equatable, Sendable {
                 }
             }
         }
+
+        // MARK: - One-shot query support (subscribe -> first value -> cancel)
+
+        /// convex-swift 0.8.1 has no one-shot query method — `subscribe` is
+        /// the only way to reach a Convex *query* function, and it's an
+        /// indefinite Combine publisher. This reduces that publisher to a
+        /// single value: take the first thing it yields, then cancel the
+        /// underlying subscription (via `AsyncThrowingPublisher`'s
+        /// cancel-on-task-cancel behavior, triggered by returning out of the
+        /// `for try await` loop). Races against `timeout` so a query that
+        /// never yields (dropped connection before the first snapshot, wrong
+        /// function name, etc.) fails fast instead of hanging the caller.
+        ///
+        /// Internal (not private) — and free of any `LiveConvexService`
+        /// instance state — so it's unit-testable against a synthetic
+        /// `AnyPublisher` without a live `ConvexClient`; see
+        /// `ConvexOneShotQueryTests`.
+        static func firstValue<T: Sendable>(
+            from publisher: AnyPublisher<T, ClientError>,
+            timeout: Duration = .seconds(10)
+        ) async throws -> T {
+            try await withThrowingTaskGroup(of: T.self) { group in
+                group.addTask {
+                    for try await value in publisher.values {
+                        return value
+                    }
+                    throw ConvexServiceError.requestFailed(
+                        "query completed without yielding a value"
+                    )
+                }
+                group.addTask {
+                    try await Task.sleep(for: timeout)
+                    throw ConvexServiceError.requestFailed(
+                        "query timed out waiting for a value"
+                    )
+                }
+                defer { group.cancelAll() }
+                guard let result = try await group.next() else {
+                    throw ConvexServiceError.requestFailed("query produced no result")
+                }
+                return result
+            }
+        }
+    }
+
+    /// Decodes the `{ ok: boolean, error?: string }` shape returned by the
+    /// `projects:validateKey` / `projects:refreshProjects` Convex actions
+    /// (see packages/backend/convex/projects.ts). `error` is currently
+    /// unused (kept for future surfacing) — decoded so the field doesn't
+    /// need to be absent for `Decodable` to succeed.
+    struct ConductorActionResult: Decodable, Sendable {
+        let ok: Bool
+        let error: String?
     }
 
     /// Serializes "attach auth once; re-attempt after failure" semantics for

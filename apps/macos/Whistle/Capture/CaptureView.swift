@@ -38,6 +38,8 @@ struct CaptureView: View {
 
                 if viewModel.isMicDenied {
                     micDeniedBanner
+                } else if viewModel.isSpeechRecognitionDenied {
+                    speechRecognitionDeniedBanner
                 }
 
                 inputCard
@@ -58,10 +60,14 @@ struct CaptureView: View {
         // render for a dark host.
         .preferredColorScheme(.dark)
         .onAppear {
-            transcriptFieldFocused = true
-            if viewModel.focusProjectPicker {
-                projectPickerFocused = true
-            }
+            applyInitialFocus()
+        }
+        .onChange(of: viewModel.focusRequestToken) { _, _ in
+            // Fires on every subsequent show -- fresh open, a resumed
+            // draft, or a plain refocus -- since `.onAppear` alone won't
+            // refire when a hidden-but-preserved panel is simply reordered
+            // front again (plan U8 fix #3).
+            applyInitialFocus()
         }
         .onExitCommand {
             onEscape()
@@ -69,6 +75,13 @@ struct CaptureView: View {
     }
 
     // MARK: - Header
+
+    private func applyInitialFocus() {
+        transcriptFieldFocused = true
+        if viewModel.focusProjectPicker {
+            projectPickerFocused = true
+        }
+    }
 
     private var header: some View {
         HStack(spacing: 8) {
@@ -93,19 +106,59 @@ struct CaptureView: View {
         }
     }
 
+    /// Fix #1a: previously this whole `HStack` (including the button) had
+    /// `.foregroundStyle(.secondary)` applied, which -- since a modifier
+    /// applied to a container is inherited by children that don't override
+    /// it -- painted the "enable mic" button the same flat gray as the
+    /// surrounding sentence, so it read as plain text, not something
+    /// tappable. The button below sets its own accent-colored, underlined
+    /// label so it visibly stands out as a real affordance; only the
+    /// explanatory sentence stays secondary/caption-styled.
     private var micDeniedBanner: some View {
-        HStack {
+        HStack(spacing: 4) {
             Image(systemName: "mic.slash")
+                .foregroundStyle(.secondary)
             Text("Microphone access denied — type your capture, or")
-            Button("enable mic") {
-                if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone") {
-                    NSWorkspace.shared.open(url)
-                }
+                .foregroundStyle(.secondary)
+            Button {
+                openSystemSettingsPane("Privacy_Microphone")
+            } label: {
+                Text("enable mic in Settings").underline()
             }
-            .buttonStyle(.link)
+            .buttonStyle(.plain)
+            .foregroundStyle(Color.accentColor)
         }
         .font(.caption)
         .foregroundStyle(PanelTheme.placeholderInk)
+    }
+
+    /// Fix #1d: speech-recognition (SFSpeechRecognizer) can be denied even
+    /// when mic access itself is granted -- its own banner + deep link to
+    /// the Privacy_SpeechRecognition pane (not Privacy_Microphone). Only
+    /// shown when mic is authorized (`micDeniedBanner` already covers the
+    /// mic-denied case, and without mic access speech recognition can't
+    /// run regardless).
+    private var speechRecognitionDeniedBanner: some View {
+        HStack(spacing: 4) {
+            Image(systemName: "waveform.slash")
+                .foregroundStyle(.secondary)
+            Text("Speech recognition access denied — type your capture, or")
+                .foregroundStyle(.secondary)
+            Button {
+                openSystemSettingsPane("Privacy_SpeechRecognition")
+            } label: {
+                Text("enable speech recognition in Settings").underline()
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(Color.accentColor)
+        }
+        .font(.caption)
+        .foregroundStyle(PanelTheme.placeholderInk)
+    }
+
+    private func openSystemSettingsPane(_ pane: String) {
+        guard let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?\(pane)") else { return }
+        NSWorkspace.shared.open(url)
     }
 
     // MARK: - Input card (idea text, notes, screenshot -- everything IN)
@@ -136,7 +189,7 @@ struct CaptureView: View {
             .clipShape(RoundedRectangle(cornerRadius: PanelTheme.ideaFieldRadius, style: .continuous))
             .overlay(alignment: .topLeading) {
                 if viewModel.transcriptText.isEmpty {
-                    Text("Type or speak your idea…")
+                    Text(transcriptPlaceholder)
                         .font(.system(size: 13.5))
                         .foregroundStyle(PanelTheme.placeholderInk)
                         .padding(.top, 14)
@@ -144,6 +197,14 @@ struct CaptureView: View {
                         .allowsHitTesting(false)
                 }
             }
+    }
+
+    /// Fix #1c: "Listening…" implies live dictation is actually running --
+    /// showing it in type-only mode (mic or speech-recognition denied) is
+    /// misleading, since nothing is listening. Falls back to a neutral
+    /// prompt in that case.
+    private var transcriptPlaceholder: String {
+        (viewModel.isMicDenied || viewModel.isSpeechRecognitionDenied) ? "Type your idea..." : "Type or speak your idea..."
     }
 
     private var notesEditor: some View {
@@ -219,6 +280,8 @@ struct CaptureView: View {
 
             Spacer(minLength: 8)
 
+            clearButton
+
             submitButton
         }
         .padding(.horizontal, 14)
@@ -229,6 +292,16 @@ struct CaptureView: View {
                 .fill(PanelTheme.borderHigh)
                 .frame(height: 1)
         }
+    }
+
+    private var clearButton: some View {
+        Button("Clear") {
+            viewModel.clear()
+        }
+        .font(.system(size: 12, weight: .medium))
+        .buttonStyle(.plain)
+        .foregroundStyle(PanelTheme.placeholderInk)
+        .disabled(!viewModel.hasContent)
     }
 
     private var submitButton: some View {

@@ -173,7 +173,7 @@ enum TranscriptionError: Error {
 public actor LegacySpeechTranscriber: TranscriptionService {
     private let locale: Locale
     private let engineFactory: () -> any SpeechRecognitionEngine
-    private let audioTap: AudioEngineTap
+    private let audioTap: any AudioTapping
 
     private var recognitionEngine: (any SpeechRecognitionEngine)?
     private var committedTranscript = ""
@@ -189,7 +189,7 @@ public actor LegacySpeechTranscriber: TranscriptionService {
     /// runs with no mic and no TCC at all.
     public init(
         locale: Locale = Locale(identifier: "en-US"),
-        audioTap: AudioEngineTap = AudioEngineTap(),
+        audioTap: any AudioTapping = AudioEngineTap(),
         engineFactory: (() -> any SpeechRecognitionEngine)? = nil
     ) {
         self.locale = locale
@@ -278,15 +278,23 @@ public actor LegacySpeechTranscriber: TranscriptionService {
             }
 
         case .error:
-            // Task error mid-utterance (§4.1b): whatever volatile text we
-            // had is lost (the underlying task can't finalize it), but
-            // committedTranscript is preserved untouched, and a fresh task
-            // starts immediately on the same tap. This matches the plan's
-            // "committed text preserved, no dropped join-space or
-            // duplicated words" — since liveSegment is simply cleared, not
-            // merged, nothing gets duplicated on the next segment's first
-            // event.
-            liveSegment = ""
+            // Task error mid-utterance (§4.1b) -- notably the real-world
+            // "silence detected" cancellation (SFSpeechRecognizer error
+            // 1110) that fires when the user pauses speaking for a beat
+            // without ever having triggered an `isFinal` result for the
+            // in-flight utterance. The volatile `liveSegment` at this
+            // point is real, already-spoken text, not garbage -- dropping
+            // it here (the previous behavior) is exactly what caused the
+            // "pause then resume wipes the box" bug: the user's words were
+            // sitting entirely in `liveSegment` with nothing yet folded
+            // into `committedTranscript`, so clearing it lost them. Fold it
+            // into `committedTranscript` first, the same way `stop()`
+            // does, so nothing spoken is ever lost, then start a fresh task
+            // immediately on the same running tap.
+            if !liveSegment.isEmpty {
+                committedTranscript = TranscriptStitcher.join(committedTranscript, liveSegment)
+                liveSegment = ""
+            }
             emitCurrentState()
             beginSegment(with: engine)
         }

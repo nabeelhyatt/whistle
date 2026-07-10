@@ -66,6 +66,21 @@ public final class CapturePanelController: NSObject, NSWindowDelegate {
     private let store: CaptureStore
     private let screenshotService: ScreenshotService
     private let mode: CapturePanelMode
+    /// Threaded straight into every `CaptureViewModel` this controller
+    /// creates (fix #2) -- wired by `WhistleApp` to `ProjectsSyncCoordinator.
+    /// refreshIfStale()`.
+    private let refreshProjectsIfStale: () -> Void
+    /// Permission seams (reset-deadlock fix), threaded straight into every
+    /// `CaptureViewModel` this controller creates -- default to the real
+    /// system implementations (matching `CaptureViewModel`'s own defaults)
+    /// so production is unaffected; tests override these with deterministic
+    /// (never `.notDetermined`) fakes so an automated `xcodebuild test` run
+    /// never fires a real TCC prompt via this controller's default-checker
+    /// tests.
+    private let micPermissionStatus: @MainActor () -> PermissionState
+    private let requestMicPermission: @MainActor () async -> Bool
+    private let speechPermissionStatus: @MainActor () -> PermissionState
+    private let requestSpeechPermission: @MainActor () async -> Bool
 
     private var panel: NSPanel?
     private var viewModel: CaptureViewModel?
@@ -85,6 +100,14 @@ public final class CapturePanelController: NSObject, NSWindowDelegate {
     public var onHistoryRequested: () -> Void = {}
     public var onSettingsRequested: () -> Void = {}
 
+    /// Supplies the menu bar status item button's on-screen window frame,
+    /// so the panel can anchor directly beneath the actual icon rather than
+    /// a hardcoded screen-corner guess. Wired by `WhistleApp` to
+    /// `StatusItemController.buttonWindowFrame`; left `nil` in tests / any
+    /// context without a real status item, in which case
+    /// `positionBeneathStatusItem` falls back to a screen-corner default.
+    public var statusItemButtonFrameProvider: () -> NSRect? = { nil }
+
     /// Fires after a capture is actually submitted (not on cancel/empty
     /// refusal), with its clientId. U10's onboarding wizard uses this to
     /// detect the first successful guided test capture (PRD F5.1 step 5→6).
@@ -93,10 +116,14 @@ public final class CapturePanelController: NSObject, NSWindowDelegate {
     /// Test-only accessors (internal, not `public` -- reachable only via
     /// `@testable import`) so `CaptureViewModelTests` can drive submit/
     /// dismiss through the real controller and assert the panel actually
-    /// closes, without needing AppKit UI automation.
-    var isPanelOpen: Bool { panel != nil }
+    /// closes, without needing AppKit UI automation. `isPanelOpen` reflects
+    /// visibility, not mere existence -- a dismissed-with-draft panel
+    /// (fix #4b) still exists (to preserve its draft) but is not "open".
+    var isPanelOpen: Bool { panel?.isVisible ?? false }
+    var hasPreservedDraft: Bool { panel != nil && !(panel?.isVisible ?? false) }
     var currentViewModel: CaptureViewModel? { viewModel }
     func submitCurrentForTesting() { handleSubmit() }
+    func dismissPreservingDraftForTesting() { dismissPreservingDraft() }
 
     /// Debug-log hook for the trigger->panel-interactive timing called out
     /// in TECH-SPEC §4.2 (<300ms target). Automated tests don't assert on
@@ -110,11 +137,21 @@ public final class CapturePanelController: NSObject, NSWindowDelegate {
     public init(
         store: CaptureStore,
         screenshotService: ScreenshotService = ScreenshotService(),
-        mode: CapturePanelMode = CapturePanelMode.current()
+        mode: CapturePanelMode = CapturePanelMode.current(),
+        refreshProjectsIfStale: @escaping () -> Void = {},
+        micPermissionStatus: @escaping @MainActor () -> PermissionState = { MicPermission.status() },
+        requestMicPermission: @escaping @MainActor () async -> Bool = { await MicPermission.request() },
+        speechPermissionStatus: @escaping @MainActor () -> PermissionState = { SpeechRecognitionPermission.status() },
+        requestSpeechPermission: @escaping @MainActor () async -> Bool = { await SpeechRecognitionPermission.request() }
     ) {
         self.store = store
         self.screenshotService = screenshotService
         self.mode = mode
+        self.refreshProjectsIfStale = refreshProjectsIfStale
+        self.micPermissionStatus = micPermissionStatus
+        self.requestMicPermission = requestMicPermission
+        self.speechPermissionStatus = speechPermissionStatus
+        self.requestSpeechPermission = requestSpeechPermission
         super.init()
     }
 
@@ -129,9 +166,19 @@ public final class CapturePanelController: NSObject, NSWindowDelegate {
     // MARK: - Trigger (hotkey or status-item left-click)
 
     /// Entry point shared by the hotkey and the status-item left-click
-    /// (plan U8: "triggered identically"). Duplicate trigger while the
-    /// panel is already open just focuses the existing panel -- no second
-    /// screenshot (plan U8 edge scenario).
+    /// (plan U8: "triggered identically"). Three cases:
+    ///   1. Panel already visible -- duplicate trigger while open just
+    ///      focuses the existing panel, no second screenshot (plan U8 edge
+    ///      scenario).
+    ///   2. Panel exists but hidden with a preserved draft (fix #4b/c: the
+    ///      user dismissed it via Esc or clicking away) and this isn't an
+    ///      explicit duplicate-as-new-capture request -- reopen the SAME
+    ///      view model as-is: resume transcription, but never touch the
+    ///      existing transcript/notes/screenshot, and never fire a new
+    ///      screenshot capture.
+    ///   3. Otherwise (first-ever trigger, no preserved draft, or an
+    ///      explicit duplicate-as-new preFill) -- a brand-new capture from
+    ///      scratch, discarding any stale hidden draft first.
     public func trigger(preFill: CapturePreFill? = nil) {
         let start = Date()
 
@@ -139,6 +186,18 @@ public final class CapturePanelController: NSObject, NSWindowDelegate {
             focusExistingPanel(panel)
             return
         }
+
+        if preFill == nil, let panel, let viewModel {
+            viewModel.resumeDraft()
+            showPanel(panel)
+            onTimingMeasured(Date().timeIntervalSince(start))
+            return
+        }
+
+        // Brand-new capture: discard any stale hidden panel/draft first
+        // (only relevant for an explicit duplicate-as-new preFill arriving
+        // while a different draft is preserved).
+        tearDownPanel()
 
         // Screenshot fires BEFORE panel show (§4.2): async, never blocks
         // panel display -- the thumbnail fades in once it resolves.
@@ -170,12 +229,23 @@ public final class CapturePanelController: NSObject, NSWindowDelegate {
             panel.makeKeyAndOrderFront(nil)
         }
         hostingView.map { panel.makeFirstResponder($0) }
+        // Fix #3: re-engage SwiftUI's FocusState even on a plain refocus
+        // (this doesn't go through beginCapture/resumeDraft).
+        viewModel?.requestTranscriptFocus()
     }
 
     // MARK: - Panel construction
 
     private func makePanel() -> (NSPanel, CaptureViewModel) {
-        let viewModel = CaptureViewModel(store: store, screenshotService: screenshotService)
+        let viewModel = CaptureViewModel(
+            store: store,
+            screenshotService: screenshotService,
+            micPermissionStatus: micPermissionStatus,
+            requestMicPermission: requestMicPermission,
+            speechPermissionStatus: speechPermissionStatus,
+            requestSpeechPermission: requestSpeechPermission,
+            refreshProjectsIfStale: refreshProjectsIfStale
+        )
 
         let captureView = CaptureView(
             viewModel: viewModel,
@@ -263,30 +333,34 @@ public final class CapturePanelController: NSObject, NSWindowDelegate {
             // closePanel()'s activating-mode restore steal focus back to
             // whatever was frontmost before the panel opened.
             self?.previousFrontmostApp = nil
-            self?.closePanel()
+            self?.dismissPreservingDraft()
         }
     }
 
-    /// Anchors the panel beneath the status item (plan U8). Falls back to
-    /// centering on the screen with the mouse cursor if the status item's
-    /// screen frame isn't available (e.g. in a test/headless context).
-    private func positionBeneathStatusItem(_ panel: NSPanel, statusItemFrame: NSRect? = nil) {
+    /// Anchors the panel beneath the status item (plan U8): reads the real
+    /// `NSStatusItem` button's window frame via `statusItemButtonFrameProvider`
+    /// and top-centers the panel directly under it, clamped to the screen's
+    /// visible frame. Falls back to a top-right screen-corner guess if the
+    /// status item's frame isn't available (e.g. in a test/headless
+    /// context, or before the status item's window has been assigned a
+    /// screen position).
+    private func positionBeneathStatusItem(_ panel: NSPanel) {
         guard let screen = NSScreen.main else { return }
-        let frame = statusItemFrame ?? NSRect(
-            x: screen.frame.maxX - 40,
-            y: screen.frame.maxY - 24,
+        let statusFrame = statusItemButtonFrameProvider() ?? NSRect(
+            x: screen.visibleFrame.maxX - 40,
+            y: screen.visibleFrame.maxY - 24,
             width: 24,
             height: 24
         )
-        let panelSize = panel.frame.size
-        let origin = NSPoint(
-            x: min(max(frame.midX - panelSize.width / 2, screen.frame.minX + 8), screen.frame.maxX - panelSize.width - 8),
-            y: frame.minY - panelSize.height - 8
+        let origin = CapturePanelPositioning.origin(
+            statusItemButtonFrame: statusFrame,
+            panelSize: panel.frame.size,
+            screenVisibleFrame: screen.visibleFrame
         )
         panel.setFrameOrigin(origin)
     }
 
-    // MARK: - Submit / dismiss
+    // MARK: - Submit / dismiss (plan U8 fix #4)
 
     private func handleSubmit() {
         let result = viewModel?.submit()
@@ -296,37 +370,39 @@ public final class CapturePanelController: NSObject, NSWindowDelegate {
         }
     }
 
+    /// Esc dismisses the panel but preserves the draft (fix #4d note: "keep
+    /// Esc = dismiss-preserving-draft too -- simpler than the old confirm
+    /// dialog"). There's nothing to confirm/discard anymore: the draft
+    /// survives until the user explicitly hits Clear or Submit.
     private func handleEscape() {
-        guard let viewModel else {
-            closePanel()
-            return
-        }
-        switch viewModel.escAction() {
-        case .close:
-            closePanel()
-        case .confirmThenClose:
-            confirmDiscard { [weak self] confirmed in
-                if confirmed {
-                    self?.closePanel()
-                }
-            }
-        }
+        dismissPreservingDraft()
     }
 
-    /// Presents a confirm-discard alert (plan U8: "Esc with content ->
-    /// confirm"). Split out so tests can drive `CaptureViewModel.escAction()`
-    /// directly without needing a real `NSAlert`.
-    private func confirmDiscard(completion: @escaping (Bool) -> Void) {
-        let alert = NSAlert()
-        alert.messageText = "Discard this capture?"
-        alert.informativeText = "You have unsaved transcript, notes, or a screenshot."
-        alert.addButton(withTitle: "Discard")
-        alert.addButton(withTitle: "Keep Editing")
-        let response = alert.runModal()
-        completion(response == .alertFirstButtonReturn)
-    }
-
+    /// Full teardown: stops transcription, restores the previously
+    /// frontmost app (`.activating` mode), hides the panel, and releases
+    /// panel/viewModel/hostingView so the next `trigger()` starts
+    /// completely fresh. Used after an actual submit -- fix #4d, "Submit
+    /// clears everything for the next capture."
     private func closePanel() {
+        if let outsideClickMonitor {
+            NSEvent.removeMonitor(outsideClickMonitor)
+            self.outsideClickMonitor = nil
+        }
+        if mode == .activating, let previousFrontmostApp {
+            previousFrontmostApp.activate()
+        }
+        previousFrontmostApp = nil
+
+        tearDownPanel()
+    }
+
+    /// Hides the panel and stops transcription, WITHOUT releasing
+    /// panel/viewModel/hostingView -- the draft (transcript, notes,
+    /// screenshot) must survive so a subsequent `trigger()` restores it
+    /// exactly as left (fix #4b/c). Used by Esc and by losing key status
+    /// (there is deliberately no close/X button -- these are the only two
+    /// ways to leave without submitting).
+    private func dismissPreservingDraft() {
         if let outsideClickMonitor {
             NSEvent.removeMonitor(outsideClickMonitor)
             self.outsideClickMonitor = nil
@@ -339,6 +415,14 @@ public final class CapturePanelController: NSObject, NSWindowDelegate {
         previousFrontmostApp = nil
 
         panel?.orderOut(nil)
+    }
+
+    /// Stops transcription and releases panel/viewModel/hostingView
+    /// outright, discarding any preserved draft. Safe to call when nothing
+    /// exists yet (all no-ops via optional chaining).
+    private func tearDownPanel() {
+        viewModel?.stopTranscription()
+        panel?.orderOut(nil)
         panel = nil
         viewModel = nil
         hostingView = nil
@@ -347,8 +431,51 @@ public final class CapturePanelController: NSObject, NSWindowDelegate {
     // MARK: - NSWindowDelegate
 
     public func windowDidResignKey(_ notification: Notification) {
-        // Non-activating panels stay open even when they lose key status
-        // (the user might click elsewhere transiently); nothing to do here
-        // for either mode -- explicit submit/Esc/close drive dismissal.
+        // Losing key status -- the user clicked away, or switched apps --
+        // dismisses the panel while preserving the draft (plan U8 fix #4b:
+        // "no X button", this + Esc are the only ways to leave without
+        // submitting).
+        dismissPreservingDraft()
+    }
+
+    public func windowDidBecomeKey(_ notification: Notification) {
+        // Fix #1b: a permission grant recovered via System Settings (e.g.
+        // toggling mic access off/on to force a fresh TCC grant tied to
+        // the current build's signature) must be reflected the moment the
+        // panel regains key status, without requiring an app relaunch --
+        // mirrors `OnboardingWindowController.windowDidBecomeKey`'s same
+        // fix for the onboarding permissions step.
+        viewModel?.refreshPermissions()
+    }
+}
+
+// MARK: - Panel positioning (plan U8 fix #2)
+
+/// Pure top-center-under-anchor positioning math, extracted so it's
+/// unit-testable without a real `NSScreen`/`NSPanel`/`NSStatusItem` (a
+/// headless test host can't construct those meaningfully). Given the
+/// status item button's actual on-screen frame, centers the panel
+/// horizontally beneath it and clamps the result to the screen's visible
+/// frame so the panel never runs off-screen on a narrow display or a
+/// status item near a screen edge.
+enum CapturePanelPositioning {
+    static func origin(
+        statusItemButtonFrame: NSRect,
+        panelSize: NSSize,
+        screenVisibleFrame: NSRect
+    ) -> NSPoint {
+        let unclampedX = statusItemButtonFrame.midX - panelSize.width / 2
+        let minX = screenVisibleFrame.minX + 8
+        let maxX = screenVisibleFrame.maxX - panelSize.width - 8
+        let x: CGFloat
+        if minX > maxX {
+            // Panel wider than the screen's visible area -- center it
+            // rather than producing an inverted clamp range.
+            x = screenVisibleFrame.midX - panelSize.width / 2
+        } else {
+            x = min(max(unclampedX, minX), maxX)
+        }
+        let y = statusItemButtonFrame.minY - panelSize.height - 8
+        return NSPoint(x: x, y: y)
     }
 }

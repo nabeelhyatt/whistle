@@ -711,4 +711,17 @@ public final class OnboardingWindowController: NSObject, NSWindowDelegate {
         window?.orderOut(nil)
         window = nil
     }
+
+    // MARK: - NSWindowDelegate
+
+    public func windowDidBecomeKey(_ notification: Notification) {
+        // Fix #5: the permissions step's live-status rows are populated via
+        // a one-shot `.task` when the SwiftUI view first appears, which
+        // goes stale if the user grants mic/speech access in System
+        // Settings and switches back to this (already-created) window --
+        // it never gets recreated, so `.task` never reruns. Refreshing on
+        // every refocus keeps the row honest without needing a poll timer.
+        guard viewModel.step == .permissions else { return }
+        viewModel.refreshPermissionStatuses()
+    }
 }
