@@ -70,6 +70,12 @@ public final class CapturePanelController: NSObject, NSWindowDelegate {
     private var panel: NSPanel?
     private var viewModel: CaptureViewModel?
     private var hostingView: NSHostingView<CaptureView>?
+    /// Global mouse-down monitor active while the panel is open: a click
+    /// delivered to ANY OTHER app dismisses the panel (Spotlight pattern,
+    /// requested in live review 2026-07-09). A global monitor only sees
+    /// events routed to other applications, so panel clicks, the project
+    /// picker's menu, and the Esc confirm alert can never self-dismiss.
+    private var outsideClickMonitor: Any?
 
     /// Frontmost app recorded before showing the activating (fallback)
     /// panel, restored on dismiss -- never leave the user dumped in a
@@ -180,7 +186,13 @@ public final class CapturePanelController: NSObject, NSWindowDelegate {
         )
 
         let hosting = NSHostingView(rootView: captureView)
-        hosting.frame = NSRect(x: 0, y: 0, width: 460, height: 360)
+        // Height bumped from 360 -> 400 for the capture-panel-redesign
+        // spec's status rail (docs/design/capture-panel-redesign-spec.md,
+        // file change #5): the rail adds ~44pt below the input card that
+        // the original layout didn't have. `positionBeneathStatusItem`
+        // reads `panel.frame.size` at call time, so it picks up the new
+        // height automatically -- no separate change needed there.
+        hosting.frame = NSRect(x: 0, y: 0, width: 460, height: 400)
         self.hostingView = hosting
 
         let styleMask: NSWindow.StyleMask
@@ -209,6 +221,10 @@ public final class CapturePanelController: NSObject, NSWindowDelegate {
         panel.titlebarAppearsTransparent = true
         panel.isMovableByWindowBackground = true
         panel.level = .floating
+        // Capture must work wherever the user is: without these the panel
+        // opens on the desktop Space and is invisible while the user is in
+        // any fullscreen app -- the hotkey appears to do nothing.
+        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         panel.hidesOnDeactivate = false
         panel.isReleasedWhenClosed = false
         panel.contentView = hosting
@@ -235,6 +251,19 @@ public final class CapturePanelController: NSObject, NSWindowDelegate {
         // (TECH-SPEC §4.1).
         if let hostingView {
             panel.makeFirstResponder(hostingView)
+        }
+
+        // Click-away dismissal. Unconditional (no discard confirm): the mic
+        // transcribes ambient speech, so gating on "has content" would
+        // leave the panel stuck open for anyone who talks near their Mac.
+        outsideClickMonitor = NSEvent.addGlobalMonitorForEvents(
+            matching: [.leftMouseDown, .rightMouseDown]
+        ) { [weak self] _ in
+            // The user just clicked INTO another app -- don't let
+            // closePanel()'s activating-mode restore steal focus back to
+            // whatever was frontmost before the panel opened.
+            self?.previousFrontmostApp = nil
+            self?.closePanel()
         }
     }
 
@@ -298,6 +327,10 @@ public final class CapturePanelController: NSObject, NSWindowDelegate {
     }
 
     private func closePanel() {
+        if let outsideClickMonitor {
+            NSEvent.removeMonitor(outsideClickMonitor)
+            self.outsideClickMonitor = nil
+        }
         viewModel?.stopTranscription()
 
         if mode == .activating, let previousFrontmostApp {

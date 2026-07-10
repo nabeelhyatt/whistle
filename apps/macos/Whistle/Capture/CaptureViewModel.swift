@@ -70,6 +70,13 @@ public final class CaptureViewModel: ObservableObject {
     @Published public var notesText: String = ""
     @Published public var screenshotData: Data?
     @Published public private(set) var isMicDenied: Bool = false
+    /// Mirrors whether the transcription service is actually running --
+    /// drives `FlapStatusView`'s mic-on indicator (capture-panel-redesign
+    /// spec, "Manifest" V2: the flap is a mic-activity indicator, not a
+    /// transcript readout). `true` once `startTranscriptionIfPermitted()`
+    /// actually starts the service; `false` on `stopTranscription()` and
+    /// when the update stream itself ends (service-side stop/error).
+    @Published public private(set) var isListening: Bool = false
     @Published public var selectedProjectId: String?
     @Published public private(set) var projects: [Project] = []
     @Published public var focusProjectPicker: Bool = false
@@ -169,6 +176,7 @@ public final class CaptureViewModel: ObservableObject {
         guard !isMicDenied else { return }
         let service = transcriptionServiceFactory()
         transcriptionService = service
+        isListening = true
         transcriptionTask = Task { [weak self] in
             let stream = await service.start()
             for await update in stream {
@@ -176,6 +184,12 @@ public final class CaptureViewModel: ObservableObject {
                 await MainActor.run {
                     self.applyTranscriptUpdate(update)
                 }
+            }
+            // Stream ended on its own (service-side stop/error) rather than
+            // via `stopTranscription()` -- still clear the indicator so the
+            // flap doesn't churn against a dead service.
+            await MainActor.run {
+                self?.isListening = false
             }
         }
     }
@@ -198,6 +212,7 @@ public final class CaptureViewModel: ObservableObject {
         transcriptionTask = nil
         let service = transcriptionService
         transcriptionService = nil
+        isListening = false
         if let service {
             Task { await service.stop() }
         }

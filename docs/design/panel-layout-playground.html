@@ -1,0 +1,1651 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Whistle — Panel Layout Playground</title>
+<style>
+/* ==========================================================================
+   0. RESET + PLAYGROUND CHROME THEME VARIABLES
+   ========================================================================== */
+*, *::before, *::after { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; }
+
+:root{
+  --ui-bg: #111317;
+  --ui-bg-2: #171a20;
+  --ui-panel: #1b1f27;
+  --ui-panel-2: #20242d;
+  --ui-border: #2b303a;
+  --ui-text: #e9eaee;
+  --ui-text-dim: #9aa1ac;
+  --ui-accent: #6d8dff;
+  /* panel mockup vars (driven by sidebar params) */
+  --accent: #ffb000;
+  --accent-ink: #201409;
+  /* action color: fixed Whistle Orange for buttons (dual-accent system --
+     amber instrumentation, orange action), independent of the accent slider */
+  --action: #e8630a;
+  --panel-bg: #1e1a18;
+}
+body.light{
+  --ui-bg: #f3f4f6;
+  --ui-bg-2: #ffffff;
+  --ui-panel: #ffffff;
+  --ui-panel-2: #f7f8fa;
+  --ui-border: #e2e4e9;
+  --ui-text: #1b1e24;
+  --ui-text-dim: #666d7a;
+  --ui-accent: #3563e9;
+}
+
+body{
+  font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+  background: var(--ui-bg);
+  color: var(--ui-text);
+  transition: background .2s ease, color .2s ease;
+}
+
+/* ==========================================================================
+   1. APP LAYOUT — sidebar (300px) + main
+   ========================================================================== */
+.app{ display: flex; align-items: flex-start; min-height: 100vh; }
+
+.sidebar{
+  width: 300px;
+  flex: 0 0 300px;
+  background: var(--ui-bg-2);
+  border-right: 1px solid var(--ui-border);
+  padding: 20px 18px 24px;
+  height: 100vh;
+  overflow-y: auto;
+  position: sticky;
+  top: 0;
+}
+.sidebar h1{ font-size: 15px; font-weight: 700; margin: 0 0 2px; letter-spacing: -0.01em; }
+.sidebar .sub{
+  font-size: 11.5px;
+  color: var(--ui-text-dim);
+  margin: 0 0 18px;
+  line-height: 1.4;
+}
+.ctrl{ margin-bottom: 14px; }
+.ctrl label{
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--ui-text-dim);
+  margin-bottom: 5px;
+  letter-spacing: .01em;
+}
+.ctrl label .val{
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 11px;
+  color: var(--ui-text);
+  font-weight: 500;
+}
+.ctrl input[type="range"]{ width: 100%; accent-color: var(--ui-accent); cursor: pointer; }
+.ctrl input[type="color"]{
+  width: 100%;
+  height: 28px;
+  border: 1px solid var(--ui-border);
+  border-radius: 6px;
+  background: none;
+  cursor: pointer;
+  padding: 2px;
+}
+.ctrl input[type="text"]{
+  width: 100%;
+  padding: 7px 9px;
+  border-radius: 6px;
+  border: 1px solid var(--ui-border);
+  background: var(--ui-panel-2);
+  color: var(--ui-text);
+  font-size: 12.5px;
+  font-family: inherit;
+}
+.ctrl input[type="text"]:focus, button:focus-visible{
+  outline: 2px solid var(--ui-accent);
+  outline-offset: 1px;
+}
+.preset-row{ display: flex; gap: 6px; margin-top: 6px; }
+.preset-chip{
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 6px 8px;
+  border-radius: 6px;
+  border: 1px solid var(--ui-border);
+  background: var(--ui-panel-2);
+  color: var(--ui-text);
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.preset-chip:hover{ background: var(--ui-border); }
+.preset-chip .swatch{ width: 10px; height: 10px; border-radius: 3px; flex: none; }
+.toggle-row{
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.toggle-row input[type="checkbox"]{ accent-color: var(--ui-accent); width: 16px; height: 16px; cursor: pointer; }
+hr.sep{ border: none; border-top: 1px solid var(--ui-border); margin: 16px 0; }
+.btn{
+  display: block;
+  width: 100%;
+  padding: 9px 10px;
+  margin-bottom: 8px;
+  border-radius: 7px;
+  border: 1px solid var(--ui-border);
+  background: var(--ui-panel-2);
+  color: var(--ui-text);
+  font-size: 12.5px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background .15s ease, transform .1s ease;
+}
+.btn:hover{ background: var(--ui-border); }
+.btn:active{ transform: scale(.98); }
+.btn.primary{ background: var(--ui-accent); border-color: var(--ui-accent); color: #fff; }
+.btn.primary:hover{ filter: brightness(1.08); }
+.footer-hint{
+  margin-top: 18px;
+  font-size: 10.5px;
+  color: var(--ui-text-dim);
+  line-height: 1.6;
+  border-top: 1px solid var(--ui-border);
+  padding-top: 12px;
+}
+.footer-hint kbd{
+  background: var(--ui-panel-2);
+  border: 1px solid var(--ui-border);
+  border-radius: 3px;
+  padding: 1px 5px;
+  font-family: ui-monospace, monospace;
+}
+
+/* ==========================================================================
+   2. MAIN AREA — variant cards
+   ========================================================================== */
+.main{
+  flex: 1;
+  padding: 32px 24px 80px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  min-width: 0;
+}
+.main-inner{ width: 100%; max-width: 760px; }
+.card{
+  background: var(--ui-panel);
+  border: 1px solid var(--ui-border);
+  border-radius: 14px;
+  padding: 20px 20px 22px;
+  margin-bottom: 22px;
+}
+.card h2{ font-size: 15px; font-weight: 700; margin: 0 0 4px; letter-spacing: -0.01em; }
+.card-desc{
+  font-size: 12px;
+  color: var(--ui-text-dim);
+  margin: 0 0 16px;
+  line-height: 1.5;
+}
+.panel-stage{
+  display: flex;
+  justify-content: center;
+  padding: 26px 16px;
+  background: var(--ui-bg);
+  border: 1px solid var(--ui-border);
+  border-radius: 10px;
+  margin-bottom: 16px;
+  background-image:
+    linear-gradient(45deg, rgba(255,255,255,.02) 25%, transparent 25%),
+    linear-gradient(-45deg, rgba(255,255,255,.02) 25%, transparent 25%),
+    linear-gradient(45deg, transparent 75%, rgba(255,255,255,.02) 75%),
+    linear-gradient(-45deg, transparent 75%, rgba(255,255,255,.02) 75%);
+  background-size: 16px 16px;
+  background-position: 0 0, 0 8px, 8px -8px, -8px 0px;
+}
+.copy-btn{
+  width: 100%;
+  padding: 10px;
+  border-radius: 8px;
+  border: 1px solid var(--ui-border);
+  background: var(--ui-panel-2);
+  color: var(--ui-text);
+  font-size: 12.5px;
+  font-weight: 700;
+  cursor: pointer;
+  letter-spacing: .01em;
+}
+.copy-btn:hover{ background: var(--ui-border); }
+
+/* ==========================================================================
+   3. SHARED PANEL PIECES (the Whistle capture panel mockups)
+   ========================================================================== */
+.wpanel{
+  width: 460px;
+  max-width: 100%;
+  background: var(--panel-bg);
+  border: 1px solid rgba(255,255,255,.08);
+  border-radius: 14px;
+  box-shadow: 0 14px 34px rgba(0,0,0,.5);
+  padding: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  color: #e8e2d9;
+  font-family: -apple-system, system-ui, "Segoe UI", sans-serif;
+  overflow: hidden;
+}
+.p-header{
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 26px;
+}
+.p-spacer{ flex: 1; }
+.icon-btn{
+  width: 24px; height: 24px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 6px;
+  color: #a3988c;
+  flex: none;
+}
+.icon-btn:hover{ background: rgba(255,255,255,.06); }
+.icon-btn svg{ display: block; }
+
+.whistle-mark svg{ display: block; filter: drop-shadow(0 1px 1px rgba(0,0,0,.4)); }
+
+/* big type/speak idea area */
+.idea-input{
+  min-height: 68px;
+  border-radius: 10px;
+  border: 1px solid rgba(255,255,255,.09);
+  background: rgba(255,255,255,.045);
+  padding: 10px 12px;
+  font-size: 13.5px;
+  line-height: 1.45;
+  color: #efe9df;
+  word-break: break-word;
+}
+.idea-input .ph{ color: #8a8078; }
+.idea-input .caret{
+  display: inline-block;
+  width: 2px;
+  height: 13px;
+  margin-left: 2px;
+  vertical-align: -2px;
+  background: var(--accent);
+  animation: caret-blink 1s steps(1) infinite;
+}
+@keyframes caret-blink{ 0%, 60% { opacity: 1; } 61%, 100% { opacity: 0; } }
+
+/* slim Notes line */
+.notes-line{
+  height: 26px;
+  border-radius: 7px;
+  border: 1px solid rgba(255,255,255,.07);
+  background: rgba(255,255,255,.03);
+  color: #8a8078;
+  font-size: 11.5px;
+  line-height: 24px;
+  padding: 0 10px;
+}
+
+/* halftone screenshot thumbnail frame */
+.thumb-frame{
+  border-radius: 8px;
+  overflow: hidden;
+  border: 1px solid rgba(255,255,255,.09);
+  line-height: 0;
+  background: #0d0d0f;
+  flex: none;
+}
+
+/* mic status: pulsing dot + caps label + mini split-flap */
+.mic-status{ display: flex; }
+.mic-status.stacked{ flex-direction: column; align-items: flex-end; gap: 5px; }
+.mic-status.inline{ flex-direction: row; align-items: center; gap: 8px; }
+.mic-label-row{
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-family: "Helvetica Neue Condensed", "Arial Narrow", Arial, sans-serif;
+  font-weight: 700;
+  font-size: 8.5px;
+  letter-spacing: .18em;
+  color: var(--accent);
+  white-space: nowrap;
+}
+@keyframes dot-pulse{ 0%, 100% { opacity: 1; } 50% { opacity: .25; } }
+.mic-dot{
+  width: 5px; height: 5px;
+  border-radius: 50%;
+  background: var(--accent);
+  flex: none;
+  animation: dot-pulse 1s ease-in-out infinite;
+}
+.mic-dot.dim{ animation: none; opacity: .3; background: #6a6058; }
+
+/* mini split-flap (3 cells, mic status indicator) */
+.flap-row{
+  display: flex;
+  gap: 2px;
+  perspective: 200px;
+  flex: none;
+}
+.flap-cell{
+  position: relative;
+  background: #141416;
+  border-radius: 3px;
+  overflow: hidden;
+  box-shadow: 0 0 0 1px rgba(255,255,255,.04) inset, 0 1px 2px rgba(0,0,0,.5);
+}
+.flap-cell::after{
+  content: "";
+  position: absolute;
+  left: 0; right: 0; top: 50%;
+  height: 1px;
+  background: rgba(0,0,0,.65);
+  z-index: 6;
+  transform: translateY(-0.5px);
+}
+.flap-wrap, .flap-leaf{ position: absolute; left: 0; right: 0; overflow: hidden; }
+.flap-wrap-top, .flap-wrap-bottom{ background: #141416; }
+.flap-leaf-top{ background: linear-gradient(#2c2c30, #131316); z-index: 4; backface-visibility: hidden; }
+.flap-leaf-bottom{ background: linear-gradient(#101012, #222226); z-index: 5; backface-visibility: hidden; }
+.flap-inner{
+  position: absolute;
+  left: 0; right: 0;
+  text-align: center;
+  font-family: "Helvetica Neue Condensed", "Arial Narrow", Arial, sans-serif;
+  font-weight: 700;
+  color: #f0e7d8;
+  user-select: none;
+}
+
+/* project chip / dropdown */
+.proj-chip{
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11.5px;
+  font-weight: 600;
+  color: #cfc6bc;
+  background: rgba(255,255,255,.05);
+  border: 1px solid rgba(255,255,255,.09);
+  border-radius: 7px;
+  padding: 5px 10px;
+  white-space: nowrap;
+}
+.proj-chip .chev{ font-size: 8px; color: #8a8078; }
+
+/* buttons inside the panel */
+.p-btn{
+  font-size: 12px;
+  font-weight: 700;
+  border-radius: 7px;
+  padding: 7px 16px;
+  border: 1px solid transparent;
+  white-space: nowrap;
+}
+.p-btn.submit{ background: var(--action); color: #fff; }
+.p-btn.ghost{
+  background: transparent;
+  color: #a3988c;
+  border-color: rgba(255,255,255,.1);
+}
+
+/* --------------------------------------------------------------------------
+   V1 — Sketch-faithful
+   -------------------------------------------------------------------------- */
+.v1-action{
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 10px 5px 7px;
+  border-radius: 8px;
+  border: 1px solid rgba(255,255,255,.1);
+  background: rgba(255,255,255,.045);
+  font-family: "Helvetica Neue Condensed", "Arial Narrow", Arial, sans-serif;
+  font-weight: 700;
+  font-size: 10.5px;
+  letter-spacing: .14em;
+  color: #e0d7c9;
+  white-space: nowrap;
+}
+.v1-bottom{
+  display: flex;
+  gap: 10px;
+  align-items: stretch;
+}
+.v1-status{
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 2px 0;
+}
+
+/* --------------------------------------------------------------------------
+   V2 — Manifest (bounded input card + departure-board status rail)
+   -------------------------------------------------------------------------- */
+.v2-card{
+  border: 1px solid rgba(255,255,255,.1);
+  background: rgba(255,255,255,.03);
+  border-radius: 11px;
+  padding: 9px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  box-shadow: inset 0 1px 3px rgba(0,0,0,.3);
+}
+.v2-card .idea-input{ border: none; background: transparent; padding: 4px 4px 2px; min-height: 58px; }
+.v2-card .notes-line{ background: rgba(255,255,255,.025); }
+.status-rail{
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  background: #0d0d0f;
+  border-top: 1px solid rgba(255,255,255,.1);
+  margin: 2px -14px -14px;
+  padding: 10px 14px;
+  border-radius: 0 0 13px 13px;
+}
+.rail-dest{
+  flex: 1;
+  text-align: center;
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-weight: 700;
+  font-size: 10.5px;
+  letter-spacing: .22em;
+  color: var(--accent);
+  text-shadow: 0 0 6px rgba(255,176,0,.35);
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+/* --------------------------------------------------------------------------
+   V3 — Station header
+   -------------------------------------------------------------------------- */
+.v3-wordmark{
+  font-family: "Helvetica Neue Condensed", "Arial Narrow", Arial, sans-serif;
+  font-weight: 700;
+  font-size: 14px;
+  letter-spacing: .3em;
+  color: #efe6d6;
+}
+.v3-notes-affordance{
+  font-size: 11px;
+  font-weight: 600;
+  color: #8a8078;
+  padding: 1px 2px;
+}
+.v3-footer{
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+/* ==========================================================================
+   4. TOAST
+   ========================================================================== */
+.toast{
+  position: fixed;
+  left: 50%; bottom: 26px;
+  transform: translate(-50%, 16px);
+  background: #1b1e24;
+  color: #fff;
+  padding: 10px 18px;
+  border-radius: 8px;
+  font-size: 12.5px;
+  font-weight: 600;
+  box-shadow: 0 8px 22px rgba(0,0,0,.35);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity .25s ease, transform .25s ease;
+  z-index: 1000;
+  max-width: 80vw;
+  text-align: center;
+}
+.toast.show{ opacity: 1; transform: translate(-50%, 0); }
+
+@media (max-width: 720px){
+  .sidebar{ position: static; height: auto; width: 100%; flex: 1 1 100%; }
+  .app{ flex-direction: column; }
+}
+</style>
+</head>
+<body class="dark">
+<div class="app">
+
+  <!-- ======================= SIDEBAR ======================= -->
+  <aside class="sidebar">
+    <h1>Panel Layout Playground</h1>
+    <p class="sub">Whistle · full capture-panel mockups — 3 groupings of inputs vs. status. 460px, 1:1, live dictation loop.</p>
+
+    <div class="ctrl">
+      <label>Accent color <span class="val" id="val-accent">#ffb000</span></label>
+      <input type="color" id="ctrl-accent" value="#ffb000">
+      <div class="preset-row">
+        <button class="preset-chip" id="preset-amber"><span class="swatch" style="background:#ffb000"></span>Amber</button>
+        <button class="preset-chip" id="preset-orange"><span class="swatch" style="background:#e8630a"></span>Whistle Orange</button>
+      </div>
+    </div>
+    <div class="ctrl">
+      <label>Panel background <span class="val" id="val-panelbg">#1e1a18</span></label>
+      <input type="color" id="ctrl-panelbg" value="#1e1a18">
+    </div>
+    <div class="ctrl">
+      <label>Flap speed <span class="val" id="val-flapspeed">1.0x</span></label>
+      <input type="range" id="ctrl-flapspeed" min="0.5" max="2" step="0.1" value="1">
+    </div>
+    <div class="ctrl">
+      <label>Halftone dot size <span class="val" id="val-htsize">5px</span></label>
+      <input type="range" id="ctrl-htsize" min="3" max="10" step="1" value="5">
+    </div>
+    <div class="ctrl">
+      <label class="toggle-row" style="margin-bottom:0;">Show Notes field (V1/V2)
+        <input type="checkbox" id="ctrl-notes" checked>
+      </label>
+    </div>
+    <div class="ctrl">
+      <label>Demo transcript</label>
+      <input type="text" id="ctrl-transcript" value="Add a settings toggle for launch at login and remember the last project">
+    </div>
+    <div class="ctrl">
+      <label>Simulate dictation</label>
+      <button class="btn" id="ctrl-play">⏸ Pause</button>
+    </div>
+
+    <hr class="sep">
+
+    <button class="btn primary" id="btn-generate-prompt">Generate Prompt</button>
+    <button class="btn" id="btn-reset">Reset to defaults</button>
+    <button class="btn" id="btn-theme-toggle">Light Mode</button>
+
+    <div class="footer-hint">
+      <div><kbd>C</kbd> copy prompt &nbsp; <kbd>D</kbd> dark/light</div>
+      <div style="margin-top:6px;">Params encode into the URL hash — share the link to restore this exact state.</div>
+    </div>
+  </aside>
+
+  <!-- ======================= MAIN ======================= -->
+  <main class="main">
+    <div class="main-inner">
+
+      <section class="card">
+        <h2>V1 · Sketch-faithful</h2>
+        <p class="card-desc">The whiteboard as drawn: action header up top, big idea area, then screenshot and mic status paired side-by-side at the bottom — inputs above, evidence + status below.</p>
+        <div class="panel-stage" id="stage-v1"></div>
+        <button class="copy-btn" data-variant="v1">Copy Code</button>
+      </section>
+
+      <section class="card">
+        <h2>V2 · Manifest</h2>
+        <p class="card-desc">Everything going IN (idea, notes, screenshot) lives in one bounded card; everything about state (mic flap, destination, submit) lives on a single departure-board rail below it.</p>
+        <div class="panel-stage" id="stage-v2"></div>
+        <button class="copy-btn" data-variant="v2">Copy Code</button>
+      </section>
+
+      <section class="card">
+        <h2>V3 · Station header</h2>
+        <p class="card-desc">Mic status lives in the header like a station board's clock — always visible, never crowding the inputs; body and footer stay conventional and match the current app.</p>
+        <div class="panel-stage" id="stage-v3"></div>
+        <button class="copy-btn" data-variant="v3">Copy Code</button>
+      </section>
+
+    </div>
+  </main>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+(function(){
+"use strict";
+
+/* ==========================================================================
+   PARAMS + DEFAULTS
+   ========================================================================== */
+var DEFAULTS = {
+  accent: "#ffb000",
+  panelBg: "#1e1a18",
+  flapSpeed: 1,
+  halftoneSize: 5,
+  showNotes: true,
+  transcript: "Add a settings toggle for launch at login and remember the last project",
+  playing: true,
+  theme: "dark"
+};
+var params = JSON.parse(JSON.stringify(DEFAULTS));
+
+/* ==========================================================================
+   SHARED DICTATION ENGINE (same as visualizer-playground)
+   idle -> listening -> speaking -> settle -> idle ...
+   ========================================================================== */
+var engine = {
+  state: "idle",
+  stateElapsed: 0,
+  activeWords: [],
+  revealedCount: 0,
+  displayedText: "",
+  audioLevel: 0,
+  audioTarget: 0,
+  _nextAudioAt: 0
+};
+var DURATIONS = { idle: 1500, listening: 1500, speaking: 6000, settle: 2000 };
+function nextState(s){
+  return s === "idle" ? "listening" : s === "listening" ? "speaking" : s === "speaking" ? "settle" : "idle";
+}
+function stepEngine(dt){
+  engine.stateElapsed += dt;
+
+  if(engine.state === "speaking"){
+    var now = performance.now();
+    if(now > engine._nextAudioAt){
+      engine.audioTarget = 0.25 + Math.random() * 0.75;
+      engine._nextAudioAt = now + 110 + Math.random() * 180;
+    }
+  } else {
+    engine.audioTarget = 0;
+  }
+  engine.audioLevel += (engine.audioTarget - engine.audioLevel) * Math.min(1, dt / 180);
+  if(engine.audioLevel < 0.002) engine.audioLevel = 0;
+
+  var duration = DURATIONS[engine.state];
+
+  if(engine.state === "speaking"){
+    var words = engine.activeWords;
+    var frac = Math.min(1, engine.stateElapsed / duration);
+    var count = words.length ? Math.min(words.length, Math.floor(frac * words.length) + 1) : 0;
+    if(count !== engine.revealedCount){
+      engine.revealedCount = count;
+      engine.displayedText = words.slice(0, count).join(" ");
+    }
+  }
+
+  if(engine.stateElapsed >= duration){
+    engine.stateElapsed = 0;
+    engine.state = nextState(engine.state);
+    if(engine.state === "speaking"){
+      engine.activeWords = params.transcript.trim().split(/\s+/).filter(Boolean);
+      engine.revealedCount = 0;
+      engine.displayedText = "";
+    }
+    if(engine.state === "idle"){
+      engine.displayedText = "";
+      engine.revealedCount = 0;
+    }
+  }
+}
+
+var subscribers = [];
+function subscribe(fn){ subscribers.push(fn); }
+
+var lastTs = null;
+function frame(ts){
+  if(lastTs === null) lastTs = ts;
+  var dt = Math.min(64, ts - lastTs);
+  lastTs = ts;
+  if(params.playing) stepEngine(dt);
+  for(var i = 0; i < subscribers.length; i++){
+    try { subscribers[i](engine, dt); } catch(e){ console.error(e); }
+  }
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+
+/* ==========================================================================
+   SPLIT-FLAP MACHINERY (reused from visualizer-playground, incl. height fix
+   and the flip guard for cascade timeouts outliving a rebuild)
+   ========================================================================== */
+function layoutCellDom(parts, cellW, cellH){
+  var half = cellH / 2;
+  function set(el, style){ for(var k in style){ el.style[k] = style[k]; } }
+  set(parts.top.wrap, { position:"absolute", top:"0px", left:"0px", right:"0px", height: half+"px", overflow:"hidden" });
+  set(parts.top.inner, { position:"absolute", top:"0px", left:"0px", right:"0px", height: cellH+"px", lineHeight: cellH+"px" });
+  set(parts.bottom.wrap, { position:"absolute", top: half+"px", left:"0px", right:"0px", height: half+"px", overflow:"hidden" });
+  set(parts.bottom.inner, { position:"absolute", top: (-half)+"px", left:"0px", right:"0px", height: cellH+"px", lineHeight: cellH+"px" });
+  set(parts.leafTop.wrap, { position:"absolute", top:"0px", left:"0px", right:"0px", height: half+"px", overflow:"hidden", transformOrigin:"bottom" });
+  set(parts.leafTop.inner, { position:"absolute", top:"0px", left:"0px", right:"0px", height: cellH+"px", lineHeight: cellH+"px" });
+  set(parts.leafBottom.wrap, { position:"absolute", top: half+"px", left:"0px", right:"0px", height: half+"px", overflow:"hidden", transformOrigin:"top" });
+  set(parts.leafBottom.inner, { position:"absolute", top: (-half)+"px", left:"0px", right:"0px", height: cellH+"px", lineHeight: cellH+"px" });
+  var fontSize = Math.max(9, Math.round(cellH * 0.66));
+  [parts.top.inner, parts.bottom.inner, parts.leafTop.inner, parts.leafBottom.inner].forEach(function(el){
+    el.style.fontSize = fontSize + "px";
+  });
+}
+
+function buildFlapCellDom(){
+  var cell = document.createElement("div");
+  cell.className = "flap-cell";
+  var parts = {};
+  ["top", "bottom"].forEach(function(pos){
+    var wrap = document.createElement("div");
+    wrap.className = "flap-wrap flap-wrap-" + pos;
+    var inner = document.createElement("div");
+    inner.className = "flap-inner";
+    wrap.appendChild(inner);
+    cell.appendChild(wrap);
+    parts[pos] = { wrap: wrap, inner: inner };
+  });
+  [["leafTop","top"], ["leafBottom","bottom"]].forEach(function(pair){
+    var key = pair[0], pos = pair[1];
+    var wrap = document.createElement("div");
+    wrap.className = "flap-leaf flap-leaf-" + pos;
+    var inner = document.createElement("div");
+    inner.className = "flap-inner";
+    wrap.appendChild(inner);
+    cell.appendChild(wrap);
+    parts[key] = { wrap: wrap, inner: inner };
+  });
+  return { cell: cell, parts: parts };
+}
+
+var RANDOM_GLYPHS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+function randomGlyph(){ return RANDOM_GLYPHS[Math.floor(Math.random() * RANDOM_GLYPHS.length)]; }
+
+/* Mini split-flap: fixed 3 cells (~16x24 each) — a MIC STATUS indicator, not
+   a transcript readout. Churns random glyphs while the mic is live, blanks
+   when idle, settles to "SAV" on capture. */
+var FLAP_CELL_W = 16, FLAP_CELL_H = 24, FLAP_CELLS = 3;
+function createMiniFlap(){
+  var row = document.createElement("div");
+  row.className = "flap-row";
+  /* explicit sizes: flap halves are absolutely positioned, the row/cells
+     would otherwise collapse to 0 height (the concept-A lesson) */
+  row.style.height = FLAP_CELL_H + "px";
+  var cells = [];
+  for(var i = 0; i < FLAP_CELLS; i++){
+    var built = buildFlapCellDom();
+    built.cell.style.width = FLAP_CELL_W + "px";
+    built.cell.style.height = FLAP_CELL_H + "px";
+    layoutCellDom(built.parts, FLAP_CELL_W, FLAP_CELL_H);
+    row.appendChild(built.cell);
+    cells.push({ el: built.cell, parts: built.parts, current: " ", nextRandomAt: performance.now() + Math.random() * 400 });
+  }
+
+  function setChar(c, ch){
+    c.current = ch;
+    c.parts.top.inner.textContent = ch;
+    c.parts.bottom.inner.textContent = ch;
+  }
+
+  function flip(c, newChar){
+    /* guard: cascade timeouts can outlive the component */
+    if(!c || c.current === newChar) return;
+    var dur = 150 / (params.flapSpeed || 1);
+    var p = c.parts;
+    p.leafTop.inner.textContent = c.current;
+    p.leafBottom.inner.textContent = newChar;
+    p.leafTop.wrap.style.transition = "none";
+    p.leafTop.wrap.style.transform = "rotateX(0deg)";
+    p.leafBottom.wrap.style.transition = "none";
+    p.leafBottom.wrap.style.transform = "rotateX(90deg)";
+    void p.leafTop.wrap.offsetHeight;
+    requestAnimationFrame(function(){
+      p.leafTop.wrap.style.transition = "transform " + dur + "ms ease-in";
+      p.leafTop.wrap.style.transform = "rotateX(-100deg)";
+      p.leafBottom.wrap.style.transition = "transform " + dur + "ms ease-out " + Math.round(dur * 0.35) + "ms";
+      p.leafBottom.wrap.style.transform = "rotateX(0deg)";
+    });
+    setTimeout(function(){ setChar(c, newChar); }, dur * 0.5);
+  }
+
+  function cascade(targetChars, stepped){
+    for(var i = 0; i < cells.length; i++){
+      (function(i){
+        var cell = cells[i];
+        var finalChar = targetChars[i] || " ";
+        var delay = i * (55 / (params.flapSpeed || 1));
+        if(stepped){
+          var steps = 1 + Math.floor(Math.random() * 2);
+          var s = 0;
+          function doStep(){
+            s++;
+            var ch = s < steps ? randomGlyph() : finalChar;
+            setTimeout(function(){ flip(cell, ch); }, 0);
+            if(s < steps) setTimeout(doStep, 130 / (params.flapSpeed || 1));
+          }
+          setTimeout(doStep, delay);
+        } else {
+          setTimeout(function(){ flip(cell, finalChar); }, delay);
+        }
+      })(i);
+    }
+  }
+
+  var prevState = null;
+  function onEngine(eng){
+    if(eng.state !== prevState){
+      prevState = eng.state;
+      if(eng.state === "idle") cascade([" ", " ", " "], false);
+      if(eng.state === "settle") cascade(["S", "A", "V"], true);
+    }
+    /* mic live: staggered mechanical churn, per-cell independent timers */
+    if(eng.state === "listening" || eng.state === "speaking"){
+      var now = performance.now();
+      cells.forEach(function(c){
+        if(now >= c.nextRandomAt){
+          flip(c, randomGlyph());
+          c.nextRandomAt = now + (200 + Math.random() * 420) / (params.flapSpeed || 1);
+        }
+      });
+    }
+  }
+
+  return { el: row, onEngine: onEngine };
+}
+
+/* Mic status cluster: pulsing dot + caps label + mini flap.
+   stacked = label row above right-aligned flap (V1); inline = one row (V2/V3). */
+function createMicStatus(opts){
+  opts = opts || {};
+  var wrap = document.createElement("div");
+  wrap.className = "mic-status " + (opts.stacked ? "stacked" : "inline");
+  var labelRow = document.createElement("div");
+  labelRow.className = "mic-label-row";
+  var dot = document.createElement("span");
+  dot.className = "mic-dot dim";
+  var lbl = document.createElement("span");
+  lbl.textContent = "STANDBY";
+  labelRow.appendChild(dot);
+  labelRow.appendChild(lbl);
+  var flap = createMiniFlap();
+  if(opts.stacked || opts.labelFirst){
+    wrap.appendChild(labelRow);
+    wrap.appendChild(flap.el);
+  } else {
+    wrap.appendChild(flap.el);
+    wrap.appendChild(labelRow);
+  }
+
+  var prevState = null;
+  function onEngine(eng){
+    if(eng.state !== prevState){
+      prevState = eng.state;
+      lbl.textContent = eng.state === "idle" ? "STANDBY" : eng.state === "settle" ? "CAPTURED" : "LISTENING";
+      dot.classList.toggle("dim", eng.state === "idle");
+    }
+    flap.onEngine(eng);
+  }
+  return { el: wrap, onEngine: onEngine };
+}
+
+/* ==========================================================================
+   IDEA INPUT (big type/speak area with live transcript + blinking caret)
+   ========================================================================== */
+function createIdeaInput(){
+  var el = document.createElement("div");
+  el.className = "idea-input";
+  var text = document.createElement("span");
+  var caret = document.createElement("span");
+  caret.className = "caret";
+  caret.style.display = "none";
+  el.appendChild(text);
+  el.appendChild(caret);
+
+  var lastShown = null;
+  function show(str, isPlaceholder, caretOn){
+    var key = str + "|" + isPlaceholder + "|" + caretOn;
+    if(key === lastShown) return;
+    lastShown = key;
+    text.textContent = str;
+    text.className = isPlaceholder ? "ph" : "";
+    caret.style.display = caretOn ? "inline-block" : "none";
+  }
+
+  function onEngine(eng){
+    if(eng.state === "idle") show("Type or speak your idea…", true, false);
+    else if(eng.state === "listening") show("Listening…", true, true);
+    else if(eng.state === "speaking") show(eng.displayedText || "", false, true);
+    else show(eng.activeWords.join(" "), false, false);
+  }
+  return { el: el, onEngine: onEngine };
+}
+
+/* ==========================================================================
+   HALFTONE SCREENSHOT (reused from visualizer-playground concept D)
+   ========================================================================== */
+var _shotCanvas = null;
+function drawMockWindow(g, x, y, w, h, bodyColor){
+  g.fillStyle = "rgba(0,0,0,.28)";
+  g.fillRect(x + 4, y + 5, w, h);
+  g.fillStyle = bodyColor;
+  g.fillRect(x, y, w, h);
+  g.fillStyle = "#d9d9de";
+  g.fillRect(x, y, w, 22);
+  var lights = ["#ff5f57", "#febc2e", "#28c840"];
+  for(var i = 0; i < 3; i++){
+    g.beginPath();
+    g.fillStyle = lights[i];
+    g.arc(x + 12 + i * 14, y + 11, 4, 0, Math.PI * 2);
+    g.fill();
+  }
+  g.fillStyle = "#9d9da6";
+  var ty = y + 36;
+  var widths = [0.82, 0.6, 0.72, 0.4, 0.66, 0.5, 0.76, 0.3];
+  for(var l = 0; l < widths.length && ty < y + h - 14; l++){
+    g.fillRect(x + 14, ty, (w - 28) * widths[l], 7);
+    ty += 16;
+  }
+}
+function getScreenshot(){
+  if(_shotCanvas) return _shotCanvas;
+  var c = document.createElement("canvas");
+  c.width = 560; c.height = 340;
+  var g = c.getContext("2d");
+  var grad = g.createLinearGradient(0, 0, 560, 340);
+  grad.addColorStop(0, "#3b4a6b");
+  grad.addColorStop(0.55, "#5a3f66");
+  grad.addColorStop(1, "#7a3b52");
+  g.fillStyle = grad;
+  g.fillRect(0, 0, 560, 340);
+  g.fillStyle = "rgba(246,246,248,.92)";
+  g.fillRect(0, 0, 560, 18);
+  g.fillStyle = "#44454a";
+  var mx = 10;
+  [12, 30, 22, 26, 18].forEach(function(w){ g.fillRect(mx, 6, w, 6); mx += w + 12; });
+  drawMockWindow(g, 38, 46, 300, 214, "#f1f1f4");
+  drawMockWindow(g, 226, 106, 288, 196, "#ffffff");
+  g.fillStyle = "rgba(255,255,255,.22)";
+  g.fillRect(150, 310, 260, 24);
+  var dockColors = ["#4a90e2", "#e2574a", "#f2b544", "#48b874", "#9a5fd6", "#e07a3f"];
+  for(var d = 0; d < dockColors.length; d++){
+    g.fillStyle = dockColors[d];
+    g.fillRect(160 + d * 42, 313, 30, 18);
+  }
+  _shotCanvas = c;
+  return c;
+}
+
+function coverRect(shot, dstW, dstH){
+  var srcAR = shot.width / shot.height, dstAR = dstW / dstH;
+  if(srcAR > dstAR){
+    var sh = shot.height, sw = sh * dstAR;
+    return { sx: (shot.width - sw) / 2, sy: 0, sw: sw, sh: sh };
+  }
+  var sw2 = shot.width, sh2 = sw2 / dstAR;
+  return { sx: 0, sy: (shot.height - sh2) / 2, sw: sw2, sh: sh2 };
+}
+
+var _sampleCanvas = document.createElement("canvas");
+function renderHalftoneInto(canvas, cssW, cssH, sweepFrac){
+  var dpr = window.devicePixelRatio || 1;
+  canvas.style.width = cssW + "px";
+  canvas.style.height = cssH + "px";
+  var pw = Math.max(1, Math.round(cssW * dpr));
+  var ph = Math.max(1, Math.round(cssH * dpr));
+  if(canvas.width !== pw) canvas.width = pw;
+  if(canvas.height !== ph) canvas.height = ph;
+  var ctx = canvas.getContext("2d");
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+  var pitch = Math.max(2, params.halftoneSize);
+  var cols = Math.max(1, Math.ceil(cssW / pitch));
+  var rows = Math.max(1, Math.ceil(cssH / pitch));
+  var shot = getScreenshot();
+  var r0 = coverRect(shot, cssW, cssH);
+  if(_sampleCanvas.width !== cols) _sampleCanvas.width = cols;
+  if(_sampleCanvas.height !== rows) _sampleCanvas.height = rows;
+  var sctx = _sampleCanvas.getContext("2d");
+  sctx.clearRect(0, 0, cols, rows);
+  sctx.drawImage(shot, r0.sx, r0.sy, r0.sw, r0.sh, 0, 0, cols, rows);
+  var data = null;
+  try { data = sctx.getImageData(0, 0, cols, rows).data; } catch(e){ /* never expected: same-origin synthetic canvas */ }
+
+  ctx.clearRect(0, 0, cssW, cssH);
+  ctx.fillStyle = "#0d0d0f";
+  ctx.fillRect(0, 0, cssW, cssH);
+  if(!data) return;
+
+  ctx.fillStyle = params.accent;
+  /* cap below half-pitch so adjacent dots never merge into solid fill */
+  var maxR = pitch * 0.42;
+  var frontX = (sweepFrac == null || sweepFrac >= 1) ? Infinity : sweepFrac * (cssW + 40);
+  for(var ry = 0; ry < rows; ry++){
+    for(var cx = 0; cx < cols; cx++){
+      var i = (ry * cols + cx) * 4;
+      var lum = (0.2126 * data[i] + 0.7152 * data[i + 1] + 0.0722 * data[i + 2]) / 255;
+      var rad = maxR * Math.pow(lum, 1.4);
+      var px = cx * pitch + pitch / 2;
+      var py = ry * pitch + pitch / 2;
+      if(px > frontX) continue;
+      rad *= Math.min(1, (frontX - px) / 40);
+      if(rad < 0.3) continue;
+      ctx.beginPath();
+      ctx.arc(px, py, rad, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+}
+
+/* Halftone thumbnail unit with the "develop" sweep at each cycle restart */
+function createThumb(w, h){
+  var frame = document.createElement("div");
+  frame.className = "thumb-frame";
+  var canvas = document.createElement("canvas");
+  frame.appendChild(canvas);
+
+  var sweepStart = -1;
+  var prevState = null;
+
+  function resize(){ renderHalftoneInto(canvas, w, h, null); }
+
+  function onEngine(eng){
+    if(eng.state !== prevState){
+      if(prevState === "idle" && eng.state === "listening") sweepStart = performance.now();
+      prevState = eng.state;
+    }
+    if(sweepStart >= 0){
+      var dur = 600 / (params.flapSpeed || 1);
+      var t = (performance.now() - sweepStart) / dur;
+      if(t >= 1){
+        sweepStart = -1;
+        renderHalftoneInto(canvas, w, h, null);
+      } else {
+        renderHalftoneInto(canvas, w, h, 1 - Math.pow(1 - t, 2));
+      }
+    }
+  }
+
+  resize();
+  return { el: frame, resize: resize, onEngine: onEngine };
+}
+
+/* ==========================================================================
+   SMALL SVG PIECES (whistle mark, history + settings icons)
+   ========================================================================== */
+var WHISTLE_SVG =
+  '<svg width="26" height="12" viewBox="0 0 100 42" xmlns="http://www.w3.org/2000/svg">' +
+    '<rect x="8" y="15" width="56" height="13" rx="3" fill="#8a5a34" stroke="#3d2412" stroke-width="1.5"/>' +
+    '<rect x="60" y="10" width="15" height="22" rx="2.5" fill="#6e4527" stroke="#3d2412" stroke-width="1.5"/>' +
+    '<rect x="8" y="18.5" width="56" height="2" fill="#4a2f19" opacity="0.5"/>' +
+    '<circle cx="28" cy="21.5" r="2.8" fill="#241408"/>' +
+    '<path d="M64 11 L73 4 L73 11 Z" fill="#c9a227" stroke="#3d2412" stroke-width="1"/>' +
+    '<rect x="6" y="14" width="4" height="15" rx="1.5" fill="#3d2412"/>' +
+  '</svg>';
+var HISTORY_SVG =
+  '<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round">' +
+    '<circle cx="8" cy="8" r="6"/><path d="M8 4.5 L8 8 L10.5 9.5"/>' +
+  '</svg>';
+var SETTINGS_SVG =
+  '<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round">' +
+    '<path d="M2 5 H14 M2 11 H14"/><circle cx="6" cy="5" r="1.7" fill="currentColor" stroke="none"/>' +
+    '<circle cx="10" cy="11" r="1.7" fill="currentColor" stroke="none"/>' +
+  '</svg>';
+
+function iconBtn(svg){
+  var b = document.createElement("span");
+  b.className = "icon-btn";
+  b.innerHTML = svg;
+  return b;
+}
+function whistleMark(){
+  var m = document.createElement("span");
+  m.className = "whistle-mark";
+  m.innerHTML = WHISTLE_SVG;
+  return m;
+}
+function projChip(){
+  var c = document.createElement("span");
+  c.className = "proj-chip";
+  c.innerHTML = 'ttl <span class="chev">▾</span>';
+  return c;
+}
+
+/* registry of Notes elements toggled by the sidebar (V1/V2 only) */
+var notesEls = [];
+function makeNotesLine(){
+  var n = document.createElement("div");
+  n.className = "notes-line";
+  n.textContent = "Notes";
+  notesEls.push(n);
+  return n;
+}
+function applyNotesVisibility(){
+  notesEls.forEach(function(n){ n.style.display = params.showNotes ? "" : "none"; });
+}
+
+/* ==========================================================================
+   VARIANT V1 — "Sketch-faithful"
+   header action row / big input / bottom = thumb (left) + status stack (right)
+   ========================================================================== */
+function createV1(){
+  var panel = document.createElement("div");
+  panel.className = "wpanel";
+
+  var header = document.createElement("div");
+  header.className = "p-header";
+  var action = document.createElement("div");
+  action.className = "v1-action";
+  action.appendChild(whistleMark());
+  var actionLbl = document.createElement("span");
+  actionLbl.textContent = "START CONDUCTOR SESSION";
+  action.appendChild(actionLbl);
+  var spacer = document.createElement("div");
+  spacer.className = "p-spacer";
+  header.appendChild(action);
+  header.appendChild(spacer);
+  header.appendChild(iconBtn(HISTORY_SVG));
+  header.appendChild(iconBtn(SETTINGS_SVG));
+
+  var idea = createIdeaInput();
+  var notes = makeNotesLine();
+
+  var bottom = document.createElement("div");
+  bottom.className = "v1-bottom";
+  var thumb = createThumb(236, 80);
+  var statusCol = document.createElement("div");
+  statusCol.className = "v1-status";
+  var mic = createMicStatus({ stacked: true });
+  statusCol.appendChild(mic.el);
+  statusCol.appendChild(projChip());
+  bottom.appendChild(thumb.el);
+  bottom.appendChild(statusCol);
+
+  panel.appendChild(header);
+  panel.appendChild(idea.el);
+  panel.appendChild(notes);
+  panel.appendChild(bottom);
+
+  return {
+    el: panel,
+    resize: function(){ thumb.resize(); },
+    onEngine: function(eng){ idea.onEngine(eng); mic.onEngine(eng); thumb.onEngine(eng); }
+  };
+}
+
+/* ==========================================================================
+   VARIANT V2 — "Manifest"
+   one bounded input card (idea + notes + screenshot) / departure-board rail
+   ========================================================================== */
+function createV2(){
+  var panel = document.createElement("div");
+  panel.className = "wpanel";
+
+  var header = document.createElement("div");
+  header.className = "p-header";
+  header.appendChild(whistleMark());
+  var spacer = document.createElement("div");
+  spacer.className = "p-spacer";
+  header.appendChild(spacer);
+  header.appendChild(iconBtn(HISTORY_SVG));
+  header.appendChild(iconBtn(SETTINGS_SVG));
+
+  var card = document.createElement("div");
+  card.className = "v2-card";
+  var idea = createIdeaInput();
+  var notes = makeNotesLine();
+  var thumb = createThumb(412, 74);
+  card.appendChild(idea.el);
+  card.appendChild(notes);
+  card.appendChild(thumb.el);
+
+  var rail = document.createElement("div");
+  rail.className = "status-rail";
+  var mic = createMicStatus({ stacked: false });
+  var dest = document.createElement("div");
+  dest.className = "rail-dest";
+  dest.textContent = "TO: TTL";
+  var submit = document.createElement("span");
+  submit.className = "p-btn submit";
+  submit.textContent = "Submit";
+  rail.appendChild(mic.el);
+  rail.appendChild(dest);
+  rail.appendChild(submit);
+
+  panel.appendChild(header);
+  panel.appendChild(card);
+  panel.appendChild(rail);
+
+  return {
+    el: panel,
+    resize: function(){ thumb.resize(); },
+    onEngine: function(eng){ idea.onEngine(eng); mic.onEngine(eng); thumb.onEngine(eng); }
+  };
+}
+
+/* ==========================================================================
+   VARIANT V3 — "Station header"
+   status top-right like a board's clock / conventional body + footer
+   ========================================================================== */
+function createV3(){
+  var panel = document.createElement("div");
+  panel.className = "wpanel";
+
+  var header = document.createElement("div");
+  header.className = "p-header";
+  var mark = document.createElement("span");
+  mark.className = "v3-wordmark";
+  mark.textContent = "WHISTLE";
+  var spacer = document.createElement("div");
+  spacer.className = "p-spacer";
+  var mic = createMicStatus({ stacked: false, labelFirst: true });
+  header.appendChild(mark);
+  header.appendChild(spacer);
+  header.appendChild(mic.el);
+
+  var idea = createIdeaInput();
+  var thumb = createThumb(428, 88);
+
+  var notesAff = document.createElement("div");
+  notesAff.className = "v3-notes-affordance";
+  notesAff.textContent = "+ Notes";
+
+  var footer = document.createElement("div");
+  footer.className = "v3-footer";
+  var fspacer = document.createElement("div");
+  fspacer.className = "p-spacer";
+  var clearBtn = document.createElement("span");
+  clearBtn.className = "p-btn ghost";
+  clearBtn.textContent = "Clear";
+  var submit = document.createElement("span");
+  submit.className = "p-btn submit";
+  submit.textContent = "Submit";
+  footer.appendChild(projChip());
+  footer.appendChild(fspacer);
+  footer.appendChild(clearBtn);
+  footer.appendChild(submit);
+
+  panel.appendChild(header);
+  panel.appendChild(idea.el);
+  panel.appendChild(thumb.el);
+  panel.appendChild(notesAff);
+  panel.appendChild(footer);
+
+  return {
+    el: panel,
+    resize: function(){ thumb.resize(); },
+    onEngine: function(eng){ idea.onEngine(eng); mic.onEngine(eng); thumb.onEngine(eng); }
+  };
+}
+
+/* ==========================================================================
+   INSTANCES
+   ========================================================================== */
+var variants = [];
+function buildInstances(){
+  var v1 = createV1(), v2 = createV2(), v3 = createV3();
+  document.getElementById("stage-v1").appendChild(v1.el);
+  document.getElementById("stage-v2").appendChild(v2.el);
+  document.getElementById("stage-v3").appendChild(v3.el);
+  variants = [v1, v2, v3];
+}
+function resizeAll(){ variants.forEach(function(v){ v.resize(); }); }
+
+/* ==========================================================================
+   CSS VARS / THEME
+   ========================================================================== */
+function hexToRgb(hex){
+  hex = (hex || "#000000").replace("#", "");
+  if(hex.length === 3) hex = hex.split("").map(function(c){ return c + c; }).join("");
+  var num = parseInt(hex, 16) || 0;
+  return [(num >> 16) & 255, (num >> 8) & 255, num & 255];
+}
+function relLuminance(hex){
+  var rgb = hexToRgb(hex).map(function(v){
+    v /= 255;
+    return v <= 0.03928 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4);
+  });
+  return 0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2];
+}
+function updateCssVars(){
+  var r = document.documentElement.style;
+  r.setProperty("--accent", params.accent);
+  /* pick readable ink on the accent (amber wants dark text, orange wants light) */
+  r.setProperty("--accent-ink", relLuminance(params.accent) > 0.35 ? "#201409" : "#ffffff");
+  r.setProperty("--panel-bg", params.panelBg);
+}
+function applyTheme(){
+  document.body.classList.toggle("light", params.theme === "light");
+  var btn = document.getElementById("btn-theme-toggle");
+  if(btn) btn.textContent = params.theme === "light" ? "Dark Mode" : "Light Mode";
+}
+
+/* ==========================================================================
+   TOAST + CLIPBOARD
+   ========================================================================== */
+var toastTimer = null;
+function showToast(msg){
+  var t = document.getElementById("toast");
+  t.textContent = msg;
+  t.classList.add("show");
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(function(){ t.classList.remove("show"); }, 1800);
+}
+function fallbackCopy(str, cb){
+  var ta = document.createElement("textarea");
+  ta.value = str;
+  ta.style.position = "fixed";
+  ta.style.opacity = "0";
+  document.body.appendChild(ta);
+  ta.select();
+  try { document.execCommand("copy"); } catch(e){}
+  document.body.removeChild(ta);
+  cb();
+}
+function copyText(str, msg){
+  function done(){ showToast(msg); }
+  if(navigator.clipboard && navigator.clipboard.writeText){
+    navigator.clipboard.writeText(str).then(done).catch(function(){ fallbackCopy(str, done); });
+  } else {
+    fallbackCopy(str, done);
+  }
+}
+
+/* ==========================================================================
+   CODE GENERATION (vanilla HTML/CSS skeleton per variant)
+   ========================================================================== */
+function sharedPanelCss(){
+  var p = params;
+  return '.wpanel{ width:460px; background:' + p.panelBg + '; border:1px solid rgba(255,255,255,.08);\n' +
+    '  border-radius:14px; padding:14px; display:flex; flex-direction:column; gap:10px;\n' +
+    '  color:#e8e2d9; font-family:-apple-system,system-ui,sans-serif; box-shadow:0 14px 34px rgba(0,0,0,.5); }\n' +
+    '.idea-input{ min-height:68px; border-radius:10px; border:1px solid rgba(255,255,255,.09);\n' +
+    '  background:rgba(255,255,255,.045); padding:10px 12px; font-size:13.5px; color:#efe9df; }\n' +
+    '.notes-line{ height:26px; border-radius:7px; border:1px solid rgba(255,255,255,.07);\n' +
+    '  background:rgba(255,255,255,.03); color:#8a8078; font-size:11.5px; line-height:24px; padding:0 10px; }\n' +
+    '.thumb{ border-radius:8px; border:1px solid rgba(255,255,255,.09); background:#0d0d0f; }\n' +
+    '/* halftone: sample screenshot per ' + p.halftoneSize + 'px cell, dot radius = pitch*0.42*pow(lum,1.4), color ' + p.accent + ' */\n' +
+    '.mic-label{ font:700 8.5px/1 "Helvetica Neue Condensed","Arial Narrow",Arial,sans-serif;\n' +
+    '  letter-spacing:.18em; color:' + p.accent + '; }\n' +
+    '.flap-row{ display:flex; gap:2px; height:24px; }\n' +
+    '.flap-cell{ position:relative; width:16px; height:24px; background:#141416; border-radius:3px; overflow:hidden;\n' +
+    '  color:#f0e7d8; font:700 16px/24px "Helvetica Neue Condensed","Arial Narrow",Arial,sans-serif; text-align:center; }\n' +
+    '/* flip: two-half rotateX leaf animation, churn random glyphs while mic is live -- see panel-layout-playground.html */\n' +
+    '/* action color: fixed Whistle Orange (dual-accent: amber instrumentation, orange action) */\n' +
+    '.submit{ background:#e8630a; color:#fff;\n' +
+    '  font:700 12px/1 -apple-system,system-ui,sans-serif; border-radius:7px; padding:8px 16px; }\n';
+}
+function generateCodeV1(){
+  var notes = params.showNotes ? '\n  <div class="notes-line">Notes</div>' : '';
+  return '<!-- Whistle capture panel -- V1 "Sketch-faithful" -->\n' +
+    '<div class="wpanel">\n' +
+    '  <div class="header">\n' +
+    '    <div class="action-chip">[whistle] START CONDUCTOR SESSION</div>\n' +
+    '    <span class="spacer"></span> [history icon] [settings icon]\n' +
+    '  </div>\n' +
+    '  <div class="idea-input">Type or speak your idea…</div>' + notes + '\n' +
+    '  <div class="bottom-row"> <!-- display:flex; gap:10px -->\n' +
+    '    <canvas class="thumb" width="236" height="80"></canvas>\n' +
+    '    <div class="status-stack"> <!-- flex column, align-items:flex-end; justify-content:space-between -->\n' +
+    '      <div><span class="mic-label">&#9679; LISTENING</span>\n' +
+    '        <div class="flap-row"><div class="flap-cell">K</div><div class="flap-cell">R</div><div class="flap-cell">7</div></div>\n' +
+    '      </div>\n' +
+    '      <span class="proj-chip">ttl &#9662;</span>\n' +
+    '    </div>\n' +
+    '  </div>\n' +
+    '</div>\n\n<style>\n' + sharedPanelCss() +
+    '.action-chip{ display:flex; align-items:center; gap:8px; padding:5px 10px; border-radius:8px;\n' +
+    '  border:1px solid rgba(255,255,255,.1); background:rgba(255,255,255,.045);\n' +
+    '  font:700 10.5px/1 "Helvetica Neue Condensed","Arial Narrow",Arial,sans-serif; letter-spacing:.14em; color:#e0d7c9; }\n' +
+    '.proj-chip{ font:600 11.5px/1 -apple-system,system-ui,sans-serif; color:#cfc6bc;\n' +
+    '  background:rgba(255,255,255,.05); border:1px solid rgba(255,255,255,.09); border-radius:7px; padding:5px 10px; }\n' +
+    '</style>';
+}
+function generateCodeV2(){
+  var notes = params.showNotes ? '\n    <div class="notes-line">Notes</div>' : '';
+  return '<!-- Whistle capture panel -- V2 "Manifest" (inputs coupled in one card, status on a rail) -->\n' +
+    '<div class="wpanel">\n' +
+    '  <div class="header">[whistle] <span class="spacer"></span> [history icon] [settings icon]</div>\n' +
+    '  <div class="input-card"> <!-- inset border, slightly lighter bg: everything going IN -->\n' +
+    '    <div class="idea-input">Type or speak your idea…</div>' + notes + '\n' +
+    '    <canvas class="thumb" width="412" height="74"></canvas>\n' +
+    '  </div>\n' +
+    '  <div class="status-rail"> <!-- departure-board footer strip -->\n' +
+    '    <div class="flap-row"><div class="flap-cell">K</div><div class="flap-cell">R</div><div class="flap-cell">7</div></div>\n' +
+    '    <span class="mic-label">&#9679; LISTENING</span>\n' +
+    '    <span class="rail-dest">TO: TTL</span>\n' +
+    '    <span class="submit">Submit</span>\n' +
+    '  </div>\n' +
+    '</div>\n\n<style>\n' + sharedPanelCss() +
+    '.input-card{ border:1px solid rgba(255,255,255,.1); background:rgba(255,255,255,.03); border-radius:11px;\n' +
+    '  padding:9px; display:flex; flex-direction:column; gap:8px; box-shadow:inset 0 1px 3px rgba(0,0,0,.3); }\n' +
+    '.status-rail{ display:flex; align-items:center; gap:12px; background:#0d0d0f;\n' +
+    '  border-top:1px solid rgba(255,255,255,.1); margin:2px -14px -14px; padding:10px 14px;\n' +
+    '  border-radius:0 0 13px 13px; }\n' +
+    '.rail-dest{ flex:1; text-align:center; font:700 10.5px/1 ui-monospace,"SF Mono",Menlo,monospace;\n' +
+    '  letter-spacing:.22em; color:' + params.accent + '; }\n' +
+    '</style>';
+}
+function generateCodeV3(){
+  return '<!-- Whistle capture panel -- V3 "Station header" (mic status as the board\'s clock) -->\n' +
+    '<div class="wpanel">\n' +
+    '  <div class="header">\n' +
+    '    <span class="wordmark">WHISTLE</span>\n' +
+    '    <span class="spacer"></span>\n' +
+    '    <span class="mic-label">&#9679; LISTENING</span>\n' +
+    '    <div class="flap-row"><div class="flap-cell">K</div><div class="flap-cell">R</div><div class="flap-cell">7</div></div>\n' +
+    '  </div>\n' +
+    '  <div class="idea-input">Type or speak your idea…</div>\n' +
+    '  <canvas class="thumb" width="428" height="88"></canvas>\n' +
+    '  <div class="notes-affordance">+ Notes</div>\n' +
+    '  <div class="footer">\n' +
+    '    <span class="proj-chip">ttl &#9662;</span>\n' +
+    '    <span class="spacer"></span>\n' +
+    '    <span class="ghost">Clear</span>\n' +
+    '    <span class="submit">Submit</span>\n' +
+    '  </div>\n' +
+    '</div>\n\n<style>\n' + sharedPanelCss() +
+    '.wordmark{ font:700 14px/1 "Helvetica Neue Condensed","Arial Narrow",Arial,sans-serif; letter-spacing:.3em; color:#efe6d6; }\n' +
+    '.notes-affordance{ font:600 11px/1 -apple-system,system-ui,sans-serif; color:#8a8078; }\n' +
+    '.footer{ display:flex; align-items:center; gap:8px; }\n' +
+    '.ghost{ font:700 12px/1 -apple-system,system-ui,sans-serif; color:#a3988c;\n' +
+    '  border:1px solid rgba(255,255,255,.1); border-radius:7px; padding:7px 16px; }\n' +
+    '.proj-chip{ font:600 11.5px/1 -apple-system,system-ui,sans-serif; color:#cfc6bc;\n' +
+    '  background:rgba(255,255,255,.05); border:1px solid rgba(255,255,255,.09); border-radius:7px; padding:5px 10px; }\n' +
+    '</style>';
+}
+function generateCode(variant){
+  if(variant === "v1") return generateCodeV1();
+  if(variant === "v2") return generateCodeV2();
+  if(variant === "v3") return generateCodeV3();
+  return "";
+}
+
+/* ==========================================================================
+   PROMPT / RESET
+   ========================================================================== */
+function generatePrompt(){
+  var p = params;
+  var text = "Create a Whistle capture panel layout (460px wide, warm dark background " + p.panelBg +
+    ") with accent color " + p.accent + ", a 3-cell split-flap mic status indicator (flap speed " + p.flapSpeed +
+    "x) that churns random glyphs while listening, a halftone-treated screenshot thumbnail (dot size " +
+    p.halftoneSize + "px, luminance-driven dots), notes field " + (p.showNotes ? "shown" : "hidden") +
+    ', a project destination chip "ttl", and an accent Submit button. Demo transcript: "' + p.transcript + '".';
+  console.log(text);
+  copyText(text, "Prompt copied to clipboard");
+}
+function resetParams(){
+  Object.keys(DEFAULTS).forEach(function(k){ params[k] = DEFAULTS[k]; });
+  refreshAll();
+}
+
+/* ==========================================================================
+   URL HASH STATE
+   ========================================================================== */
+var hashTimer = null;
+function encodeHash(){
+  return Object.keys(params).map(function(k){
+    return k + "=" + encodeURIComponent(params[k]);
+  }).join("&");
+}
+function persistHash(){
+  clearTimeout(hashTimer);
+  hashTimer = setTimeout(function(){
+    history.replaceState(null, "", "#" + encodeHash());
+  }, 300);
+}
+function loadFromHash(){
+  if(!location.hash) return;
+  location.hash.slice(1).split("&").forEach(function(pair){
+    // Shared links are untrusted input: malformed percent escapes throw
+    // from decodeURIComponent, and unclamped numbers can freeze the page.
+    // Ignore bad pairs; clamp numerics to the matching control's range.
+    try {
+      var idx = pair.indexOf("=");
+      if(idx < 0) return;
+      var k = pair.slice(0, idx);
+      var v = decodeURIComponent(pair.slice(idx + 1) || "");
+      if(!(k in DEFAULTS)) return;
+      var defVal = DEFAULTS[k];
+      if(typeof defVal === "number"){ var n = parseFloat(v); if(isFinite(n)) params[k] = clampToControlRange(k, n); }
+      else if(typeof defVal === "boolean"){ params[k] = v === "true"; }
+      else { params[k] = v; }
+    } catch(e) { /* skip malformed pair */ }
+  });
+}
+
+/* Clamp a hash-supplied number to the matching slider's min/max (controls
+   use ids of the form ctrl-<param lowercased>); pass through when there is
+   no bounded control for the param. */
+function clampToControlRange(key, n){
+  var el = document.getElementById("ctrl-" + key.toLowerCase());
+  if(el && el.min !== "" && el.max !== "" && el.type === "range"){
+    return Math.min(parseFloat(el.max), Math.max(parseFloat(el.min), n));
+  }
+  return n;
+}
+
+/* ==========================================================================
+   SIDEBAR CONTROLS
+   ========================================================================== */
+function syncControls(){
+  document.getElementById("ctrl-accent").value = params.accent;
+  document.getElementById("val-accent").textContent = params.accent;
+  document.getElementById("ctrl-panelbg").value = params.panelBg;
+  document.getElementById("val-panelbg").textContent = params.panelBg;
+  document.getElementById("ctrl-flapspeed").value = params.flapSpeed;
+  document.getElementById("val-flapspeed").textContent = Number(params.flapSpeed).toFixed(1) + "x";
+  document.getElementById("ctrl-htsize").value = params.halftoneSize;
+  document.getElementById("val-htsize").textContent = params.halftoneSize + "px";
+  document.getElementById("ctrl-notes").checked = params.showNotes;
+  document.getElementById("ctrl-transcript").value = params.transcript;
+  document.getElementById("ctrl-play").textContent = params.playing ? "⏸ Pause" : "▶ Play";
+}
+function refreshAll(){
+  updateCssVars();
+  resizeAll();
+  applyNotesVisibility();
+  syncControls();
+  applyTheme();
+  persistHash();
+}
+function onParamChange(){
+  updateCssVars();
+  resizeAll();
+  syncControls();
+  persistHash();
+}
+
+function bindControls(){
+  document.getElementById("ctrl-accent").addEventListener("input", function(e){
+    params.accent = e.target.value;
+    onParamChange();
+  });
+  document.getElementById("preset-amber").addEventListener("click", function(){
+    params.accent = "#ffb000";
+    onParamChange();
+    showToast("Accent: Amber #ffb000");
+  });
+  document.getElementById("preset-orange").addEventListener("click", function(){
+    params.accent = "#e8630a";
+    onParamChange();
+    showToast("Accent: Whistle Orange #e8630a");
+  });
+  document.getElementById("ctrl-panelbg").addEventListener("input", function(e){
+    params.panelBg = e.target.value;
+    onParamChange();
+  });
+  document.getElementById("ctrl-flapspeed").addEventListener("input", function(e){
+    params.flapSpeed = parseFloat(e.target.value);
+    onParamChange();
+  });
+  document.getElementById("ctrl-htsize").addEventListener("input", function(e){
+    params.halftoneSize = parseFloat(e.target.value);
+    onParamChange();
+  });
+  document.getElementById("ctrl-notes").addEventListener("change", function(e){
+    params.showNotes = e.target.checked;
+    applyNotesVisibility();
+    persistHash();
+  });
+  document.getElementById("ctrl-transcript").addEventListener("input", function(e){
+    params.transcript = e.target.value;
+    persistHash();
+  });
+  document.getElementById("ctrl-play").addEventListener("click", function(){
+    params.playing = !params.playing;
+    syncControls();
+    persistHash();
+  });
+  document.getElementById("btn-generate-prompt").addEventListener("click", generatePrompt);
+  document.getElementById("btn-reset").addEventListener("click", resetParams);
+  document.getElementById("btn-theme-toggle").addEventListener("click", function(){
+    params.theme = params.theme === "light" ? "dark" : "light";
+    applyTheme();
+    persistHash();
+  });
+  document.querySelectorAll(".copy-btn").forEach(function(btn){
+    btn.addEventListener("click", function(){
+      copyText(generateCode(btn.dataset.variant), "Copied " + btn.dataset.variant.toUpperCase() + " code");
+    });
+  });
+}
+
+/* ==========================================================================
+   KEYBOARD SHORTCUTS (C = copy prompt, D = dark/light; ignored while typing)
+   ========================================================================== */
+function onKeydown(e){
+  var tag = document.activeElement ? document.activeElement.tagName : "";
+  if(tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
+  var key = e.key.toLowerCase();
+  if(key === "c"){ generatePrompt(); }
+  else if(key === "d"){
+    params.theme = params.theme === "light" ? "dark" : "light";
+    applyTheme();
+    persistHash();
+  }
+}
+
+/* ==========================================================================
+   INIT
+   ========================================================================== */
+function init(){
+  loadFromHash();
+  buildInstances();
+  bindControls();
+  updateCssVars();
+  resizeAll();
+  applyNotesVisibility();
+  syncControls();
+  applyTheme();
+  subscribe(function(eng){
+    variants.forEach(function(v){ v.onEngine(eng); });
+  });
+  document.addEventListener("keydown", onKeydown);
+}
+
+if(document.readyState === "loading"){
+  document.addEventListener("DOMContentLoaded", init);
+} else {
+  init();
+}
+
+})();
+</script>
+</body>
+</html>
