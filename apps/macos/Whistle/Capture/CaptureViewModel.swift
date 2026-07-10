@@ -12,6 +12,7 @@
 
 import AVFoundation
 import Foundation
+import Speech
 import WhistleCore
 
 /// Optional pre-fill used by the "Duplicate as new capture" entry point
@@ -55,13 +56,6 @@ public enum CaptureSubmitResult: Equatable {
     case refusedEmpty
 }
 
-/// What Esc should do, given current panel content (plan U8: "Esc with
-/// content -> confirm; Esc empty -> close").
-public enum EscAction: Equatable {
-    case close
-    case confirmThenClose
-}
-
 @MainActor
 public final class CaptureViewModel: ObservableObject {
     // MARK: - Published UI state
@@ -77,9 +71,29 @@ public final class CaptureViewModel: ObservableObject {
     /// actually starts the service; `false` on `stopTranscription()` and
     /// when the update stream itself ends (service-side stop/error).
     @Published public private(set) var isListening: Bool = false
+    /// Speech-recognition (SFSpeechRecognizer) authorization, tracked
+    /// separately from `isMicDenied` (fix #1d) -- mic can be authorized
+    /// while speech recognition alone is denied, which needs its own
+    /// banner + System Settings deep link (Privacy_SpeechRecognition, not
+    /// Privacy_Microphone).
+    @Published public private(set) var isSpeechRecognitionDenied: Bool = false
     @Published public var selectedProjectId: String?
     @Published public private(set) var projects: [Project] = []
     @Published public var focusProjectPicker: Bool = false
+
+    /// Bumped every time the panel is shown -- fresh open, a resumed draft
+    /// (fix #4b/c), or a refocus while already open -- so `CaptureView` can
+    /// re-engage its `@FocusState` via `.onChange` even when SwiftUI's own
+    /// `.onAppear` doesn't refire (it won't for a panel that's merely
+    /// re-ordered front after being hidden, since the hosted view was never
+    /// removed from the window's view hierarchy). Plan U8 fix #3: "keyboard
+    /// focus must land in the main text box immediately... in BOTH panel
+    /// modes."
+    @Published public private(set) var focusRequestToken: Int = 0
+
+    public func requestTranscriptFocus() {
+        focusRequestToken += 1
+    }
 
     /// Debug-log-friendly timestamp captured at `beginCapture()` entry, used
     /// by `CapturePanelController` to compute (and log) the
@@ -98,7 +112,42 @@ public final class CaptureViewModel: ObservableObject {
     private let store: CaptureStore
     private let screenshotService: ScreenshotService
     private let transcriptionServiceFactory: () -> any TranscriptionService
-    private let micPermissionChecker: () -> Bool
+    /// Tri-state mic TCC status read (fix: reset-deadlock) -- distinct from
+    /// `requestMicPermission` below so a status-only recheck (every panel
+    /// open, `windowDidBecomeKey`) never itself prompts. `.notDetermined`
+    /// must be told apart from `.denied`: only the latter is actionable via
+    /// System Settings -- the former means the app hasn't asked yet, and
+    /// doesn't even show up in Settings until it does.
+    private let micPermissionStatus: () -> PermissionState
+    /// Fires the real `AVCaptureDevice.requestAccess` TCC prompt -- called
+    /// ONLY when `micPermissionStatus()` is `.notDetermined`, and only from
+    /// `startTranscriptionIfPermitted()` at first real capture (never at
+    /// launch/prewarm, per commit 5ff9c64's invariant). This is what
+    /// actually registers the app in System Settings -> Privacy ->
+    /// Microphone -- before any request, macOS won't list it there at all,
+    /// which is what made the old "treat notDetermined as denied" bug an
+    /// unrecoverable deadlock (banner says denied, but there's nothing to
+    /// flip in Settings, because the app was never asked).
+    private let requestMicPermission: () async -> Bool
+    /// Real speech-recognition (SFSpeechRecognizer) TCC status, separate
+    /// from `micPermissionStatus` -- fix #5: transcription must actually be
+    /// gated on this, matching what the onboarding permission row displays,
+    /// rather than blindly attempting recognition regardless of
+    /// authorization (which would otherwise tight-loop retrying a task that
+    /// immediately errors on every restart when speech isn't authorized).
+    private let speechPermissionStatus: () -> PermissionState
+    /// `SFSpeechRecognizer.requestAuthorization` counterpart to
+    /// `requestMicPermission` -- same notDetermined-only, first-capture-only
+    /// contract.
+    private let requestSpeechPermission: () async -> Bool
+    /// Fires whenever the panel opens (fix #2): lets the caller (wired by
+    /// `CapturePanelController`/`WhistleApp` to `ProjectsSyncCoordinator.
+    /// refreshIfStale()`) trigger a `conductor.refreshProjects` server call
+    /// if the local `projects_snapshot` cache is stale (>1h) or missing,
+    /// per TECH-SPEC §7. A plain synchronous closure -- `CaptureViewModel`
+    /// itself never touches Convex/actors directly, matching the seam
+    /// style of `micPermissionStatus`/`speechPermissionStatus` above.
+    private let refreshProjectsIfStale: () -> Void
     private let defaultAgent: String
     private let defaultModel: String?
 
@@ -106,26 +155,34 @@ public final class CaptureViewModel: ObservableObject {
     private var transcriptionTask: Task<Void, Never>?
     private var projectsTask: Task<Void, Never>?
 
-    /// Committed transcript text accumulated by the transcription service,
-    /// kept separately from `transcriptText` so the user's manual edits
-    /// (the transcript field is editable per PRD F1.3) aren't clobbered by
-    /// a stray late update after the user has already started typing over
-    /// it. New transcription updates simply extend `transcriptText` as long
-    /// as the user hasn't diverged from what the service has produced.
+    /// The transcription service's own running display text as of the last
+    /// update, kept separately from `transcriptText` (the transcript field
+    /// is editable per PRD F1.3) so `applyTranscriptUpdate` can always
+    /// compute what's *newly* dictated and append just that, whether or not
+    /// the user has edited the field in the meantime -- the field must only
+    /// ever grow, never shrink or get silently rebuilt from scratch.
     private var lastServiceText: String = ""
 
     public init(
         store: CaptureStore,
         screenshotService: ScreenshotService = ScreenshotService(),
         transcriptionServiceFactory: @escaping () -> any TranscriptionService = { TranscriptionServiceFactory.make() },
-        micPermissionChecker: @escaping () -> Bool = { MicPermission.isAuthorized() },
+        micPermissionStatus: @escaping @MainActor () -> PermissionState = { MicPermission.status() },
+        requestMicPermission: @escaping @MainActor () async -> Bool = { await MicPermission.request() },
+        speechPermissionStatus: @escaping @MainActor () -> PermissionState = { SpeechRecognitionPermission.status() },
+        requestSpeechPermission: @escaping @MainActor () async -> Bool = { await SpeechRecognitionPermission.request() },
+        refreshProjectsIfStale: @escaping () -> Void = {},
         defaultAgent: String = "claude",
         defaultModel: String? = nil
     ) {
         self.store = store
         self.screenshotService = screenshotService
         self.transcriptionServiceFactory = transcriptionServiceFactory
-        self.micPermissionChecker = micPermissionChecker
+        self.micPermissionStatus = micPermissionStatus
+        self.requestMicPermission = requestMicPermission
+        self.speechPermissionStatus = speechPermissionStatus
+        self.requestSpeechPermission = requestSpeechPermission
+        self.refreshProjectsIfStale = refreshProjectsIfStale
         self.defaultAgent = defaultAgent
         self.defaultModel = defaultModel
     }
@@ -152,10 +209,80 @@ public final class CaptureViewModel: ObservableObject {
         screenshotData = preFill?.screenshotData
         focusProjectPicker = preFill?.focusProjectPicker ?? false
         lastServiceText = ""
-        isMicDenied = !micPermissionChecker()
-
+        // Fix #1b (fresh recheck) + reset-deadlock fix: `isMicDenied`/
+        // `isSpeechRecognitionDenied` are (re)computed from the OS fresh
+        // here, rather than trusting whatever they last held -- a grant
+        // recovered via System Settings must be picked up without an app
+        // relaunch. This happens inside `startTranscriptionIfPermitted()`
+        // below, which also fires the actual TCC request when a status
+        // comes back `.notDetermined` (first real capture only -- never at
+        // launch/prewarm).
         loadProjects()
+        // Fix #2: "on picker open" per TECH-SPEC §7 -- triggers
+        // `conductor.refreshProjects` if the local snapshot is stale/
+        // missing.
+        refreshProjectsIfStale()
         startTranscriptionIfPermitted()
+        requestTranscriptFocus()
+    }
+
+    /// Re-activates a preserved but unsent draft (plan U8 fix #4b/c): the
+    /// panel was dismissed (Esc, or losing key/focus) while `transcriptText`/
+    /// `notesText`/`screenshotData` held content, and is now reopening.
+    /// Unlike `beginCapture`, this must NEVER reset those fields or
+    /// `clientId` -- the whole point is that the draft survives until
+    /// `clear()` or `submit()` -- and it never touches `screenshotData`, so
+    /// the controller must not fire a new screenshot capture on this path
+    /// either (fix #4c: "do NOT retake the screenshot over the draft's").
+    /// Transcription itself does restart (it was stopped on dismiss);
+    /// `lastServiceText` resets to `""` so the fresh transcription stream's
+    /// output is appended after the existing draft text rather than
+    /// replacing it, via the same reconciliation `applyTranscriptUpdate`
+    /// already does for a mid-dictation manual edit.
+    public func resumeDraft() {
+        captureBeganAt = Date()
+        lastServiceText = ""
+        refreshProjectsIfStale()
+        startTranscriptionIfPermitted()
+        requestTranscriptFocus()
+    }
+
+    /// Re-checks mic + speech-recognition authorization fresh from the OS
+    /// (fix #1b), independent of a full `beginCapture`/`resumeDraft`.
+    /// Wired by `CapturePanelController.windowDidBecomeKey` so a
+    /// permission grant recovered via System Settings is picked up the
+    /// moment the panel's window regains key status, even on a path that
+    /// doesn't go through `trigger()` at all. If a previously-denied
+    /// permission is now granted and transcription isn't already running,
+    /// starts it -- the user shouldn't have to dismiss/reopen the panel to
+    /// benefit from a permission they just granted.
+    public func refreshPermissions() {
+        let wasMicDenied = isMicDenied
+        let wasSpeechDenied = isSpeechRecognitionDenied
+        // Status-only recheck (never requests) -- mirrors the denied-flag
+        // half of `startTranscriptionIfPermitted()` below without touching
+        // `transcriptionService`, so a plain window-key-regain recheck can
+        // never itself spin up a second transcription task.
+        syncDeniedFlags()
+
+        let recovered = (wasMicDenied && !isMicDenied) || (wasSpeechDenied && !isSpeechRecognitionDenied)
+        if recovered, transcriptionService == nil {
+            startTranscriptionIfPermitted()
+        }
+    }
+
+    /// "Clear" button (plan U8 fix #4a): empties transcript, notes, and
+    /// screenshot, and mints a fresh `clientId` so a subsequent submit is
+    /// recorded as a distinct capture. The panel stays open and
+    /// transcription keeps running -- `lastServiceText` resets so dictation
+    /// after a clear starts fresh instead of trying to diff against the
+    /// discarded text.
+    public func clear() {
+        transcriptText = ""
+        notesText = ""
+        screenshotData = nil
+        lastServiceText = ""
+        clientId = UUID().uuidString
     }
 
     /// Called by `CapturePanelController` when the pre-panel screenshot
@@ -172,8 +299,84 @@ public final class CaptureViewModel: ObservableObject {
 
     // MARK: - Transcription
 
+    /// Re-reads both TCC statuses and updates the two `@Published` denied
+    /// flags accordingly. Only `.denied`/`.restricted` renders as denied --
+    /// the reset-deadlock fix: `.notDetermined` must NEVER show the
+    /// actionable "denied -- enable in Settings" banner. There's nothing to
+    /// flip in Settings yet at that point (the app isn't even listed there
+    /// until it's actually requested access once), so treating
+    /// notDetermined as denied is a dead end for the user -- the exact bug
+    /// this fixes. Status-only: never itself prompts.
+    @discardableResult
+    private func syncDeniedFlags() -> (mic: PermissionState, speech: PermissionState) {
+        let mic = micPermissionStatus()
+        let speech = speechPermissionStatus()
+        isMicDenied = mic == .denied
+        isSpeechRecognitionDenied = speech == .denied
+        return (mic, speech)
+    }
+
+    /// The three-way permission handling at the heart of the reset-deadlock
+    /// fix. For each of mic/speech independently:
+    ///   - `.denied`/`.restricted` -> `isMicDenied`/`isSpeechRecognitionDenied`
+    ///     already set by `syncDeniedFlags()`; nothing more to do here.
+    ///   - `.notDetermined` -> fire the real TCC request (this is what
+    ///     registers the app in System Settings -> Privacy in the first
+    ///     place). Granted -> starts transcription immediately, no relaunch
+    ///     or reopen needed; denied -> falls to the denied-banner state.
+    ///     While the request is in flight, neither denied flag is set (it's
+    ///     pending, not denied), so the panel stays usable in type-only mode
+    ///     without showing the "go to Settings" banner.
+    ///   - `.granted` -> no request needed.
+    /// Transcription only actually starts once BOTH mic and speech
+    /// authorization resolve to granted (fix #5's existing gate).
+    ///
+    /// Only called from `beginCapture`/`resumeDraft` (fresh, real capture)
+    /// and `refreshPermissions` (recovered-grant case) -- never at
+    /// launch/prewarm (commit 5ff9c64's invariant: constructing a
+    /// `CaptureViewModel` alone must never touch mic/speech permissions).
     private func startTranscriptionIfPermitted() {
-        guard !isMicDenied else { return }
+        let (micStatus, speechStatus) = syncDeniedFlags()
+        guard micStatus != .denied, speechStatus != .denied else { return }
+
+        guard micStatus == .notDetermined || speechStatus == .notDetermined else {
+            // Both already granted -- no request needed, start right away.
+            beginRunningTranscription()
+            return
+        }
+
+        // Capture the request closures locally rather than reading
+        // `self.requestMicPermission`/`self.requestSpeechPermission` from
+        // inside the unstructured `Task` below, matching this file's
+        // existing weak-self + explicit `MainActor.run` hop style.
+        let requestMic = requestMicPermission
+        let requestSpeech = requestSpeechPermission
+
+        Task { [weak self] in
+            var micGranted = micStatus == .granted
+            if micStatus == .notDetermined {
+                let granted = await requestMic()
+                micGranted = granted
+                await MainActor.run { self?.isMicDenied = !granted }
+            }
+
+            var speechGranted = speechStatus == .granted
+            if speechStatus == .notDetermined {
+                let granted = await requestSpeech()
+                speechGranted = granted
+                await MainActor.run { self?.isSpeechRecognitionDenied = !granted }
+            }
+
+            guard micGranted, speechGranted else { return }
+            await MainActor.run { self?.beginRunningTranscription() }
+        }
+    }
+
+    /// Actually spins up the transcription service + its update-consuming
+    /// task. Split out from `startTranscriptionIfPermitted()` so both the
+    /// synchronous already-granted path and the async post-request path
+    /// share one implementation.
+    private func beginRunningTranscription() {
         let service = transcriptionServiceFactory()
         transcriptionService = service
         isListening = true
@@ -194,15 +397,51 @@ public final class CaptureViewModel: ObservableObject {
         }
     }
 
+    /// Reconciles a fresh `TranscriptUpdate` against whatever's currently in
+    /// the box. The field must only ever grow, never shrink or get wiped
+    /// out from under the user (the "pause then resume wipes the box" bug
+    /// this guards against) -- and a manual mid-dictation edit must never be
+    /// clobbered by a later update.
     private func applyTranscriptUpdate(_ update: TranscriptUpdate) {
         let newServiceText = update.displayText
-        // Only auto-extend the field if the user hasn't diverged from the
-        // transcription service's own running text -- otherwise a manual
-        // edit mid-dictation would be silently overwritten.
-        if transcriptText == lastServiceText || transcriptText.isEmpty {
+        defer { lastServiceText = newServiceText }
+
+        if transcriptText.isEmpty || (transcriptText == lastServiceText && newServiceText.hasPrefix(lastServiceText)) {
+            // Common case: no user edits since the last update, and the
+            // service's own text is a clean extension of what it last
+            // reported -- adopt it wholesale.
             transcriptText = newServiceText
+            return
         }
-        lastServiceText = newServiceText
+
+        // Either the user has diverged from the dictated text (a manual
+        // edit mid-dictation), or the service's text didn't extend cleanly
+        // (e.g. a segment restart producing something that doesn't share
+        // the prior prefix). Either way, never rebuild the field from
+        // scratch: append only the newly-dictated material onto whatever is
+        // already on screen, so dictation extends the user's edits instead
+        // of overwriting them.
+        appendDictated(newServiceText)
+    }
+
+    /// Appends the portion of `newServiceText` that's new since
+    /// `lastServiceText` onto `transcriptText`, rather than replacing the
+    /// field outright.
+    private func appendDictated(_ newServiceText: String) {
+        let addition: String
+        if newServiceText.hasPrefix(lastServiceText) {
+            addition = String(newServiceText.dropFirst(lastServiceText.count))
+        } else {
+            addition = newServiceText
+        }
+        let trimmedAddition = addition.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedAddition.isEmpty else { return }
+
+        if transcriptText.isEmpty || transcriptText.hasSuffix(" ") {
+            transcriptText += trimmedAddition
+        } else {
+            transcriptText += " " + trimmedAddition
+        }
     }
 
     /// Stops the transcription service (e.g. panel closing). Safe to call
@@ -221,24 +460,33 @@ public final class CaptureViewModel: ObservableObject {
     // MARK: - Projects
 
     private func loadProjects() {
-        projects = (try? store.projectsSnapshot()) ?? []
-        if let lastUsed = try? store.lastUsedProjectId(), projects.contains(where: { $0.id == lastUsed }) {
-            selectedProjectId = lastUsed
-        } else {
-            selectedProjectId = projects.first?.id
-        }
+        applyProjectsUpdate((try? store.projectsSnapshot()) ?? [])
 
         projectsTask?.cancel()
         projectsTask = Task { [weak self] in
             guard let self else { return }
             for await updated in self.store.projectsUpdates() {
                 await MainActor.run {
-                    self.projects = updated
-                    if self.selectedProjectId == nil {
-                        self.selectedProjectId = updated.first?.id
-                    }
+                    self.applyProjectsUpdate(updated)
                 }
             }
+        }
+    }
+
+    /// Applies a fresh projects list (initial snapshot read or a later
+    /// `projectsUpdates()` yield -- e.g. the app-wide `ProjectsSyncCoordinator`
+    /// persisting a `projects.list` subscription result into `CaptureStore`
+    /// for the first time after the picker opened with an empty/stale
+    /// snapshot, fix #2) and ensures a selection exists once projects do:
+    /// keeps the current selection if it's still valid, otherwise prefers
+    /// the last-used project, falling back to the first.
+    private func applyProjectsUpdate(_ updated: [Project]) {
+        projects = updated
+        guard selectedProjectId == nil || !updated.contains(where: { $0.id == selectedProjectId }) else { return }
+        if let lastUsed = try? store.lastUsedProjectId(), updated.contains(where: { $0.id == lastUsed }) {
+            selectedProjectId = lastUsed
+        } else {
+            selectedProjectId = updated.first?.id
         }
     }
 
@@ -264,13 +512,6 @@ public final class CaptureViewModel: ObservableObject {
         !transcriptText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             || !notesText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             || screenshotData != nil
-    }
-
-    // MARK: - Esc handling
-
-    /// Plan U8: "Esc with content -> confirm; Esc empty -> close."
-    public func escAction() -> EscAction {
-        hasContent ? .confirmThenClose : .close
     }
 
     // MARK: - Submit
@@ -342,14 +583,74 @@ public final class CaptureViewModel: ObservableObject {
 
 // MARK: - Mic permission seam
 
-/// Seam over `AVCaptureDevice.authorizationStatus(for: .audio)` so tests can
-/// simulate a denied-mic host without touching real TCC state (plan U8:
-/// "mic denied -> type-only mode flag set, panel still opens"). This checks
-/// status only -- it never itself prompts for permission (that's an
-/// onboarding-only concern, mirroring `ScreenshotService`'s preflight-only
-/// contract).
+/// Seam over `AVCaptureDevice.authorizationStatus(for: .audio)` /
+/// `AVCaptureDevice.requestAccess(for: .audio)` so tests can simulate any
+/// mic TCC host -- including the `.notDetermined -> request -> granted/
+/// denied` transition (the reset-deadlock fix) -- without touching real TCC
+/// state.
+///
+/// Previously this only exposed a status-only `isAuthorized() -> Bool`
+/// check, on the theory that requesting was an onboarding-only concern.
+/// That over-corrected: after `tccutil reset Microphone` (or on a fresh
+/// install), `authorizationStatus(for: .audio)` comes back
+/// `.notDetermined`, and treating "not authorized" as "denied" everywhere
+/// meant capture's actionable-denied banner fired for a permission that was
+/// never actually asked for -- and since `requestAccess` was never called
+/// from the capture path either, the app never appeared in System Settings
+/// -> Privacy & Security -> Microphone at all (apps only list there after
+/// their first request). Banner says denied, Settings has nothing to flip,
+/// app never asks: a genuine deadlock. `request()` below is the fix --
+/// called from `CaptureViewModel.startTranscriptionIfPermitted()` only at
+/// first real capture (never at launch/prewarm).
 public enum MicPermission {
-    public static func isAuthorized() -> Bool {
-        AVCaptureDevice.authorizationStatus(for: .audio) == .authorized
+    /// Tri-state status read (`PermissionState`, shared with
+    /// `PermissionStep.swift`'s onboarding row) -- never itself prompts.
+    public static func status() -> PermissionState {
+        switch AVCaptureDevice.authorizationStatus(for: .audio) {
+        case .authorized: return .granted
+        case .denied, .restricted: return .denied
+        case .notDetermined: return .notDetermined
+        @unknown default: return .denied
+        }
+    }
+
+    /// Fires the real system TCC prompt (only meaningful when `status()`
+    /// is `.notDetermined`) -- this is what actually registers the app in
+    /// System Settings -> Privacy & Security -> Microphone.
+    public static func request() async -> Bool {
+        await AVCaptureDevice.requestAccess(for: .audio)
+    }
+}
+
+// MARK: - Speech recognition permission seam
+
+/// Seam over `SFSpeechRecognizer.authorizationStatus()` / `.requestAuthorization`
+/// (fix #5) -- the same real status `PermissionStep.swift`'s onboarding row
+/// displays, so transcription's gating and the onboarding display can never
+/// disagree. Same reset-deadlock class of bug as `MicPermission` (speech
+/// recognition needs its own TCC grant, and also only appears in Settings
+/// once requested), and the same fix: `request()` is called from
+/// `CaptureViewModel` only when `status()` is `.notDetermined`, only at
+/// first real capture.
+public enum SpeechRecognitionPermission {
+    /// Tri-state status read -- never itself prompts.
+    public static func status() -> PermissionState {
+        switch SFSpeechRecognizer.authorizationStatus() {
+        case .authorized: return .granted
+        case .denied, .restricted: return .denied
+        case .notDetermined: return .notDetermined
+        @unknown default: return .denied
+        }
+    }
+
+    /// Fires the real system TCC prompt (only meaningful when `status()`
+    /// is `.notDetermined`) -- this is what actually registers the app in
+    /// System Settings -> Privacy & Security -> Speech Recognition.
+    public static func request() async -> Bool {
+        await withCheckedContinuation { continuation in
+            SFSpeechRecognizer.requestAuthorization { status in
+                continuation.resume(returning: status == .authorized)
+            }
+        }
     }
 }
