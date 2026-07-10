@@ -160,9 +160,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Dev/QA affordance: open the capture panel immediately on launch,
         // for manual verification when the hotkey or status item isn't
         // reachable (menu-bar overflow managers, screenshot-driven QA).
+        // Debug-only: a release binary must not start screenshot capture +
+        // transcription from a launch argument (PR #5 review).
+        #if DEBUG
         if ProcessInfo.processInfo.arguments.contains("--show-capture-panel") {
             capturePanel.trigger()
         }
+        #endif
 
         Task {
             await auth.resolveInitialState()

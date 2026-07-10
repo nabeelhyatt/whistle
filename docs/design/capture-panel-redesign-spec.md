@@ -53,7 +53,7 @@ VStack(spacing 10)                      // .padding(14), bg #1e1a18
                                         // keep the xmark remove button as an overlay, top-trailing
   statusRail:                           // HStack, bg #0d0d0f, negative-inset to panel edges,
                                         // top border white@10%, bottom corners follow panel radius
-    FlapStatusView(isListening:)        // left
+    FlapStatusView(transcript:isListening:isMicDenied:)  // left; transcript drives the flips
     destinationMenu                     // center, flex: "TO: TTL" styling wrapping the existing
                                         // ProjectPicker selection logic (keep Binding + selectProject)
     Submit button                       // right, accent bg, dark ink, keep .keyboardShortcut(.return)

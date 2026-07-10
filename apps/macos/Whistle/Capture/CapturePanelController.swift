@@ -259,6 +259,10 @@ public final class CapturePanelController: NSObject, NSWindowDelegate {
         outsideClickMonitor = NSEvent.addGlobalMonitorForEvents(
             matching: [.leftMouseDown, .rightMouseDown]
         ) { [weak self] _ in
+            // The user just clicked INTO another app -- don't let
+            // closePanel()'s activating-mode restore steal focus back to
+            // whatever was frontmost before the panel opened.
+            self?.previousFrontmostApp = nil
             self?.closePanel()
         }
     }

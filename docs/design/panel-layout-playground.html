@@ -1492,16 +1492,32 @@ function persistHash(){
 function loadFromHash(){
   if(!location.hash) return;
   location.hash.slice(1).split("&").forEach(function(pair){
-    var idx = pair.indexOf("=");
-    if(idx < 0) return;
-    var k = pair.slice(0, idx);
-    var v = decodeURIComponent(pair.slice(idx + 1) || "");
-    if(!(k in DEFAULTS)) return;
-    var defVal = DEFAULTS[k];
-    if(typeof defVal === "number"){ var n = parseFloat(v); if(!isNaN(n)) params[k] = n; }
-    else if(typeof defVal === "boolean"){ params[k] = v === "true"; }
-    else { params[k] = v; }
+    // Shared links are untrusted input: malformed percent escapes throw
+    // from decodeURIComponent, and unclamped numbers can freeze the page.
+    // Ignore bad pairs; clamp numerics to the matching control's range.
+    try {
+      var idx = pair.indexOf("=");
+      if(idx < 0) return;
+      var k = pair.slice(0, idx);
+      var v = decodeURIComponent(pair.slice(idx + 1) || "");
+      if(!(k in DEFAULTS)) return;
+      var defVal = DEFAULTS[k];
+      if(typeof defVal === "number"){ var n = parseFloat(v); if(isFinite(n)) params[k] = clampToControlRange(k, n); }
+      else if(typeof defVal === "boolean"){ params[k] = v === "true"; }
+      else { params[k] = v; }
+    } catch(e) { /* skip malformed pair */ }
   });
+}
+
+/* Clamp a hash-supplied number to the matching slider's min/max (controls
+   use ids of the form ctrl-<param lowercased>); pass through when there is
+   no bounded control for the param. */
+function clampToControlRange(key, n){
+  var el = document.getElementById("ctrl-" + key.toLowerCase());
+  if(el && el.min !== "" && el.max !== "" && el.type === "range"){
+    return Math.min(parseFloat(el.max), Math.max(parseFloat(el.min), n));
+  }
+  return n;
 }
 
 /* ==========================================================================

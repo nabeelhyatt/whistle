@@ -20,7 +20,14 @@ enum HalftoneImage {
     /// SwiftUI body evaluations (typing in the transcript field, etc.)
     /// don't re-run the Core Image chain -- only a genuinely new
     /// screenshot pays the render cost.
-    private static let cache = NSCache<NSData, NSImage>()
+    private static let cache: NSCache<NSData, NSImage> = {
+        let cache = NSCache<NSData, NSImage>()
+        // One render is live per panel; a couple of spares cover rapid
+        // reopen. Bounding it releases stale full-screen renders promptly
+        // instead of waiting for memory pressure (PR #5 review).
+        cache.countLimit = 4
+        return cache
+    }()
 
     /// Renders (or returns the cached render of) `data` as an amber-on-
     /// dark halftone `NSImage` sized for display at `displaySize` (points).

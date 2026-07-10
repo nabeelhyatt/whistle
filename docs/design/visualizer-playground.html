@@ -557,6 +557,10 @@ hr.sep{
 }
 .ht-canvas{
   display: block;
+  /* scale down inside narrow (mobile-preview) panels instead of cropping;
+     !important because the dpr renderer sets inline width/height */
+  max-width: 100% !important;
+  height: auto !important;
   border-radius: 6px;
   border: 1px solid #2a2a2a;
 }
@@ -2070,16 +2074,32 @@ function loadFromHash(){
   if(!location.hash) return;
   var s = location.hash.slice(1);
   s.split("&").forEach(function(pair){
-    var idx = pair.indexOf("=");
-    if(idx < 0) return;
-    var k = pair.slice(0, idx);
-    var v = decodeURIComponent(pair.slice(idx + 1) || "");
-    if(!(k in DEFAULTS)) return;
-    var defVal = DEFAULTS[k];
-    if(typeof defVal === "number"){ var n = parseFloat(v); if(!isNaN(n)) params[k] = n; }
-    else if(typeof defVal === "boolean"){ params[k] = v === "true"; }
-    else { params[k] = v; }
+    // Shared links are untrusted input: malformed percent escapes throw
+    // from decodeURIComponent, and unclamped numbers (cells=1e9) can
+    // freeze the page. Ignore bad pairs; clamp numerics to control range.
+    try {
+      var idx = pair.indexOf("=");
+      if(idx < 0) return;
+      var k = pair.slice(0, idx);
+      var v = decodeURIComponent(pair.slice(idx + 1) || "");
+      if(!(k in DEFAULTS)) return;
+      var defVal = DEFAULTS[k];
+      if(typeof defVal === "number"){ var n = parseFloat(v); if(isFinite(n)) params[k] = clampToControlRange(k, n); }
+      else if(typeof defVal === "boolean"){ params[k] = v === "true"; }
+      else { params[k] = v; }
+    } catch(e) { /* skip malformed pair */ }
   });
+}
+
+/* Clamp a hash-supplied number to the matching slider's min/max (controls
+   use ids of the form ctrl-<param lowercased>); pass through when there is
+   no bounded control for the param. */
+function clampToControlRange(key, n){
+  var el = document.getElementById("ctrl-" + key.toLowerCase());
+  if(el && el.min !== "" && el.max !== "" && el.type === "range"){
+    return Math.min(parseFloat(el.max), Math.max(parseFloat(el.min), n));
+  }
+  return n;
 }
 
 /* ==========================================================================

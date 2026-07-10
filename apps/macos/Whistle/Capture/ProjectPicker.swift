@@ -89,7 +89,10 @@ struct ProjectPicker: View {
                 .lineLimit(1)
         }
         .menuStyle(.borderlessButton)
-        .fixedSize()
+        // Vertical-only: the label must stay one line but accept horizontal
+        // compression so a long project name truncates in place instead of
+        // widening the status rail (PR #5 review).
+        .fixedSize(horizontal: false, vertical: true)
         .disabled(projects.isEmpty)
         .modifier(OptionalFocused(isFocused: isFocused))
     }
