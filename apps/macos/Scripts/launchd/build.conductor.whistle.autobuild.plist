@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Template LaunchAgent for autobuild-watch.sh. This file is a reference —
+  the live copy lives at ~/Library/LaunchAgents/ and has $HOME expanded to
+  an absolute path (launchd does not expand ~ or $HOME).
+
+  Install:
+    sed "s|__HOME__|$HOME|g" apps/macos/Scripts/launchd/build.conductor.whistle.autobuild.plist \
+      > ~/Library/LaunchAgents/build.conductor.whistle.autobuild.plist
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/build.conductor.whistle.autobuild.plist
+
+  Uninstall:
+    launchctl bootout gui/$(id -u)/build.conductor.whistle.autobuild
+    rm ~/Library/LaunchAgents/build.conductor.whistle.autobuild.plist
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>build.conductor.whistle.autobuild</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>__HOME__/.whistle-autobuild/repo/apps/macos/Scripts/autobuild-watch.sh</string>
+  </array>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+
+  <key>StartInterval</key>
+  <integer>900</integer>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>StandardOutPath</key>
+  <string>__HOME__/Library/Logs/whistle-autobuild.log</string>
+
+  <key>StandardErrorPath</key>
+  <string>__HOME__/Library/Logs/whistle-autobuild.log</string>
+</dict>
+</plist>
