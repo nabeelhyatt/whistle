@@ -96,8 +96,10 @@ public final class StatusItemController: NSObject {
     // MARK: - Click routing
 
     @objc private func statusItemClicked(_ sender: NSStatusBarButton) {
-        guard let event = NSApp.currentEvent else { return }
-        switch event.type {
+        // Synthetic activations (VoiceOver/accessibility `AXPress`) carry no
+        // NSEvent -- treat them as the primary action rather than dropping
+        // them, so assistive tech can trigger capture.
+        switch NSApp.currentEvent?.type {
         case .rightMouseUp:
             showMenu()
         default:

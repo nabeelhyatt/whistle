@@ -157,6 +157,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         LaunchAtLogin.setEnabled(true)
 
+        // Dev/QA affordance: open the capture panel immediately on launch,
+        // for manual verification when the hotkey or status item isn't
+        // reachable (menu-bar overflow managers, screenshot-driven QA).
+        if ProcessInfo.processInfo.arguments.contains("--show-capture-panel") {
+            capturePanel.trigger()
+        }
+
         Task {
             await auth.resolveInitialState()
             self.showOnboardingIfNeeded()

@@ -1,0 +1,2252 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Whistle — Visualizer Design Playground</title>
+<style>
+/* ==========================================================================
+   0. RESET + PLAYGROUND CHROME THEME VARIABLES
+   ========================================================================== */
+*, *::before, *::after { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; }
+
+:root{
+  --ui-bg: #111317;
+  --ui-bg-2: #171a20;
+  --ui-panel: #1b1f27;
+  --ui-panel-2: #20242d;
+  --ui-border: #2b303a;
+  --ui-text: #e9eaee;
+  --ui-text-dim: #9aa1ac;
+  --ui-accent: #6d8dff;
+  --ui-radius: 10px;
+  --vp-accent: #ffb000;
+  --vp-cream: #f0e7d8;
+  --vp-boxbg: #141416;
+  --vp-radius: 8px;
+  --vp-glow: 4px;
+}
+body.light{
+  --ui-bg: #f3f4f6;
+  --ui-bg-2: #ffffff;
+  --ui-panel: #ffffff;
+  --ui-panel-2: #f7f8fa;
+  --ui-border: #e2e4e9;
+  --ui-text: #1b1e24;
+  --ui-text-dim: #666d7a;
+  --ui-accent: #3563e9;
+}
+
+body{
+  font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+  background: var(--ui-bg);
+  color: var(--ui-text);
+  transition: background .2s ease, color .2s ease;
+}
+
+a { color: inherit; }
+
+/* ==========================================================================
+   1. APP LAYOUT — sidebar (300px) + main
+   ========================================================================== */
+.app{ display: flex; align-items: flex-start; min-height: 100vh; }
+
+.sidebar{
+  width: 300px;
+  flex: 0 0 300px;
+  background: var(--ui-bg-2);
+  border-right: 1px solid var(--ui-border);
+  padding: 20px 18px 24px;
+  height: 100vh;
+  overflow-y: auto;
+  position: sticky;
+  top: 0;
+}
+.sidebar h1{
+  font-size: 15px;
+  font-weight: 700;
+  margin: 0 0 2px;
+  letter-spacing: -0.01em;
+}
+.sidebar .sub{
+  font-size: 11.5px;
+  color: var(--ui-text-dim);
+  margin: 0 0 18px;
+  line-height: 1.4;
+}
+.ctrl-group{ margin-bottom: 16px; }
+.ctrl{ margin-bottom: 14px; }
+.ctrl label{
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--ui-text-dim);
+  margin-bottom: 5px;
+  letter-spacing: .01em;
+}
+.ctrl label .val{
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 11px;
+  color: var(--ui-text);
+  font-weight: 500;
+}
+.ctrl input[type="range"]{
+  width: 100%;
+  accent-color: var(--ui-accent);
+  cursor: pointer;
+}
+.ctrl input[type="color"]{
+  width: 100%;
+  height: 28px;
+  border: 1px solid var(--ui-border);
+  border-radius: 6px;
+  background: none;
+  cursor: pointer;
+  padding: 2px;
+}
+.ctrl input[type="text"]{
+  width: 100%;
+  padding: 7px 9px;
+  border-radius: 6px;
+  border: 1px solid var(--ui-border);
+  background: var(--ui-panel-2);
+  color: var(--ui-text);
+  font-size: 12.5px;
+  font-family: inherit;
+}
+.ctrl input[type="text"]:focus, select:focus, button:focus-visible{
+  outline: 2px solid var(--ui-accent);
+  outline-offset: 1px;
+}
+.ctrl select{
+  width: 100%;
+  padding: 7px 9px;
+  border-radius: 6px;
+  border: 1px solid var(--ui-border);
+  background: var(--ui-panel-2);
+  color: var(--ui-text);
+  font-size: 12.5px;
+}
+hr.sep{
+  border: none;
+  border-top: 1px solid var(--ui-border);
+  margin: 16px 0;
+}
+.btn{
+  display: block;
+  width: 100%;
+  padding: 9px 10px;
+  margin-bottom: 8px;
+  border-radius: 7px;
+  border: 1px solid var(--ui-border);
+  background: var(--ui-panel-2);
+  color: var(--ui-text);
+  font-size: 12.5px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background .15s ease, transform .1s ease, border-color .15s ease;
+}
+.btn:hover{ background: var(--ui-border); }
+.btn:active{ transform: scale(.98); }
+.btn.primary{
+  background: var(--ui-accent);
+  border-color: var(--ui-accent);
+  color: #fff;
+}
+.btn.primary:hover{ filter: brightness(1.08); }
+.btn-row{ display: flex; gap: 8px; }
+.btn-row .btn{ flex: 1; }
+#ctrl-play{ display:flex; align-items:center; justify-content:center; gap: 6px; }
+
+.footer-hint{
+  margin-top: 18px;
+  font-size: 10.5px;
+  color: var(--ui-text-dim);
+  line-height: 1.6;
+  border-top: 1px solid var(--ui-border);
+  padding-top: 12px;
+}
+.footer-hint kbd{
+  background: var(--ui-panel-2);
+  border: 1px solid var(--ui-border);
+  border-radius: 3px;
+  padding: 1px 5px;
+  font-family: ui-monospace, monospace;
+}
+
+/* ==========================================================================
+   2. MAIN AREA — responsive toggle + cards
+   ========================================================================== */
+.main{
+  flex: 1;
+  padding: 32px 24px 80px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  min-width: 0;
+}
+.viewport-toolbar{
+  width: 100%;
+  max-width: 760px;
+  display: flex;
+  justify-content: flex-end;
+  gap: 6px;
+  margin-bottom: 16px;
+}
+.vp-btn{
+  padding: 5px 12px;
+  border-radius: 20px;
+  border: 1px solid var(--ui-border);
+  background: var(--ui-panel);
+  color: var(--ui-text-dim);
+  font-size: 11.5px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all .15s ease;
+}
+.vp-btn.active{ background: var(--ui-accent); border-color: var(--ui-accent); color: #fff; }
+
+.main-inner{
+  width: 100%;
+  max-width: 760px;
+  transition: max-width .3s ease;
+}
+.main-inner.viewport-mobile{ max-width: 340px; }
+.main-inner.viewport-tablet{ max-width: 520px; }
+.main-inner.viewport-desktop{ max-width: 760px; }
+
+.card{
+  background: var(--ui-panel);
+  border: 1px solid var(--ui-border);
+  border-radius: 14px;
+  padding: 20px 20px 22px;
+  margin-bottom: 22px;
+}
+.card-head{
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 4px;
+}
+.card-head h2{
+  font-size: 15px;
+  font-weight: 700;
+  margin: 0;
+  letter-spacing: -0.01em;
+}
+.card-desc{
+  font-size: 12px;
+  color: var(--ui-text-dim);
+  margin: 4px 0 16px;
+  line-height: 1.5;
+}
+.contrast-badge{
+  font-size: 10.5px;
+  padding: 3px 9px;
+  border-radius: 20px;
+  font-weight: 700;
+  letter-spacing: .02em;
+  border: 1px solid transparent;
+  white-space: nowrap;
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+}
+.contrast-badge.pass-aaa{ background: rgba(45,182,110,.15); color: #37c383; border-color: rgba(45,182,110,.4); }
+.contrast-badge.pass-aa{ background: rgba(230,180,20,.15); color: #d8ad1f; border-color: rgba(230,180,20,.4); }
+.contrast-badge.fail{ background: rgba(230,70,70,.15); color: #e35b5b; border-color: rgba(230,70,70,.4); }
+
+.hero-stage{
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 190px;
+  background: var(--ui-bg);
+  border: 1px solid var(--ui-border);
+  border-radius: 10px;
+  padding: 20px;
+  margin-bottom: 18px;
+  background-image:
+    linear-gradient(45deg, rgba(255,255,255,.02) 25%, transparent 25%),
+    linear-gradient(-45deg, rgba(255,255,255,.02) 25%, transparent 25%),
+    linear-gradient(45deg, transparent 75%, rgba(255,255,255,.02) 75%),
+    linear-gradient(-45deg, transparent 75%, rgba(255,255,255,.02) 75%);
+  background-size: 16px 16px;
+  background-position: 0 0, 0 8px, 8px -8px, -8px 0px;
+}
+
+.context-wrap{
+  display: flex;
+  justify-content: center;
+  margin-bottom: 16px;
+}
+
+/* macOS-style fake capture panel */
+.panel-mock{
+  width: 460px;
+  max-width: 100%;
+  background: #ececec;
+  border-radius: 12px;
+  border: 1px solid #d2d2d2;
+  box-shadow: 0 10px 26px rgba(0,0,0,.22), 0 1px 0 rgba(255,255,255,.6) inset;
+  overflow: hidden;
+}
+.panel-titlebar{
+  height: 24px;
+  background: linear-gradient(#f6f6f6, #e2e2e2);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 10px;
+  border-bottom: 1px solid #cfcfcf;
+}
+.panel-titlebar .dot{ width: 9px; height: 9px; border-radius: 50%; }
+.panel-titlebar .dot.r{ background: #ff5f57; }
+.panel-titlebar .dot.y{ background: #febc2e; }
+.panel-titlebar .dot.g{ background: #28c840; }
+.panel-body{
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 16px;
+}
+.fake-input{
+  flex: 1;
+  min-width: 0;
+  height: 34px;
+  border-radius: 8px;
+  border: 1px solid #cbcbcb;
+  background: #fff;
+  padding: 0 11px;
+  font: 13.5px/1 -apple-system, system-ui, sans-serif;
+  color: #222;
+  pointer-events: none;
+}
+.fake-input::placeholder{ color: #9d9d9d; }
+
+.copy-btn{
+  width: 100%;
+  padding: 10px;
+  border-radius: 8px;
+  border: 1px solid var(--ui-border);
+  background: var(--ui-panel-2);
+  color: var(--ui-text);
+  font-size: 12.5px;
+  font-weight: 700;
+  cursor: pointer;
+  letter-spacing: .01em;
+}
+.copy-btn:hover{ background: var(--ui-border); }
+
+/* ==========================================================================
+   3. VIZ SCALING WRAPPERS (shared by all 3 concepts)
+   ========================================================================== */
+.viz-outer{ position: relative; }
+
+/* ==========================================================================
+   4. CONCEPT A — Solari split-flap
+   ========================================================================== */
+.solari-box{
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 3px 4px;
+  box-sizing: border-box;
+  background: #141416;
+}
+.flap-row{
+  display: flex;
+  gap: 2px;
+  perspective: 260px;
+}
+.flap-cell{
+  position: relative;
+  flex: 1;
+  background: #1a1a1c;
+  border-radius: 2px;
+  overflow: hidden;
+  box-shadow: 0 0 0 1px rgba(255,255,255,.02) inset;
+}
+.flap-cell::after{
+  content: "";
+  position: absolute;
+  left: 0; right: 0; top: 50%;
+  height: 1px;
+  background: rgba(0,0,0,.6);
+  z-index: 6;
+  transform: translateY(-0.5px);
+}
+.flap-wrap, .flap-leaf{
+  position: absolute;
+  left: 0; right: 0;
+  overflow: hidden;
+}
+.flap-wrap-top, .flap-wrap-bottom{ background: #1a1a1c; }
+.flap-leaf-top{
+  background: linear-gradient(#2c2c30, #17171a);
+  z-index: 4;
+  backface-visibility: hidden;
+}
+.flap-leaf-bottom{
+  background: linear-gradient(#141416, #232327);
+  z-index: 5;
+  backface-visibility: hidden;
+}
+.flap-inner{
+  position: absolute;
+  left: 0; right: 0;
+  text-align: center;
+  font-family: "Helvetica Neue Condensed", "Arial Narrow", Arial, sans-serif;
+  font-weight: 700;
+  color: var(--vp-cream);
+  user-select: none;
+}
+.flap-status{
+  height: auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-family: "Helvetica Neue Condensed", "Arial Narrow", Arial, sans-serif;
+  font-weight: 700;
+  letter-spacing: .16em;
+  color: var(--vp-accent);
+  gap: 4px;
+  white-space: nowrap;
+}
+@keyframes dot-pulse{ 0%, 100% { opacity: 1; } 50% { opacity: .28; } }
+.status-dot{
+  width: 5px; height: 5px;
+  border-radius: 50%;
+  background: var(--vp-accent);
+  display: inline-block;
+  flex: none;
+  animation: dot-pulse 1s ease-in-out infinite;
+}
+.status-dot.dim{ animation: none; opacity: .3; background: #555; }
+
+/* ==========================================================================
+   5. CONCEPT B — Dot-matrix departure board
+   ========================================================================== */
+.dm-frame{
+  position: relative;
+  background: #0d0d0f;
+  border: 1px solid #2a2a2a;
+  box-shadow: inset 0 0 8px rgba(0,0,0,.7), inset 0 0 0 1px rgba(255,255,255,.02);
+  overflow: hidden;
+}
+.dm-canvas{ display: block; }
+
+/* ==========================================================================
+   6. CONCEPT C — Wooden whistle & steam
+   ========================================================================== */
+.steam-box{
+  position: relative;
+  overflow: hidden;
+  box-sizing: border-box;
+  background:
+    repeating-linear-gradient(95deg, rgba(0,0,0,.09) 0px, rgba(0,0,0,.09) 2px, transparent 2px, transparent 7px),
+    linear-gradient(155deg, #6b4429 0%, #4a2c18 55%, #5b3a24 100%);
+  border: 2px solid #8a6a1f;
+  box-shadow: inset 0 0 0 1px rgba(255,215,120,.28), inset 0 1px 4px rgba(0,0,0,.55);
+}
+.whistle-svg-wrap{
+  position: absolute;
+  left: 6%;
+  top: 16%;
+  width: 50%;
+}
+.whistle-svg-wrap svg{
+  width: 100%;
+  height: auto;
+  display: block;
+  filter: drop-shadow(0 1px 1px rgba(0,0,0,.45));
+}
+.whistle-label{
+  position: absolute;
+  left: 0; right: 0; bottom: 2px;
+  text-align: center;
+  font-family: "Helvetica Neue Condensed", "Arial Narrow", Arial, sans-serif;
+  font-weight: 700;
+  letter-spacing: .22em;
+  color: rgba(0,0,0,.5);
+  text-shadow: 0 1px 0 rgba(255,255,255,.2);
+  user-select: none;
+}
+.puff-layer{ position: absolute; inset: 0; overflow: visible; pointer-events: none; }
+.puff{
+  position: absolute;
+  border-radius: 50%;
+  filter: blur(1.6px);
+  pointer-events: none;
+  animation-name: puff-rise;
+  animation-timing-function: ease-out;
+  animation-fill-mode: forwards;
+}
+@keyframes puff-rise{
+  0%{ transform: translate(-50%, 0) scale(.5); opacity: 0; }
+  18%{ opacity: var(--puff-op, .45); }
+  100%{ transform: translate(calc(-50% + var(--dx, 10px)), calc(-1 * var(--rise, 40px))) scale(1.9); opacity: 0; }
+}
+.word-rise{
+  position: absolute;
+  left: 50%; bottom: 40%;
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-weight: 700;
+  letter-spacing: .07em;
+  text-transform: uppercase;
+  pointer-events: none;
+  text-shadow: 0 0 4px rgba(255,255,255,.55);
+  animation-name: word-rise;
+  animation-timing-function: ease-out;
+  animation-fill-mode: forwards;
+  white-space: nowrap;
+}
+@keyframes word-rise{
+  0%{ transform: translate(-50%, 0); opacity: 0; }
+  22%{ opacity: 1; }
+  100%{ transform: translate(-50%, calc(-1 * var(--rise, 40px))); opacity: 0; }
+}
+.gauge{ position: absolute; top: 3px; right: 3px; width: 13%; aspect-ratio: 1; min-width: 10px; }
+.gauge-face{
+  width: 100%; height: 100%;
+  border-radius: 50%;
+  background: #f3ead8;
+  border: 1px solid #8a6a1f;
+  position: relative;
+  box-shadow: inset 0 1px 2px rgba(0,0,0,.4);
+}
+.gauge-needle{
+  position: absolute;
+  left: 50%; bottom: 50%;
+  width: 1.4px; height: 42%;
+  background: #6e1f1f;
+  transform-origin: bottom center;
+  transform: translateX(-50%) rotate(-50deg);
+  transition: transform .15s ease-out;
+}
+
+/* ==========================================================================
+   6b. CONCEPT D — Halftone screenshot treatment
+   ========================================================================== */
+.halftone-hero{
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
+  flex-wrap: wrap;
+}
+.ht-fig{
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+}
+.ht-fig-label{
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: .18em;
+  color: var(--ui-text-dim);
+}
+.ht-arrow{
+  color: var(--ui-text-dim);
+  font-size: 16px;
+  user-select: none;
+}
+.ht-canvas{
+  display: block;
+  border-radius: 6px;
+  border: 1px solid #2a2a2a;
+}
+
+/* dark capture-panel mock (matches the real Whistle panel) for concept D */
+.panel-dark{
+  width: 460px;
+  max-width: 100%;
+  background: #1e1a18;
+  border: 1px solid #372e28;
+  border-radius: 14px;
+  box-shadow: 0 10px 26px rgba(0,0,0,.45);
+  padding: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.fake-input-dark{
+  height: 34px;
+  border-radius: 8px;
+  border: 1px solid #3a322c;
+  background: #262019;
+  color: #e8e2d9;
+  padding: 0 11px;
+  font: 13.5px/1 -apple-system, system-ui, sans-serif;
+  pointer-events: none;
+}
+.fake-input-dark::placeholder{ color: #8a8078; }
+.fake-notes{
+  height: 24px;
+  border-radius: 7px;
+  border: 1px solid #322a25;
+  background: #241e19;
+  color: #8a8078;
+  font: 11.5px/22px -apple-system, system-ui, sans-serif;
+  padding: 0 10px;
+}
+.thumb-strip{
+  align-self: center;
+  border-radius: 8px;
+  overflow: hidden;
+  border: 1px solid #3a322c;
+  line-height: 0;
+  max-width: 100%;
+}
+.panel-actions{
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+.fake-dropdown{
+  font: 600 12px/1 -apple-system, system-ui, sans-serif;
+  color: #cfc6bc;
+  background: #2a231d;
+  border: 1px solid #3a322c;
+  border-radius: 7px;
+  padding: 7px 12px;
+}
+.fake-submit{
+  font: 700 12px/1 -apple-system, system-ui, sans-serif;
+  color: #fff;
+  background: #e8720c;
+  border-radius: 7px;
+  padding: 8px 18px;
+}
+
+/* ==========================================================================
+   7. TOAST
+   ========================================================================== */
+.toast{
+  position: fixed;
+  left: 50%; bottom: 26px;
+  transform: translate(-50%, 16px);
+  background: #1b1e24;
+  color: #fff;
+  padding: 10px 18px;
+  border-radius: 8px;
+  font-size: 12.5px;
+  font-weight: 600;
+  box-shadow: 0 8px 22px rgba(0,0,0,.35);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity .25s ease, transform .25s ease;
+  z-index: 1000;
+  max-width: 80vw;
+  text-align: center;
+}
+.toast.show{ opacity: 1; transform: translate(-50%, 0); }
+
+@media (max-width: 720px){
+  .sidebar{ position: static; height: auto; width: 100%; flex: 1 1 100%; }
+  .app{ flex-direction: column; }
+  .panel-mock{ width: 100%; }
+}
+</style>
+</head>
+<body class="dark">
+<div class="app">
+
+  <!-- ======================= SIDEBAR ======================= -->
+  <aside class="sidebar">
+    <h1>Design Playground</h1>
+    <p class="sub">Whistle · retro train-station capture visualizer — tune params, compare 4 concepts, copy code.</p>
+
+    <div class="ctrl-group">
+      <div class="ctrl">
+        <label>Accent / LED color <span class="val" id="val-accent">#ffb000</span></label>
+        <input type="color" id="ctrl-accent" value="#ffb000">
+      </div>
+      <div class="ctrl">
+        <label>Letter / cream color <span class="val" id="val-cream">#f0e7d8</span></label>
+        <input type="color" id="ctrl-cream" value="#f0e7d8">
+      </div>
+      <div class="ctrl">
+        <label>Box background <span class="val" id="val-boxbg">#141416</span></label>
+        <input type="color" id="ctrl-boxbg" value="#141416">
+      </div>
+      <div class="ctrl">
+        <label>Box width <span class="val" id="val-boxw">110px</span></label>
+        <input type="range" id="ctrl-boxw" min="90" max="160" step="1" value="110">
+      </div>
+      <div class="ctrl">
+        <label>Box height <span class="val" id="val-boxh">44px</span></label>
+        <input type="range" id="ctrl-boxh" min="36" max="64" step="1" value="44">
+      </div>
+      <div class="ctrl">
+        <label>Corner radius <span class="val" id="val-radius">8px</span></label>
+        <input type="range" id="ctrl-radius" min="0" max="16" step="1" value="8">
+      </div>
+      <div class="ctrl">
+        <label>Character cells (A) <span class="val" id="val-cells">7</span></label>
+        <input type="range" id="ctrl-cells" min="4" max="10" step="1" value="7">
+      </div>
+      <div class="ctrl">
+        <label>Flip / scroll speed <span class="val" id="val-speed">1.0×</span></label>
+        <input type="range" id="ctrl-speed" min="0.5" max="2" step="0.1" value="1">
+      </div>
+      <div class="ctrl">
+        <label>Glow intensity <span class="val" id="val-glow">4</span></label>
+        <input type="range" id="ctrl-glow" min="0" max="10" step="1" value="4">
+      </div>
+      <div class="ctrl">
+        <label>Dot pitch (B) <span class="val" id="val-pitch">3px</span></label>
+        <input type="range" id="ctrl-pitch" min="2" max="5" step="1" value="3">
+      </div>
+      <div class="ctrl">
+        <label>Steam density (C) <span class="val" id="val-steam">5</span></label>
+        <input type="range" id="ctrl-steam" min="1" max="10" step="1" value="5">
+      </div>
+      <div class="ctrl">
+        <label>Halftone dot size (D) <span class="val" id="val-halftone-size">5px</span></label>
+        <input type="range" id="ctrl-halftone-size" min="3" max="10" step="1" value="5">
+      </div>
+      <div class="ctrl">
+        <label>Halftone style (D) <span class="val" id="val-halftone-style">Amber mono</span></label>
+        <select id="ctrl-halftone-style">
+          <option value="amber">Amber mono</option>
+          <option value="ivory">Ivory</option>
+        </select>
+      </div>
+      <div class="ctrl">
+        <label>Demo transcript</label>
+        <input type="text" id="ctrl-transcript" value="Add a settings toggle for launch at login and remember the last project">
+      </div>
+      <div class="ctrl">
+        <label>Simulate dictation</label>
+        <button class="btn" id="ctrl-play">⏸ Pause</button>
+      </div>
+    </div>
+
+    <hr class="sep">
+
+    <button class="btn primary" id="btn-generate-prompt">Generate Prompt</button>
+    <div class="btn-row">
+      <button class="btn" id="btn-random">Random</button>
+      <button class="btn" id="btn-reset">Reset</button>
+    </div>
+    <div class="ctrl" style="margin-top:10px;">
+      <label>Copy Code format</label>
+      <select id="ctrl-export-format">
+        <option value="css">Vanilla HTML / CSS</option>
+        <option value="tailwind">Tailwind</option>
+        <option value="cssinjs">CSS-in-JS (React)</option>
+      </select>
+    </div>
+    <button class="btn" id="btn-theme-toggle" style="margin-top:6px;">Light Mode</button>
+
+    <div class="footer-hint">
+      <div><kbd>R</kbd> random &nbsp; <kbd>C</kbd> copy prompt &nbsp; <kbd>D</kbd> dark/light</div>
+      <div style="margin-top:6px;">Params encode into the URL hash — share the link to restore this exact state.</div>
+    </div>
+  </aside>
+
+  <!-- ======================= MAIN ======================= -->
+  <main class="main">
+    <div class="viewport-toolbar">
+      <button class="vp-btn" data-vp="mobile">Mobile</button>
+      <button class="vp-btn" data-vp="tablet">Tablet</button>
+      <button class="vp-btn" data-vp="desktop">Desktop</button>
+    </div>
+
+    <div class="main-inner viewport-desktop" id="main-inner">
+
+      <!-- CONCEPT A -->
+      <section class="card">
+        <div class="card-head">
+          <h2>A · Solari split-flap</h2>
+          <span class="contrast-badge" id="contrast-a">—</span>
+        </div>
+        <p class="card-desc">Mechanical split-flap cells cascade to show the tail of the live transcript, like an airport/station departure board.</p>
+        <div class="hero-stage"><div class="viz-outer" id="hero-a-wrap"></div></div>
+        <div class="context-wrap">
+          <div class="panel-mock">
+            <div class="panel-titlebar"><span class="dot r"></span><span class="dot y"></span><span class="dot g"></span></div>
+            <div class="panel-body">
+              <input class="fake-input" id="fake-input-a" readonly placeholder="Click the mic to dictate…">
+              <div class="viz-outer" id="ctx-a-wrap"></div>
+            </div>
+          </div>
+        </div>
+        <button class="copy-btn" data-concept="a">Copy Code</button>
+      </section>
+
+      <!-- CONCEPT B -->
+      <section class="card">
+        <div class="card-head">
+          <h2>B · Dot-matrix departure board</h2>
+          <span class="contrast-badge" id="contrast-b">—</span>
+        </div>
+        <p class="card-desc">Amber LED dot-matrix ticker, closest to the reference train-station photo — live transcript scrolls like a platform sign.</p>
+        <div class="hero-stage"><div class="viz-outer" id="hero-b-wrap"></div></div>
+        <div class="context-wrap">
+          <div class="panel-mock">
+            <div class="panel-titlebar"><span class="dot r"></span><span class="dot y"></span><span class="dot g"></span></div>
+            <div class="panel-body">
+              <input class="fake-input" id="fake-input-b" readonly placeholder="Click the mic to dictate…">
+              <div class="viz-outer" id="ctx-b-wrap"></div>
+            </div>
+          </div>
+        </div>
+        <button class="copy-btn" data-concept="b">Copy Code</button>
+      </section>
+
+      <!-- CONCEPT C -->
+      <section class="card">
+        <div class="card-head">
+          <h2>C · Wooden whistle &amp; steam</h2>
+          <span class="contrast-badge" id="contrast-c">—</span>
+        </div>
+        <p class="card-desc">A little walnut &amp; brass plaque — steam puffs and dissolving words rise from the whistle as you speak.</p>
+        <div class="hero-stage"><div class="viz-outer" id="hero-c-wrap"></div></div>
+        <div class="context-wrap">
+          <div class="panel-mock">
+            <div class="panel-titlebar"><span class="dot r"></span><span class="dot y"></span><span class="dot g"></span></div>
+            <div class="panel-body">
+              <input class="fake-input" id="fake-input-c" readonly placeholder="Click the mic to dictate…">
+              <div class="viz-outer" id="ctx-c-wrap"></div>
+            </div>
+          </div>
+        </div>
+        <button class="copy-btn" data-concept="c">Copy Code</button>
+      </section>
+
+      <!-- CONCEPT D -->
+      <section class="card">
+        <div class="card-head">
+          <h2>D · Halftone screenshot treatment</h2>
+          <span class="contrast-badge" id="contrast-d">—</span>
+        </div>
+        <p class="card-desc">The captured screenshot rendered as a halftone dot grid — newspaper-meets-departure-board.</p>
+        <div class="hero-stage"><div id="hero-d-wrap"></div></div>
+        <div class="context-wrap">
+          <div class="panel-dark">
+            <input class="fake-input-dark" id="fake-input-d" readonly placeholder="Type your idea…">
+            <div class="fake-notes">Notes</div>
+            <div class="thumb-strip" id="ctx-d-wrap"></div>
+            <div class="panel-actions">
+              <span class="fake-dropdown">Whistle ▾</span>
+              <span class="fake-submit">Submit</span>
+            </div>
+          </div>
+        </div>
+        <button class="copy-btn" data-concept="d">Copy Code</button>
+      </section>
+
+    </div>
+  </main>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+(function(){
+"use strict";
+
+/* ==========================================================================
+   PARAMS + DEFAULTS
+   ========================================================================== */
+var DEFAULTS = {
+  accent: "#ffb000",
+  cream: "#f0e7d8",
+  boxBg: "#141416",
+  boxW: 110,
+  boxH: 44,
+  radius: 8,
+  cells: 7,
+  speed: 1,
+  glow: 4,
+  dotPitch: 3,
+  steamDensity: 5,
+  halftoneSize: 5,
+  halftoneStyle: "amber",
+  transcript: "Add a settings toggle for launch at login and remember the last project",
+  playing: true,
+  theme: "dark",
+  viewport: "desktop",
+  exportFormat: "css"
+};
+var params = JSON.parse(JSON.stringify(DEFAULTS));
+
+/* ==========================================================================
+   SHARED DICTATION ENGINE (state machine + fake audio level)
+   idle -> listening -> speaking -> settle -> idle ...
+   ========================================================================== */
+var engine = {
+  state: "idle",
+  stateElapsed: 0,
+  activeWords: [],
+  revealedCount: 0,
+  displayedText: "",
+  audioLevel: 0,
+  audioTarget: 0,
+  _nextAudioAt: 0
+};
+var DURATIONS = { idle: 1500, listening: 1500, settle: 2000 };
+function speakingDuration(){ return 6000; }
+function nextState(s){
+  return s === "idle" ? "listening" : s === "listening" ? "speaking" : s === "speaking" ? "settle" : "idle";
+}
+function stepEngine(dt){
+  var speed = params.speed || 1;
+  engine.stateElapsed += dt * speed;
+
+  if(engine.state === "speaking"){
+    var now = performance.now();
+    if(now > engine._nextAudioAt){
+      engine.audioTarget = 0.25 + Math.random() * 0.75;
+      engine._nextAudioAt = now + 110 + Math.random() * 180;
+    }
+  } else {
+    engine.audioTarget = 0;
+  }
+  engine.audioLevel += (engine.audioTarget - engine.audioLevel) * Math.min(1, dt / 180);
+  if(engine.audioLevel < 0.002) engine.audioLevel = 0;
+
+  var duration = engine.state === "speaking" ? speakingDuration() : DURATIONS[engine.state];
+
+  if(engine.state === "speaking"){
+    var words = engine.activeWords;
+    var frac = Math.min(1, engine.stateElapsed / duration);
+    var count = words.length ? Math.min(words.length, Math.floor(frac * words.length) + 1) : 0;
+    if(count !== engine.revealedCount){
+      engine.revealedCount = count;
+      engine.displayedText = words.slice(0, count).join(" ");
+    }
+  }
+
+  if(engine.stateElapsed >= duration){
+    engine.stateElapsed = 0;
+    engine.state = nextState(engine.state);
+    if(engine.state === "speaking"){
+      engine.activeWords = params.transcript.trim().split(/\s+/).filter(Boolean);
+      engine.revealedCount = 0;
+      engine.displayedText = "";
+    }
+    if(engine.state === "idle"){
+      engine.displayedText = "";
+      engine.revealedCount = 0;
+    }
+  }
+}
+
+var subscribers = [];
+function subscribe(fn){ subscribers.push(fn); }
+
+var lastTs = null;
+function frame(ts){
+  if(lastTs === null) lastTs = ts;
+  var dt = Math.min(64, ts - lastTs);
+  lastTs = ts;
+  if(params.playing) stepEngine(dt);
+  for(var i = 0; i < subscribers.length; i++){
+    try { subscribers[i](engine, dt); } catch(e){ console.error(e); }
+  }
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+
+/* ==========================================================================
+   5x7 DOT-MATRIX FONT (Concept B)
+   Each glyph: array of 7 strings, 5 chars each, '#' = lit
+   ========================================================================== */
+var FONT5x7 = {
+  "A": [".###.","#...#","#...#","#####","#...#","#...#","#...#"],
+  "B": ["####.","#...#","#...#","####.","#...#","#...#","####."],
+  "C": [".####","#....","#....","#....","#....","#....",".####"],
+  "D": ["####.","#...#","#...#","#...#","#...#","#...#","####."],
+  "E": ["#####","#....","#....","####.","#....","#....","#####"],
+  "F": ["#####","#....","#....","####.","#....","#....","#...."],
+  "G": [".####","#....","#....","#.###","#...#","#...#",".####"],
+  "H": ["#...#","#...#","#...#","#####","#...#","#...#","#...#"],
+  "I": ["#####","..#..","..#..","..#..","..#..","..#..","#####"],
+  "J": ["..###","...#.","...#.","...#.","...#.","#..#.",".##.."],
+  "K": ["#...#","#..#.","#.#..","##...","#.#..","#..#.","#...#"],
+  "L": ["#....","#....","#....","#....","#....","#....","#####"],
+  "M": ["#...#","##.##","#.#.#","#...#","#...#","#...#","#...#"],
+  "N": ["#...#","##..#","#.#.#","#..##","#...#","#...#","#...#"],
+  "O": [".###.","#...#","#...#","#...#","#...#","#...#",".###."],
+  "P": ["####.","#...#","#...#","####.","#....","#....","#...."],
+  "Q": [".###.","#...#","#...#","#...#","#.#.#","#..#.",".##.#"],
+  "R": ["####.","#...#","#...#","####.","#.#..","#..#.","#...#"],
+  "S": [".####","#....","#....",".###.","....#","....#","####."],
+  "T": ["#####","..#..","..#..","..#..","..#..","..#..","..#.."],
+  "U": ["#...#","#...#","#...#","#...#","#...#","#...#",".###."],
+  "V": ["#...#","#...#","#...#","#...#","#...#",".#.#.","..#.."],
+  "W": ["#...#","#...#","#...#","#.#.#","#.#.#","#.#.#",".#.#."],
+  "X": ["#...#","#...#",".#.#.","..#..",".#.#.","#...#","#...#"],
+  "Y": ["#...#","#...#",".#.#.","..#..","..#..","..#..","..#.."],
+  "Z": ["#####","....#","...#.","..#..",".#...","#....","#####"],
+  "0": [".###.","#...#","#..##","#.#.#","##..#","#...#",".###."],
+  "1": ["..#..",".##..","..#..","..#..","..#..","..#..","#####"],
+  "2": [".###.","#...#","....#","...#.","..#..",".#...","#####"],
+  "3": [".###.","#...#","....#","..##.","....#","#...#",".###."],
+  "4": ["...#.","..##.",".#.#.","#..#.","#####","...#.","...#."],
+  "5": ["#####","#....","####.","....#","....#","#...#",".###."],
+  "6": [".###.","#....","#....","####.","#...#","#...#",".###."],
+  "7": ["#####","....#","...#.","..#..",".#...",".#...",".#..."],
+  "8": [".###.","#...#","#...#",".###.","#...#","#...#",".###."],
+  "9": [".###.","#...#","#...#",".####","....#","....#",".###."],
+  " ": [".....",".....",".....",".....",".....",".....","....."],
+  ".": [".....",".....",".....",".....",".....",".....","..#.."],
+  ",": [".....",".....",".....",".....",".....","..#..",".#..."],
+  "'": ["..#..","..#..",".....",".....",".....",".....","....."],
+  "-": [".....",".....",".....","#####",".....",".....","....."],
+  ":": [".....","..#..",".....",".....",".....","..#..","....."]
+};
+
+function charWidth(pitch){ return 5 * pitch + pitch; }
+function textWidth(text, pitch){ return text.length * charWidth(pitch); }
+function drawGlyph(ctx, rows, ox, oy, pitch, litColor, unlitColor, glow){
+  var r = Math.max(0.8, pitch * 0.38);
+  for(var ry = 0; ry < 7; ry++){
+    var row = rows[ry];
+    for(var rx = 0; rx < 5; rx++){
+      var on = row[rx] === "#";
+      var cx = ox + rx * pitch + pitch / 2;
+      var cy = oy + ry * pitch + pitch / 2;
+      ctx.beginPath();
+      if(on && glow > 0){
+        ctx.save();
+        ctx.shadowColor = litColor;
+        ctx.shadowBlur = glow;
+        ctx.fillStyle = litColor;
+        ctx.arc(cx, cy, r, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.restore();
+      } else {
+        ctx.fillStyle = on ? litColor : unlitColor;
+        ctx.arc(cx, cy, r, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    }
+  }
+}
+function drawText(ctx, text, x, y, pitch, litColor, unlitColor, glow){
+  var cx = x;
+  for(var i = 0; i < text.length; i++){
+    var ch = text[i];
+    var glyph = FONT5x7[ch] || FONT5x7[" "];
+    drawGlyph(ctx, glyph, cx, y, pitch, litColor, unlitColor, glow);
+    cx += charWidth(pitch);
+  }
+  return cx - x;
+}
+
+/* ==========================================================================
+   WHISTLE SVG (Concept C)
+   ========================================================================== */
+var WHISTLE_SVG =
+  '<svg viewBox="0 0 100 42" class="whistle-icon" xmlns="http://www.w3.org/2000/svg">' +
+    '<rect x="8" y="15" width="56" height="13" rx="3" fill="#8a5a34" stroke="#3d2412" stroke-width="1.5"/>' +
+    '<rect x="60" y="10" width="15" height="22" rx="2.5" fill="#6e4527" stroke="#3d2412" stroke-width="1.5"/>' +
+    '<rect x="8" y="18.5" width="56" height="2" fill="#4a2f19" opacity="0.5"/>' +
+    '<circle cx="28" cy="21.5" r="2.8" fill="#241408"/>' +
+    '<path d="M64 11 L73 4 L73 11 Z" fill="#c9a227" stroke="#3d2412" stroke-width="1"/>' +
+    '<rect x="6" y="14" width="4" height="15" rx="1.5" fill="#3d2412"/>' +
+  '</svg>';
+
+/* ==========================================================================
+   CONCEPT A — SOLARI SPLIT-FLAP FACTORY
+   ========================================================================== */
+function layoutCellDom(parts, cellH){
+  var half = cellH / 2;
+  function set(el, style){ for(var k in style){ el.style[k] = style[k]; } }
+  set(parts.top.wrap, { position:"absolute", top:"0px", left:"0px", right:"0px", height: half+"px", overflow:"hidden" });
+  set(parts.top.inner, { position:"absolute", top:"0px", left:"0px", right:"0px", height: cellH+"px", lineHeight: cellH+"px" });
+  set(parts.bottom.wrap, { position:"absolute", top: half+"px", left:"0px", right:"0px", height: half+"px", overflow:"hidden" });
+  set(parts.bottom.inner, { position:"absolute", top: (-half)+"px", left:"0px", right:"0px", height: cellH+"px", lineHeight: cellH+"px" });
+  set(parts.leafTop.wrap, { position:"absolute", top:"0px", left:"0px", right:"0px", height: half+"px", overflow:"hidden", transformOrigin:"bottom" });
+  set(parts.leafTop.inner, { position:"absolute", top:"0px", left:"0px", right:"0px", height: cellH+"px", lineHeight: cellH+"px" });
+  set(parts.leafBottom.wrap, { position:"absolute", top: half+"px", left:"0px", right:"0px", height: half+"px", overflow:"hidden", transformOrigin:"top" });
+  set(parts.leafBottom.inner, { position:"absolute", top: (-half)+"px", left:"0px", right:"0px", height: cellH+"px", lineHeight: cellH+"px" });
+  var fontSize = Math.max(7, Math.round(cellH * 0.62));
+  [parts.top.inner, parts.bottom.inner, parts.leafTop.inner, parts.leafBottom.inner].forEach(function(el){
+    el.style.fontSize = fontSize + "px";
+  });
+}
+
+function buildFlapCellDom(){
+  var cell = document.createElement("div");
+  cell.className = "flap-cell";
+  var parts = {};
+  ["top", "bottom"].forEach(function(pos){
+    var wrap = document.createElement("div");
+    wrap.className = "flap-wrap flap-wrap-" + pos;
+    var inner = document.createElement("div");
+    inner.className = "flap-inner";
+    wrap.appendChild(inner);
+    cell.appendChild(wrap);
+    parts[pos] = { wrap: wrap, inner: inner };
+  });
+  [["leafTop","top"], ["leafBottom","bottom"]].forEach(function(pair){
+    var key = pair[0], pos = pair[1];
+    var wrap = document.createElement("div");
+    wrap.className = "flap-leaf flap-leaf-" + pos;
+    var inner = document.createElement("div");
+    inner.className = "flap-inner";
+    wrap.appendChild(inner);
+    cell.appendChild(wrap);
+    parts[key] = { wrap: wrap, inner: inner };
+  });
+  return { cell: cell, parts: parts };
+}
+
+var RANDOM_GLYPHS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+function randomGlyph(){ return RANDOM_GLYPHS[Math.floor(Math.random() * RANDOM_GLYPHS.length)]; }
+
+function createSolari(scale){
+  var outer = document.createElement("div");
+  outer.className = "viz-outer";
+  var box = document.createElement("div");
+  box.className = "solari-box";
+  var row = document.createElement("div");
+  row.className = "flap-row";
+  var status = document.createElement("div");
+  status.className = "flap-status";
+  var dot = document.createElement("span");
+  dot.className = "status-dot";
+  var label = document.createElement("span");
+  label.textContent = "STANDBY";
+  status.appendChild(dot);
+  status.appendChild(label);
+  box.appendChild(row);
+  box.appendChild(status);
+  outer.appendChild(box);
+  box.style.transformOrigin = "top left";
+
+  var cells = [];
+  var builtN = -1;
+  var lastTarget = "";
+  var prevState = null;
+
+  function buildCells(n){
+    row.innerHTML = "";
+    cells = [];
+    for(var i = 0; i < n; i++){
+      var built = buildFlapCellDom();
+      row.appendChild(built.cell);
+      cells.push({ el: built.cell, parts: built.parts, current: " ", nextRandomAt: performance.now() + Math.random() * 400 });
+    }
+    lastTarget = "";
+  }
+
+  function setChar(c, ch){
+    c.current = ch;
+    c.parts.top.inner.textContent = ch;
+    c.parts.bottom.inner.textContent = ch;
+  }
+
+  function flip(c, newChar){
+    /* guard: cascade timeouts can outlive a buildCells() rebuild */
+    if(!c || c.current === newChar) return;
+    var dur = 150 / (params.speed || 1);
+    var p = c.parts;
+    p.leafTop.inner.textContent = c.current;
+    p.leafBottom.inner.textContent = newChar;
+    p.leafTop.wrap.style.transition = "none";
+    p.leafTop.wrap.style.transform = "rotateX(0deg)";
+    p.leafBottom.wrap.style.transition = "none";
+    p.leafBottom.wrap.style.transform = "rotateX(90deg)";
+    void p.leafTop.wrap.offsetHeight;
+    requestAnimationFrame(function(){
+      p.leafTop.wrap.style.transition = "transform " + dur + "ms ease-in";
+      p.leafTop.wrap.style.transform = "rotateX(-100deg)";
+      p.leafBottom.wrap.style.transition = "transform " + dur + "ms ease-out " + Math.round(dur * 0.35) + "ms";
+      p.leafBottom.wrap.style.transform = "rotateX(0deg)";
+    });
+    setTimeout(function(){ setChar(c, newChar); }, dur * 0.5);
+  }
+
+  function cascade(targetChars, stepped){
+    var n = cells.length;
+    for(var i = 0; i < n; i++){
+      (function(i){
+        var cell = cells[i];
+        var finalChar = targetChars[i] || " ";
+        var delay = i * (28 / (params.speed || 1));
+        if(stepped){
+          var steps = 1 + Math.floor(Math.random() * 2);
+          var s = 0;
+          function doStep(){
+            s++;
+            var ch = s < steps ? randomGlyph() : finalChar;
+            setTimeout(function(){ flip(cell, ch); }, 0);
+            if(s < steps) setTimeout(doStep, 130 / (params.speed || 1));
+          }
+          setTimeout(doStep, delay);
+        } else {
+          setTimeout(function(){ flip(cell, finalChar); }, delay);
+        }
+      })(i);
+    }
+  }
+
+  function resize(){
+    var w = params.boxW, h = params.boxH;
+    outer.style.width = (w * scale) + "px";
+    outer.style.height = (h * scale) + "px";
+    box.style.width = w + "px";
+    box.style.height = h + "px";
+    box.style.borderRadius = params.radius + "px";
+    box.style.background = params.boxBg;
+    box.style.transform = scale === 1 ? "" : "scale(" + scale + ")";
+
+    if(params.cells !== builtN){
+      builtN = params.cells;
+      buildCells(builtN);
+    }
+    var statusH = Math.max(8, Math.round(h * 0.2));
+    var padding = 3, gap = 2;
+    var rowH = Math.max(10, h - statusH - gap - padding * 2);
+    status.style.height = statusH + "px";
+    status.style.fontSize = Math.max(6, Math.round(statusH * 0.62)) + "px";
+    /* Explicit heights: the flap halves inside each cell are absolutely
+       positioned, so .flap-row and .flap-cell would otherwise collapse to
+       0px height and clip the flaps entirely. */
+    row.style.height = rowH + "px";
+    row.style.flex = "none";
+    cells.forEach(function(c){
+      c.el.style.height = rowH + "px";
+      layoutCellDom(c.parts, rowH);
+    });
+  }
+
+  function onEngine(eng){
+    if(eng.state !== prevState){
+      prevState = eng.state;
+      label.textContent = eng.state === "idle" ? "STANDBY" : eng.state === "settle" ? "CAPTURED" : "LISTENING";
+      dot.classList.toggle("dim", eng.state === "idle");
+      if(eng.state === "idle"){
+        var blanks = new Array(cells.length).fill(" ");
+        lastTarget = blanks.join("");
+        cascade(blanks, false);
+      }
+      if(eng.state === "settle"){
+        var words = eng.activeWords || [];
+        var lastWord = (words[words.length - 1] || "").toUpperCase();
+        var n = cells.length;
+        var target = lastWord.slice(-n);
+        while(target.length < n) target = " " + target;
+        lastTarget = target;
+        cascade(target.split(""), true);
+      }
+    }
+    if(eng.state === "listening"){
+      var now = performance.now();
+      cells.forEach(function(c){
+        if(now >= c.nextRandomAt){
+          flip(c, randomGlyph());
+          c.nextRandomAt = now + 150 + Math.random() * 350;
+        }
+      });
+    } else if(eng.state === "speaking"){
+      var n2 = cells.length;
+      var raw = (eng.displayedText || "").toUpperCase();
+      var target2 = raw.slice(-n2);
+      while(target2.length < n2) target2 = " " + target2;
+      if(target2 !== lastTarget){
+        lastTarget = target2;
+        cascade(target2.split(""), true);
+      }
+    }
+  }
+
+  resize();
+  return { el: outer, resize: resize, onEngine: onEngine };
+}
+
+/* ==========================================================================
+   CONCEPT B — DOT-MATRIX DEPARTURE BOARD FACTORY
+   ========================================================================== */
+function createDotMatrix(scale){
+  var outer = document.createElement("div");
+  outer.className = "dm-frame viz-outer";
+  var canvas = document.createElement("canvas");
+  canvas.className = "dm-canvas";
+  outer.appendChild(canvas);
+  var ctx = canvas.getContext("2d");
+
+  var cssW = 0, cssH = 0, pitch = 3;
+  var scrollX = 0;
+  var prevState = null;
+
+  function resize(){
+    cssW = params.boxW * scale;
+    cssH = params.boxH * scale;
+    pitch = params.dotPitch * scale;
+    outer.style.width = cssW + "px";
+    outer.style.height = cssH + "px";
+    outer.style.borderRadius = (params.radius * scale) + "px";
+    outer.style.borderWidth = Math.max(1, scale) + "px";
+    var dpr = window.devicePixelRatio || 1;
+    canvas.style.width = cssW + "px";
+    canvas.style.height = cssH + "px";
+    canvas.width = Math.round(cssW * dpr);
+    canvas.height = Math.round(cssH * dpr);
+    ctx = canvas.getContext("2d");
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+
+  function onEngine(eng, dt){
+    if(eng.state !== prevState){
+      if(eng.state === "speaking") scrollX = cssW;
+      prevState = eng.state;
+    }
+    var lit = params.accent, unlit = "#1c1c1e", bg = params.boxBg, glow = params.glow * scale * 0.5;
+    ctx.clearRect(0, 0, cssW, cssH);
+    ctx.fillStyle = bg;
+    ctx.fillRect(0, 0, cssW, cssH);
+
+    var trackW = charWidth(pitch) * 2 + pitch * 2;
+    var tickerW = Math.max(10, cssW - trackW - pitch);
+
+    ctx.fillStyle = "rgba(255,255,255,.08)";
+    ctx.fillRect(tickerW + pitch * 0.4, 3 * scale, Math.max(1, scale * 0.5), Math.max(0, cssH - 6 * scale));
+
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(0, 0, tickerW, cssH);
+    ctx.clip();
+
+    var rowY = (cssH - 7 * pitch) / 2;
+
+    if(eng.state === "idle"){
+      var blink = Math.floor(eng.stateElapsed / 500) % 2 === 0;
+      if(blink) drawText(ctx, "--", 6 * scale, rowY, pitch, lit, unlit, glow * 0.5);
+    } else if(eng.state === "listening"){
+      var dur = 700, t = Math.min(1, eng.stateElapsed / dur), ease = 1 - Math.pow(1 - t, 3);
+      var label1 = "LISTENING", w1 = textWidth(label1, pitch);
+      var startX = tickerW, endX = (tickerW - w1) / 2;
+      var x1 = startX + (endX - startX) * ease;
+      drawText(ctx, label1, x1, rowY, pitch, lit, unlit, glow);
+    } else if(eng.state === "speaking"){
+      var label2 = (eng.displayedText || "").toUpperCase();
+      var w2 = Math.max(1, textWidth(label2, pitch));
+      scrollX -= (36 * scale * (params.speed || 1)) * (dt / 1000);
+      if(scrollX < -w2) scrollX = tickerW;
+      drawText(ctx, label2, scrollX, rowY, pitch, lit, unlit, glow);
+      drawText(ctx, label2, scrollX + w2 + charWidth(pitch) * 4, rowY, pitch, lit, unlit, glow);
+    } else if(eng.state === "settle"){
+      var label3 = "SAVED", w3 = textWidth(label3, pitch), x3 = (tickerW - w3) / 2;
+      drawText(ctx, label3, x3, rowY, pitch, lit, unlit, glow);
+    }
+    ctx.restore();
+
+    var blinkDot = eng.state !== "idle" && (eng.state === "speaking" || Math.floor(performance.now() / 500) % 2 === 0);
+    ctx.beginPath();
+    ctx.fillStyle = blinkDot ? lit : unlit;
+    ctx.arc(4 * scale, 4 * scale, 1.5 * scale, 0, Math.PI * 2);
+    ctx.fill();
+
+    var trackNum = String((eng.revealedCount || 0) % 100);
+    while(trackNum.length < 2) trackNum = "0" + trackNum;
+    drawText(ctx, trackNum, tickerW + pitch * 1.1, rowY, pitch, lit, unlit, glow * 0.6);
+  }
+
+  resize();
+  return { el: outer, resize: resize, onEngine: onEngine };
+}
+
+/* ==========================================================================
+   CONCEPT C — WOODEN WHISTLE & STEAM FACTORY
+   ========================================================================== */
+function createSteam(scale){
+  var outer = document.createElement("div");
+  outer.className = "viz-outer";
+  var plaque = document.createElement("div");
+  plaque.className = "steam-box";
+  var svgWrap = document.createElement("div");
+  svgWrap.className = "whistle-svg-wrap";
+  svgWrap.innerHTML = WHISTLE_SVG;
+  var puffLayer = document.createElement("div");
+  puffLayer.className = "puff-layer";
+  var label = document.createElement("div");
+  label.className = "whistle-label";
+  label.textContent = "WHISTLE";
+  var gauge = document.createElement("div");
+  gauge.className = "gauge";
+  gauge.innerHTML = '<div class="gauge-face"><div class="gauge-needle"></div></div>';
+  plaque.appendChild(svgWrap);
+  plaque.appendChild(puffLayer);
+  plaque.appendChild(label);
+  plaque.appendChild(gauge);
+  outer.appendChild(plaque);
+  plaque.style.transformOrigin = "top left";
+
+  var spawnAt = 0, prevState = null, bigDone = false, lastRevealed = 0;
+
+  function resize(){
+    var w = params.boxW, h = params.boxH;
+    outer.style.width = (w * scale) + "px";
+    outer.style.height = (h * scale) + "px";
+    plaque.style.width = w + "px";
+    plaque.style.height = h + "px";
+    plaque.style.borderRadius = params.radius + "px";
+    plaque.style.transform = scale === 1 ? "" : "scale(" + scale + ")";
+    plaque.style.setProperty("--rise", Math.round(h * 0.9) + "px");
+    label.style.fontSize = Math.max(5, Math.round(h * 0.14)) + "px";
+    var wordFontSize = Math.max(6, Math.round(h * 0.16));
+    plaque.style.setProperty("--word-fs", wordFontSize + "px");
+  }
+
+  function spawnPuff(o){
+    o = o || {};
+    var s = document.createElement("span");
+    s.className = "puff";
+    var size = o.size || (6 + Math.random() * 5);
+    var dx = (Math.random() * 2 - 1) * (o.spread || 12);
+    var dur = (o.dur || (1100 + Math.random() * 500)) / (params.speed || 1);
+    s.style.setProperty("--dx", dx + "px");
+    s.style.setProperty("--puff-op", o.opacity != null ? o.opacity : 0.45);
+    s.style.width = size + "px";
+    s.style.height = size + "px";
+    s.style.left = (o.x != null ? o.x : 36) + "%";
+    s.style.bottom = (o.y != null ? o.y : "44%");
+    s.style.background = params.cream;
+    s.style.animationDuration = dur + "ms";
+    puffLayer.appendChild(s);
+    s.addEventListener("animationend", function(){ s.remove(); });
+  }
+  function spawnWord(word){
+    if(!word) return;
+    var el = document.createElement("span");
+    el.className = "word-rise";
+    el.textContent = word;
+    el.style.color = params.cream;
+    el.style.fontSize = "var(--word-fs, 7px)";
+    el.style.animationDuration = (1500 / (params.speed || 1)) + "ms";
+    puffLayer.appendChild(el);
+    el.addEventListener("animationend", function(){ el.remove(); });
+  }
+
+  function onEngine(eng){
+    if(eng.state !== prevState){
+      prevState = eng.state;
+      bigDone = false;
+      if(eng.state === "speaking") lastRevealed = 0;
+    }
+    var now = performance.now();
+    if(eng.state === "listening"){
+      if(now > spawnAt){
+        spawnPuff({ size: 5, opacity: 0.18, dur: 2400 });
+        spawnAt = now + Math.max(300, 1100 - params.steamDensity * 60);
+      }
+    } else if(eng.state === "speaking"){
+      var rate = Math.max(90, 480 - params.steamDensity * 35 - eng.audioLevel * 260);
+      if(now > spawnAt){
+        spawnPuff({ size: 6 + eng.audioLevel * 9, opacity: 0.3 + eng.audioLevel * 0.4, dur: 850 + Math.random() * 450 });
+        spawnAt = now + rate;
+      }
+      if(eng.revealedCount > lastRevealed){
+        lastRevealed = eng.revealedCount;
+        spawnWord((eng.activeWords[lastRevealed - 1] || "").toUpperCase());
+      }
+    } else if(eng.state === "settle"){
+      if(!bigDone){
+        bigDone = true;
+        spawnPuff({ size: 20, opacity: 0.55, dur: 1700, spread: 5 });
+      }
+    }
+    var needle = gauge.querySelector(".gauge-needle");
+    if(needle){
+      var angle = -50 + (eng.audioLevel || 0) * 100;
+      needle.style.transform = "translateX(-50%) rotate(" + angle + "deg)";
+    }
+  }
+
+  resize();
+  return { el: outer, resize: resize, onEngine: onEngine };
+}
+
+/* ==========================================================================
+   CONCEPT D — HALFTONE SCREENSHOT TREATMENT FACTORY
+   ========================================================================== */
+/* Synthetic "desktop screenshot" drawn once on an offscreen canvas (560x340):
+   menu bar, two overlapping windows, text-line rectangles, colorful dock —
+   enough luminance variety for the halftone to read. */
+var _shotCanvas = null;
+function drawMockWindow(g, x, y, w, h, bodyColor){
+  g.fillStyle = "rgba(0,0,0,.28)";
+  g.fillRect(x + 4, y + 5, w, h);
+  g.fillStyle = bodyColor;
+  g.fillRect(x, y, w, h);
+  g.fillStyle = "#d9d9de";
+  g.fillRect(x, y, w, 22);
+  var lights = ["#ff5f57", "#febc2e", "#28c840"];
+  for(var i = 0; i < 3; i++){
+    g.beginPath();
+    g.fillStyle = lights[i];
+    g.arc(x + 12 + i * 14, y + 11, 4, 0, Math.PI * 2);
+    g.fill();
+  }
+  g.fillStyle = "#9d9da6";
+  var ty = y + 36;
+  var widths = [0.82, 0.6, 0.72, 0.4, 0.66, 0.5, 0.76, 0.3];
+  for(var l = 0; l < widths.length && ty < y + h - 14; l++){
+    g.fillRect(x + 14, ty, (w - 28) * widths[l], 7);
+    ty += 16;
+  }
+}
+function getScreenshot(){
+  if(_shotCanvas) return _shotCanvas;
+  var c = document.createElement("canvas");
+  c.width = 560; c.height = 340;
+  var g = c.getContext("2d");
+  var grad = g.createLinearGradient(0, 0, 560, 340);
+  grad.addColorStop(0, "#3b4a6b");
+  grad.addColorStop(0.55, "#5a3f66");
+  grad.addColorStop(1, "#7a3b52");
+  g.fillStyle = grad;
+  g.fillRect(0, 0, 560, 340);
+  /* menu bar */
+  g.fillStyle = "rgba(246,246,248,.92)";
+  g.fillRect(0, 0, 560, 18);
+  g.fillStyle = "#44454a";
+  var mx = 10;
+  [12, 30, 22, 26, 18].forEach(function(w){ g.fillRect(mx, 6, w, 6); mx += w + 12; });
+  /* two overlapping app windows */
+  drawMockWindow(g, 38, 46, 300, 214, "#f1f1f4");
+  drawMockWindow(g, 226, 106, 288, 196, "#ffffff");
+  /* dock */
+  g.fillStyle = "rgba(255,255,255,.22)";
+  g.fillRect(150, 310, 260, 24);
+  var dockColors = ["#4a90e2", "#e2574a", "#f2b544", "#48b874", "#9a5fd6", "#e07a3f"];
+  for(var d = 0; d < dockColors.length; d++){
+    g.fillStyle = dockColors[d];
+    g.fillRect(160 + d * 42, 313, 30, 18);
+  }
+  _shotCanvas = c;
+  return c;
+}
+
+/* Cover-crop source rect of the screenshot for a target aspect ratio */
+function coverRect(shot, dstW, dstH){
+  var srcAR = shot.width / shot.height, dstAR = dstW / dstH;
+  if(srcAR > dstAR){
+    var sh = shot.height, sw = sh * dstAR;
+    return { sx: (shot.width - sw) / 2, sy: 0, sw: sw, sh: sh };
+  }
+  var sw2 = shot.width, sh2 = sw2 / dstAR;
+  return { sx: 0, sy: (shot.height - sh2) / 2, sw: sw2, sh: sh2 };
+}
+
+var _sampleCanvas = document.createElement("canvas");
+/* Draw the halftone: sample the screenshot at one pixel per grid cell, then
+   one round dot per cell with radius proportional to luminance (bright areas
+   = big dots on near-black). sweepFrac (0..1) is the "develop" front; null
+   or >= 1 draws the full image. */
+function renderHalftoneInto(canvas, cssW, cssH, sweepFrac){
+  var dpr = window.devicePixelRatio || 1;
+  canvas.style.width = cssW + "px";
+  canvas.style.height = cssH + "px";
+  var pw = Math.max(1, Math.round(cssW * dpr));
+  var ph = Math.max(1, Math.round(cssH * dpr));
+  if(canvas.width !== pw) canvas.width = pw;
+  if(canvas.height !== ph) canvas.height = ph;
+  var ctx = canvas.getContext("2d");
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+  var pitch = Math.max(2, params.halftoneSize);
+  var cols = Math.max(1, Math.ceil(cssW / pitch));
+  var rows = Math.max(1, Math.ceil(cssH / pitch));
+  var shot = getScreenshot();
+  var r0 = coverRect(shot, cssW, cssH);
+  if(_sampleCanvas.width !== cols) _sampleCanvas.width = cols;
+  if(_sampleCanvas.height !== rows) _sampleCanvas.height = rows;
+  var sctx = _sampleCanvas.getContext("2d");
+  sctx.clearRect(0, 0, cols, rows);
+  sctx.drawImage(shot, r0.sx, r0.sy, r0.sw, r0.sh, 0, 0, cols, rows);
+  var data = null;
+  try { data = sctx.getImageData(0, 0, cols, rows).data; } catch(e){ /* tainted canvas — never expected here */ }
+
+  ctx.clearRect(0, 0, cssW, cssH);
+  ctx.fillStyle = "#0d0d0f";
+  ctx.fillRect(0, 0, cssW, cssH);
+  if(!data) return;
+
+  var color = params.halftoneStyle === "ivory" ? params.cream : params.accent;
+  ctx.fillStyle = color;
+  /* cap below half-pitch so adjacent dots never merge into solid fill */
+  var maxR = pitch * 0.42;
+  var frontX = (sweepFrac == null || sweepFrac >= 1) ? Infinity : sweepFrac * (cssW + 40);
+  for(var ry = 0; ry < rows; ry++){
+    for(var cx = 0; cx < cols; cx++){
+      var i = (ry * cols + cx) * 4;
+      var lum = (0.2126 * data[i] + 0.7152 * data[i + 1] + 0.0722 * data[i + 2]) / 255;
+      var rad = maxR * Math.pow(lum, 1.4);
+      var px = cx * pitch + pitch / 2;
+      var py = ry * pitch + pitch / 2;
+      if(px > frontX) continue;
+      /* dots grow in over a 40px band behind the moving develop front */
+      rad *= Math.min(1, (frontX - px) / 40);
+      if(rad < 0.3) continue;
+      ctx.beginPath();
+      ctx.arc(px, py, rad, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+}
+
+function createHalftone(mode){
+  var outer = document.createElement("div");
+  var halftoneCanvas = document.createElement("canvas");
+  halftoneCanvas.className = "ht-canvas";
+  var originalCanvas = null;
+  var dims;
+
+  if(mode === "hero"){
+    outer.className = "halftone-hero";
+    dims = { w: 320, h: 194 };
+    originalCanvas = document.createElement("canvas");
+    originalCanvas.className = "ht-canvas";
+    var figOrig = document.createElement("div");
+    figOrig.className = "ht-fig";
+    figOrig.innerHTML = '<div class="ht-fig-label">ORIGINAL</div>';
+    figOrig.appendChild(originalCanvas);
+    var arrow = document.createElement("div");
+    arrow.className = "ht-arrow";
+    arrow.textContent = "→";
+    var figHt = document.createElement("div");
+    figHt.className = "ht-fig";
+    figHt.innerHTML = '<div class="ht-fig-label">HALFTONE</div>';
+    figHt.appendChild(halftoneCanvas);
+    outer.appendChild(figOrig);
+    outer.appendChild(arrow);
+    outer.appendChild(figHt);
+  } else {
+    outer.className = "viz-outer";
+    dims = { w: 428, h: 90 };
+    outer.appendChild(halftoneCanvas);
+  }
+
+  var sweepStart = -1;
+  var prevState = null;
+
+  function renderOriginal(){
+    var w = 168, h = 102;
+    var dpr = window.devicePixelRatio || 1;
+    originalCanvas.style.width = w + "px";
+    originalCanvas.style.height = h + "px";
+    originalCanvas.width = Math.round(w * dpr);
+    originalCanvas.height = Math.round(h * dpr);
+    var g = originalCanvas.getContext("2d");
+    g.setTransform(dpr, 0, 0, dpr, 0, 0);
+    var shot = getScreenshot();
+    var r0 = coverRect(shot, w, h);
+    g.drawImage(shot, r0.sx, r0.sy, r0.sw, r0.sh, 0, 0, w, h);
+  }
+
+  function resize(){
+    if(originalCanvas) renderOriginal();
+    renderHalftoneInto(halftoneCanvas, dims.w, dims.h, null);
+  }
+
+  function onEngine(eng){
+    if(eng.state !== prevState){
+      /* dictation-cycle restart: play the left-to-right "develop" sweep */
+      if(prevState === "idle" && eng.state === "listening") sweepStart = performance.now();
+      prevState = eng.state;
+    }
+    if(sweepStart >= 0){
+      var dur = 600 / (params.speed || 1);
+      var t = (performance.now() - sweepStart) / dur;
+      if(t >= 1){
+        sweepStart = -1;
+        renderHalftoneInto(halftoneCanvas, dims.w, dims.h, null);
+      } else {
+        var ease = 1 - Math.pow(1 - t, 2);
+        renderHalftoneInto(halftoneCanvas, dims.w, dims.h, ease);
+      }
+    }
+  }
+
+  resize();
+  return { el: outer, resize: resize, onEngine: onEngine };
+}
+
+/* ==========================================================================
+   INSTANCES
+   ========================================================================== */
+var heroA, ctxA, heroB, ctxB, heroC, ctxC, heroD, ctxD, allInstances = [];
+function buildInstances(){
+  heroA = createSolari(3);
+  ctxA = createSolari(1);
+  heroB = createDotMatrix(3);
+  ctxB = createDotMatrix(1);
+  heroC = createSteam(3);
+  ctxC = createSteam(1);
+  heroD = createHalftone("hero");
+  ctxD = createHalftone("context");
+  document.getElementById("hero-a-wrap").appendChild(heroA.el);
+  document.getElementById("ctx-a-wrap").appendChild(ctxA.el);
+  document.getElementById("hero-b-wrap").appendChild(heroB.el);
+  document.getElementById("ctx-b-wrap").appendChild(ctxB.el);
+  document.getElementById("hero-c-wrap").appendChild(heroC.el);
+  document.getElementById("ctx-c-wrap").appendChild(ctxC.el);
+  document.getElementById("hero-d-wrap").appendChild(heroD.el);
+  document.getElementById("ctx-d-wrap").appendChild(ctxD.el);
+  allInstances = [heroA, ctxA, heroB, ctxB, heroC, ctxC, heroD, ctxD];
+}
+function resizeAll(){ allInstances.forEach(function(i){ i.resize(); }); }
+
+function updateFakeInputs(eng){
+  var ids = ["fake-input-a", "fake-input-b", "fake-input-c", "fake-input-d"];
+  var val = "", ph = "Click the mic to dictate…";
+  if(eng.state === "idle"){ val = ""; ph = "Click the mic to dictate…"; }
+  else if(eng.state === "listening"){ val = ""; ph = "Listening…"; }
+  else if(eng.state === "speaking"){ val = eng.displayedText; ph = ""; }
+  else if(eng.state === "settle"){ val = eng.activeWords.join(" "); ph = ""; }
+  ids.forEach(function(id){
+    var el = document.getElementById(id);
+    if(!el) return;
+    el.value = val;
+    /* concept D's real-panel field keeps its native placeholder while idle */
+    el.placeholder = (id === "fake-input-d" && eng.state === "idle") ? "Type your idea…" : ph;
+  });
+}
+
+/* ==========================================================================
+   CONTRAST (WCAG) BADGES
+   ========================================================================== */
+function hexToRgb(hex){
+  hex = (hex || "#000000").replace("#", "");
+  if(hex.length === 3) hex = hex.split("").map(function(c){ return c + c; }).join("");
+  var num = parseInt(hex, 16) || 0;
+  return [(num >> 16) & 255, (num >> 8) & 255, num & 255];
+}
+function relLuminance(hex){
+  var rgb = hexToRgb(hex).map(function(v){
+    v /= 255;
+    return v <= 0.03928 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4);
+  });
+  return 0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2];
+}
+function contrastRatio(hexA, hexB){
+  var l1 = relLuminance(hexA) + 0.05, l2 = relLuminance(hexB) + 0.05;
+  return l1 > l2 ? l1 / l2 : l2 / l1;
+}
+function updateContrastBadges(){
+  var pairs = {
+    a: [params.cream, params.boxBg],
+    b: [params.accent, params.boxBg],
+    c: [params.cream, "#2e1c10"],
+    d: [params.halftoneStyle === "ivory" ? params.cream : params.accent, "#0d0d0f"]
+  };
+  Object.keys(pairs).forEach(function(key){
+    var fg = pairs[key][0], bg = pairs[key][1];
+    var ratio = contrastRatio(fg, bg);
+    var el = document.getElementById("contrast-" + key);
+    if(!el) return;
+    var level = "Fail", cls = "fail";
+    if(ratio >= 7){ level = "AAA"; cls = "pass-aaa"; }
+    else if(ratio >= 4.5){ level = "AA"; cls = "pass-aa"; }
+    el.textContent = ratio.toFixed(2) + ":1 " + level;
+    el.className = "contrast-badge " + cls;
+  });
+}
+
+/* ==========================================================================
+   CSS VARS / THEME / VIEWPORT
+   ========================================================================== */
+function updateCssVars(){
+  var r = document.documentElement.style;
+  r.setProperty("--vp-accent", params.accent);
+  r.setProperty("--vp-cream", params.cream);
+  r.setProperty("--vp-boxbg", params.boxBg);
+  r.setProperty("--vp-radius", params.radius + "px");
+  r.setProperty("--vp-glow", params.glow + "px");
+}
+function applyTheme(){
+  document.body.classList.toggle("light", params.theme === "light");
+  var btn = document.getElementById("btn-theme-toggle");
+  if(btn) btn.textContent = params.theme === "light" ? "Dark Mode" : "Light Mode";
+}
+function applyViewport(){
+  var el = document.getElementById("main-inner");
+  el.className = "main-inner viewport-" + params.viewport;
+  document.querySelectorAll(".vp-btn").forEach(function(b){
+    b.classList.toggle("active", b.dataset.vp === params.viewport);
+  });
+}
+
+/* ==========================================================================
+   TOAST + CLIPBOARD
+   ========================================================================== */
+var toastTimer = null;
+function showToast(msg){
+  var t = document.getElementById("toast");
+  t.textContent = msg;
+  t.classList.add("show");
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(function(){ t.classList.remove("show"); }, 1800);
+}
+function fallbackCopy(str, cb){
+  var ta = document.createElement("textarea");
+  ta.value = str;
+  ta.style.position = "fixed";
+  ta.style.opacity = "0";
+  document.body.appendChild(ta);
+  ta.select();
+  try { document.execCommand("copy"); } catch(e){}
+  document.body.removeChild(ta);
+  cb();
+}
+function copyText(str, msg){
+  function done(){ showToast(msg); }
+  if(navigator.clipboard && navigator.clipboard.writeText){
+    navigator.clipboard.writeText(str).then(done).catch(function(){ fallbackCopy(str, done); });
+  } else {
+    fallbackCopy(str, done);
+  }
+}
+
+/* ==========================================================================
+   CODE GENERATION (Copy Code per concept + export format)
+   ========================================================================== */
+function generateCodeA(fmt){
+  var p = params;
+  var n = p.cells;
+  var fontSize = Math.max(7, Math.round(p.boxH * 0.31));
+  if(fmt === "tailwind"){
+    var cellsHtml = "";
+    for(var i = 0; i < n; i++) cellsHtml += '\n    <div class="flex-1 flex items-center justify-center rounded-sm" style="background:#1a1a1c;color:' + p.cream + ';font-weight:700;font-size:' + fontSize + 'px;">A</div>';
+    return '<!-- Solari split-flap visualizer (Tailwind, structure only -- flip animation needs JS) -->\n' +
+      '<div class="flex flex-col gap-[2px] p-1 box-border" style="width:' + p.boxW + 'px;height:' + p.boxH + 'px;background:' + p.boxBg + ';border-radius:' + p.radius + 'px;">\n' +
+      '  <div class="flex gap-[2px] flex-1">' + cellsHtml + '\n  </div>\n' +
+      '  <div class="text-center" style="color:' + p.accent + ';font-size:7px;letter-spacing:.16em;">&#9679; LISTENING</div>\n' +
+      '</div>';
+  }
+  if(fmt === "cssinjs"){
+    return '// Solari split-flap visualizer (React inline styles -- structure only)\n' +
+      'const boxStyle = { display:"flex", flexDirection:"column", gap:2, padding:"3px 4px", boxSizing:"border-box",\n' +
+      '  width:' + p.boxW + ', height:' + p.boxH + ', background:"' + p.boxBg + '", borderRadius:' + p.radius + ' };\n' +
+      'const rowStyle = { display:"flex", gap:2, flex:1 };\n' +
+      'const cellStyle = { flex:1, display:"flex", alignItems:"center", justifyContent:"center", background:"#1a1a1c",\n' +
+      '  borderRadius:2, color:"' + p.cream + '", fontWeight:700, fontSize:' + fontSize + ' };\n' +
+      'const statusStyle = { textAlign:"center", color:"' + p.accent + '", fontSize:7, letterSpacing:"0.16em" };\n\n' +
+      'function SolariBox(){\n' +
+      '  return (\n' +
+      '    <div style={boxStyle}>\n' +
+      '      <div style={rowStyle}>\n' +
+      '        {Array.from({ length: ' + n + ' }).map((_, i) => <div key={i} style={cellStyle}>A</div>)}\n' +
+      '      </div>\n' +
+      '      <div style={statusStyle}>&#9679; LISTENING</div>\n' +
+      '    </div>\n' +
+      '  );\n' +
+      '}\n' +
+      '// Flip animation: rotateX transform on leaf overlays per cell -- see visualizer-playground.html';
+  }
+  var cellsMarkup = "";
+  for(var j = 0; j < n; j++) cellsMarkup += '\n    <div class="flap-cell">A</div>';
+  return '<div class="solari-box">\n  <div class="flap-row">' + cellsMarkup + '\n  </div>\n' +
+    '  <div class="flap-status"><span class="status-dot"></span>LISTENING</div>\n</div>\n\n' +
+    '<style>\n' +
+    '.solari-box{ display:flex; flex-direction:column; gap:2px; padding:3px 4px; box-sizing:border-box;\n' +
+    '  width:' + p.boxW + 'px; height:' + p.boxH + 'px; background:' + p.boxBg + '; border-radius:' + p.radius + 'px; }\n' +
+    '.flap-row{ display:flex; gap:2px; flex:1; perspective:260px; }\n' +
+    '.flap-cell{ flex:1; display:flex; align-items:center; justify-content:center; background:#1a1a1c;\n' +
+    '  border-radius:2px; color:' + p.cream + '; font:700 ' + fontSize + 'px/1 "Helvetica Neue Condensed","Arial Narrow",Arial,sans-serif; }\n' +
+    '.flap-status{ text-align:center; color:' + p.accent + '; font-size:7px; letter-spacing:.16em; }\n' +
+    '.status-dot{ display:inline-block; width:5px; height:5px; border-radius:50%; background:' + p.accent + ';\n' +
+    '  animation: dot-pulse 1s ease-in-out infinite; margin-right:3px; }\n' +
+    '@keyframes dot-pulse{ 0%,100%{opacity:1;} 50%{opacity:.28;} }\n' +
+    '/* Flip: split each cell top/bottom, animate a leaf overlay rotateX 0deg -> -100deg on change. */\n' +
+    '/* Full engine (staggered flips, cascade reveal): see visualizer-playground.html (Concept A). */\n' +
+    '</style>';
+}
+
+function generateCodeB(fmt){
+  var p = params;
+  if(fmt === "tailwind"){
+    return '<!-- Dot-matrix departure board (Tailwind, structure only -- rendering is canvas + JS) -->\n' +
+      '<canvas class="border rounded-[' + p.radius + 'px]" style="width:' + p.boxW + 'px;height:' + p.boxH + 'px;background:' + p.boxBg + ';border-color:#2a2a2a;box-shadow:inset 0 0 6px rgba(0,0,0,.6);"></canvas>\n' +
+      '<!-- LED color: ' + p.accent + '  Unlit dot: #1c1c1e  Dot pitch: ' + p.dotPitch + 'px  Glow: ' + p.glow + 'px -->';
+  }
+  if(fmt === "cssinjs"){
+    return '// Dot-matrix departure board (React) -- canvas ref + draw loop\n' +
+      'const canvasStyle = { width:' + p.boxW + ', height:' + p.boxH + ', background:"' + p.boxBg + '",\n' +
+      '  border:"1px solid #2a2a2a", borderRadius:' + p.radius + ', boxShadow:"inset 0 0 6px rgba(0,0,0,.6)" };\n\n' +
+      '// In a useEffect: get the 2D context and draw a 5x7 dot-matrix font with\n' +
+      '//   ledColor="' + p.accent + '", unlitColor="#1c1c1e", pitch=' + p.dotPitch + ', glow=' + p.glow + '\n' +
+      '// Full FONT5x7 glyph map + scrolling ticker + track-number cell:\n' +
+      '// see visualizer-playground.html (Concept B).';
+  }
+  return '<canvas class="dm-canvas" width="' + p.boxW + '" height="' + p.boxH + '"></canvas>\n\n' +
+    '<style>\n.dm-canvas{\n  width:' + p.boxW + 'px; height:' + p.boxH + 'px;\n  background:' + p.boxBg + ';\n' +
+    '  border:1px solid #2a2a2a;\n  border-radius:' + p.radius + 'px;\n  box-shadow: inset 0 0 6px rgba(0,0,0,.6);\n}\n</style>\n\n' +
+    '<script>\n' +
+    '// Draw a 5x7 LED dot-matrix ticker on the canvas 2D context.\n' +
+    '// LED lit: ' + p.accent + '   LED unlit: #1c1c1e   Dot pitch: ' + p.dotPitch + 'px   Glow blur: ' + p.glow + 'px\n' +
+    '// Define FONT5x7 glyph bitmaps (5 cols x 7 rows) for A-Z, 0-9 and punctuation,\n' +
+    '// then draw a circle per lit cell (ctx.shadowBlur for the glow) and scroll\n' +
+    '// the live transcript right-to-left with requestAnimationFrame.\n' +
+    '// Full implementation: see visualizer-playground.html (Concept B).\n' +
+    '</' + 'script>';
+}
+
+function generateCodeC(fmt){
+  var p = params;
+  if(fmt === "tailwind"){
+    return '<!-- Wooden whistle & steam visualizer (Tailwind, structure only -- steam needs JS) -->\n' +
+      '<div class="relative overflow-hidden border-2" style="width:' + p.boxW + 'px;height:' + p.boxH + 'px;border-radius:' + p.radius + 'px;border-color:#8a6a1f;\n' +
+      '  background: linear-gradient(155deg,#6b4429,#4a2c18 55%,#5b3a24);">\n' +
+      '  <div class="absolute inset-x-0 bottom-0 text-center" style="color:rgba(0,0,0,.5);font-size:6px;letter-spacing:.22em;">WHISTLE</div>\n' +
+      '  <!-- steam puffs: spawn absolutely-positioned divs animating translateY + fade, color ' + p.cream + ' -->\n' +
+      '</div>';
+  }
+  if(fmt === "cssinjs"){
+    return '// Wooden whistle & steam visualizer (React inline styles -- structure only)\n' +
+      'const plaqueStyle = {\n' +
+      '  position:"relative", overflow:"hidden", boxSizing:"border-box",\n' +
+      '  width:' + p.boxW + ', height:' + p.boxH + ', borderRadius:' + p.radius + ',\n' +
+      '  border:"2px solid #8a6a1f",\n' +
+      '  background:"linear-gradient(155deg,#6b4429,#4a2c18 55%,#5b3a24)"\n' +
+      '};\n' +
+      '// Spawn <span> puffs on an interval (rate scales with fake audio level + steamDensity=' + p.steamDensity + '),\n' +
+      '// animating translateY(-' + Math.round(p.boxH * 0.9) + 'px) + opacity fade, color "' + p.cream + '".\n' +
+      '// Full puff/word-rise/gauge implementation: see visualizer-playground.html (Concept C).';
+  }
+  return '<div class="steam-box">\n' +
+    '  <div class="whistle-svg-wrap">' + WHISTLE_SVG + '</div>\n' +
+    '  <div class="puff-layer"></div>\n' +
+    '  <div class="whistle-label">WHISTLE</div>\n' +
+    '</div>\n\n' +
+    '<style>\n' +
+    '.steam-box{ position:relative; overflow:hidden; box-sizing:border-box;\n' +
+    '  width:' + p.boxW + 'px; height:' + p.boxH + 'px; border-radius:' + p.radius + 'px;\n' +
+    '  border:2px solid #8a6a1f;\n' +
+    '  background: repeating-linear-gradient(95deg, rgba(0,0,0,.09) 0 2px, transparent 2px 7px),\n' +
+    '    linear-gradient(155deg,#6b4429,#4a2c18 55%,#5b3a24);\n' +
+    '  box-shadow: inset 0 0 0 1px rgba(255,215,120,.28), inset 0 1px 4px rgba(0,0,0,.55); }\n' +
+    '.whistle-label{ position:absolute; left:0; right:0; bottom:2px; text-align:center;\n' +
+    '  font:700 6px/1 "Helvetica Neue Condensed","Arial Narrow",Arial,sans-serif; letter-spacing:.22em;\n' +
+    '  color:rgba(0,0,0,.5); text-shadow:0 1px 0 rgba(255,255,255,.2); }\n' +
+    '.puff{ position:absolute; border-radius:50%; filter:blur(1.6px); background:' + p.cream + ';\n' +
+    '  animation: puff-rise 1.2s ease-out forwards; }\n' +
+    '@keyframes puff-rise{ 0%{ transform:translate(-50%,0) scale(.5); opacity:0; }\n' +
+    '  18%{ opacity:.45; } 100%{ transform:translate(calc(-50% + 10px), -' + Math.round(p.boxH * 0.9) + 'px) scale(1.9); opacity:0; } }\n' +
+    '/* Spawn a .puff span on an interval (rate scales with steamDensity=' + p.steamDensity + ' + fake audio level). */\n' +
+    '/* Full whistle SVG + word-rise + brass gauge: see visualizer-playground.html (Concept C). */\n' +
+    '</style>';
+}
+
+function generateCodeD(fmt){
+  var p = params;
+  var color = p.halftoneStyle === "ivory" ? p.cream : p.accent;
+  var styleName = p.halftoneStyle === "ivory" ? "ivory" : "amber mono";
+  if(fmt === "tailwind"){
+    return '<!-- Halftone screenshot treatment (Tailwind, structure only -- rendering is canvas + JS) -->\n' +
+      '<canvas class="rounded-lg border" style="width:428px;height:90px;background:#0d0d0f;border-color:#3a322c;"></canvas>\n' +
+      '<!-- Style: ' + styleName + '  Dot color: ' + color + '  Dot pitch: ' + p.halftoneSize + 'px -->\n' +
+      '<!-- Draw loop: sample the screenshot at one pixel per ' + p.halftoneSize + 'px cell, then one round dot per\n' +
+      '     cell with radius = pitch*0.42 * pow(luminance, 1.4) -- see drawHalftone in visualizer-playground.html -->';
+  }
+  if(fmt === "cssinjs"){
+    return '// Halftone screenshot treatment (React) -- canvas ref + draw once per image/param change\n' +
+      'const canvasStyle = { width: 428, height: 90, background: "#0d0d0f",\n' +
+      '  border: "1px solid #3a322c", borderRadius: 8 };\n\n' +
+      '// In a useEffect (re-run on image / param change):\n' +
+      'function drawHalftone(canvas, img){\n' +
+      '  const pitch = ' + p.halftoneSize + ', ctx = canvas.getContext("2d");\n' +
+      '  const W = canvas.width, H = canvas.height;\n' +
+      '  const cols = Math.ceil(W / pitch), rows = Math.ceil(H / pitch);\n' +
+      '  const s = document.createElement("canvas"); s.width = cols; s.height = rows;\n' +
+      '  s.getContext("2d").drawImage(img, 0, 0, cols, rows);\n' +
+      '  const d = s.getContext("2d").getImageData(0, 0, cols, rows).data;\n' +
+      '  ctx.fillStyle = "#0d0d0f"; ctx.fillRect(0, 0, W, H);\n' +
+      '  ctx.fillStyle = "' + color + '"; // ' + styleName + '\n' +
+      '  for(let y = 0; y < rows; y++) for(let x = 0; x < cols; x++){\n' +
+      '    const i = (y * cols + x) * 4;\n' +
+      '    const lum = (0.2126*d[i] + 0.7152*d[i+1] + 0.0722*d[i+2]) / 255;\n' +
+      '    const r = pitch * 0.42 * Math.pow(lum, 1.4);\n' +
+      '    if(r < 0.3) continue;\n' +
+      '    ctx.beginPath(); ctx.arc(x*pitch + pitch/2, y*pitch + pitch/2, r, 0, Math.PI*2); ctx.fill();\n' +
+      '  }\n' +
+      '}';
+  }
+  return '<canvas id="ht" width="428" height="90" style="background:#0d0d0f;border:1px solid #3a322c;border-radius:8px;"></canvas>\n\n' +
+    '<script>\n' +
+    '// Halftone screenshot treatment -- ' + styleName + ' dots (' + color + ') on #0d0d0f, pitch ' + p.halftoneSize + 'px.\n' +
+    '// Bright areas of the source image become big dots (newspaper / departure-board look).\n' +
+    'function drawHalftone(canvas, img){\n' +
+    '  var pitch = ' + p.halftoneSize + ', ctx = canvas.getContext("2d");\n' +
+    '  var W = canvas.width, H = canvas.height;\n' +
+    '  var cols = Math.ceil(W / pitch), rows = Math.ceil(H / pitch);\n' +
+    '  // sample: one pixel per grid cell\n' +
+    '  var s = document.createElement("canvas"); s.width = cols; s.height = rows;\n' +
+    '  s.getContext("2d").drawImage(img, 0, 0, cols, rows);\n' +
+    '  var d = s.getContext("2d").getImageData(0, 0, cols, rows).data;\n' +
+    '  ctx.fillStyle = "#0d0d0f"; ctx.fillRect(0, 0, W, H);\n' +
+    '  ctx.fillStyle = "' + color + '";\n' +
+    '  for(var y = 0; y < rows; y++) for(var x = 0; x < cols; x++){\n' +
+    '    var i = (y * cols + x) * 4;\n' +
+    '    var lum = (0.2126*d[i] + 0.7152*d[i+1] + 0.0722*d[i+2]) / 255;\n' +
+    '    var r = pitch * 0.42 * Math.pow(lum, 1.4);\n' +
+    '    if(r < 0.3) continue;\n' +
+    '    ctx.beginPath(); ctx.arc(x*pitch + pitch/2, y*pitch + pitch/2, r, 0, Math.PI*2); ctx.fill();\n' +
+    '  }\n' +
+    '}\n' +
+    '// Usage: drawHalftone(document.getElementById("ht"), screenshotImage);\n' +
+    '// For crisp dots on retina, scale canvas.width/height by devicePixelRatio.\n' +
+    '// Develop sweep + dpr handling: see visualizer-playground.html (Concept D).\n' +
+    '</' + 'script>';
+}
+
+function generateCode(concept, fmt){
+  if(concept === "a") return generateCodeA(fmt);
+  if(concept === "b") return generateCodeB(fmt);
+  if(concept === "c") return generateCodeC(fmt);
+  if(concept === "d") return generateCodeD(fmt);
+  return "";
+}
+
+/* ==========================================================================
+   PARAM SUMMARY / GENERATE PROMPT / RANDOM / RESET
+   ========================================================================== */
+function paramsSummary(){
+  var p = params;
+  return "accent/LED color " + p.accent + ", letter/cream color " + p.cream + ", box background " + p.boxBg +
+    ", box size " + p.boxW + "x" + p.boxH + "px, corner radius " + p.radius + "px, " + p.cells +
+    " character cells, flip/scroll speed " + p.speed + "x, glow intensity " + p.glow +
+    ", dot pitch " + p.dotPitch + "px, steam density " + p.steamDensity +
+    ", halftone dot size " + p.halftoneSize + "px, halftone style " +
+    (p.halftoneStyle === "ivory" ? "ivory" : "amber mono") +
+    ', demo transcript "' + p.transcript + '"';
+}
+function generatePrompt(){
+  var text = "Create a retro train-station visualizer box with " + paramsSummary() + ".";
+  console.log(text);
+  copyText(text, "Prompt copied to clipboard");
+}
+function randomHex(){ return "#" + Math.floor(Math.random() * 0xffffff).toString(16).padStart(6, "0"); }
+function randInt(min, max){ return Math.floor(min + Math.random() * (max - min + 1)); }
+function randomizeParams(){
+  params.accent = randomHex();
+  params.cream = randomHex();
+  params.boxBg = randomHex();
+  params.boxW = randInt(90, 160);
+  params.boxH = randInt(36, 64);
+  params.radius = randInt(0, 16);
+  params.cells = randInt(4, 10);
+  params.speed = parseFloat((Math.random() * 1.5 + 0.5).toFixed(1));
+  params.glow = randInt(0, 10);
+  params.dotPitch = randInt(2, 5);
+  params.steamDensity = randInt(1, 10);
+  params.halftoneSize = randInt(3, 10);
+  params.halftoneStyle = Math.random() < 0.5 ? "amber" : "ivory";
+  refreshAll();
+}
+function resetParams(){
+  Object.keys(DEFAULTS).forEach(function(k){ params[k] = DEFAULTS[k]; });
+  refreshAll();
+}
+
+/* ==========================================================================
+   URL HASH STATE
+   ========================================================================== */
+var hashTimer = null;
+function encodeHash(){
+  return Object.keys(params).map(function(k){
+    return k + "=" + encodeURIComponent(params[k]);
+  }).join("&");
+}
+function persistHash(){
+  clearTimeout(hashTimer);
+  hashTimer = setTimeout(function(){
+    history.replaceState(null, "", "#" + encodeHash());
+  }, 300);
+}
+function loadFromHash(){
+  if(!location.hash) return;
+  var s = location.hash.slice(1);
+  s.split("&").forEach(function(pair){
+    var idx = pair.indexOf("=");
+    if(idx < 0) return;
+    var k = pair.slice(0, idx);
+    var v = decodeURIComponent(pair.slice(idx + 1) || "");
+    if(!(k in DEFAULTS)) return;
+    var defVal = DEFAULTS[k];
+    if(typeof defVal === "number"){ var n = parseFloat(v); if(!isNaN(n)) params[k] = n; }
+    else if(typeof defVal === "boolean"){ params[k] = v === "true"; }
+    else { params[k] = v; }
+  });
+}
+
+/* ==========================================================================
+   SIDEBAR CONTROLS: sync + binding
+   ========================================================================== */
+var CONTROL_MAP = [
+  ["ctrl-accent", "accent", "val-accent", null],
+  ["ctrl-cream", "cream", "val-cream", null],
+  ["ctrl-boxbg", "boxBg", "val-boxbg", null],
+  ["ctrl-boxw", "boxW", "val-boxw", "px"],
+  ["ctrl-boxh", "boxH", "val-boxh", "px"],
+  ["ctrl-radius", "radius", "val-radius", "px"],
+  ["ctrl-cells", "cells", "val-cells", ""],
+  ["ctrl-speed", "speed", "val-speed", "x"],
+  ["ctrl-glow", "glow", "val-glow", ""],
+  ["ctrl-pitch", "dotPitch", "val-pitch", "px"],
+  ["ctrl-steam", "steamDensity", "val-steam", ""],
+  ["ctrl-halftone-size", "halftoneSize", "val-halftone-size", "px"]
+];
+function syncControlValueLabels(){
+  CONTROL_MAP.forEach(function(row){
+    var valEl = document.getElementById(row[2]);
+    if(!valEl) return;
+    var v = params[row[1]];
+    if(row[3] === "x") valEl.textContent = Number(v).toFixed(1) + "x";
+    else if(row[3] !== null) valEl.textContent = v + row[3];
+    else valEl.textContent = String(v);
+  });
+  var htStyleVal = document.getElementById("val-halftone-style");
+  if(htStyleVal) htStyleVal.textContent = params.halftoneStyle === "ivory" ? "Ivory" : "Amber mono";
+}
+function syncControlsFromParams(){
+  CONTROL_MAP.forEach(function(row){
+    var input = document.getElementById(row[0]);
+    if(input) input.value = params[row[1]];
+  });
+  var transcriptEl = document.getElementById("ctrl-transcript");
+  if(transcriptEl) transcriptEl.value = params.transcript;
+  var htStyleEl = document.getElementById("ctrl-halftone-style");
+  if(htStyleEl) htStyleEl.value = params.halftoneStyle;
+  var fmtEl = document.getElementById("ctrl-export-format");
+  if(fmtEl) fmtEl.value = params.exportFormat;
+  var playBtn = document.getElementById("ctrl-play");
+  if(playBtn) playBtn.textContent = params.playing ? "⏸ Pause" : "▶ Play";
+  syncControlValueLabels();
+}
+function refreshAll(){
+  updateCssVars();
+  resizeAll();
+  updateContrastBadges();
+  syncControlsFromParams();
+  applyTheme();
+  applyViewport();
+  persistHash();
+}
+function onParamChange(){
+  updateCssVars();
+  resizeAll();
+  updateContrastBadges();
+  syncControlValueLabels();
+  persistHash();
+}
+
+function bindControls(){
+  CONTROL_MAP.forEach(function(row){
+    var el = document.getElementById(row[0]);
+    if(!el) return;
+    var isColor = el.type === "color";
+    el.addEventListener("input", function(){
+      params[row[1]] = isColor ? el.value : parseFloat(el.value);
+      onParamChange();
+    });
+  });
+
+  var transcriptEl = document.getElementById("ctrl-transcript");
+  transcriptEl.addEventListener("input", function(){
+    params.transcript = transcriptEl.value;
+    persistHash();
+  });
+
+  document.getElementById("ctrl-halftone-style").addEventListener("change", function(e){
+    params.halftoneStyle = e.target.value;
+    onParamChange();
+  });
+
+  var playBtn = document.getElementById("ctrl-play");
+  playBtn.addEventListener("click", function(){
+    params.playing = !params.playing;
+    playBtn.textContent = params.playing ? "⏸ Pause" : "▶ Play";
+    persistHash();
+  });
+
+  document.getElementById("btn-generate-prompt").addEventListener("click", generatePrompt);
+  document.getElementById("btn-random").addEventListener("click", randomizeParams);
+  document.getElementById("btn-reset").addEventListener("click", resetParams);
+
+  document.getElementById("ctrl-export-format").addEventListener("change", function(e){
+    params.exportFormat = e.target.value;
+    persistHash();
+  });
+
+  document.getElementById("btn-theme-toggle").addEventListener("click", function(){
+    params.theme = params.theme === "light" ? "dark" : "light";
+    applyTheme();
+    persistHash();
+  });
+
+  document.querySelectorAll(".vp-btn").forEach(function(btn){
+    btn.addEventListener("click", function(){
+      params.viewport = btn.dataset.vp;
+      applyViewport();
+      persistHash();
+    });
+  });
+
+  document.querySelectorAll(".copy-btn").forEach(function(btn){
+    btn.addEventListener("click", function(){
+      var concept = btn.dataset.concept;
+      var code = generateCode(concept, params.exportFormat);
+      copyText(code, "Copied Concept " + concept.toUpperCase() + " code");
+    });
+  });
+}
+
+/* ==========================================================================
+   KEYBOARD SHORTCUTS
+   ========================================================================== */
+function onKeydown(e){
+  var tag = document.activeElement ? document.activeElement.tagName : "";
+  if(tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
+  var key = e.key.toLowerCase();
+  if(key === "r"){ randomizeParams(); }
+  else if(key === "c"){ generatePrompt(); }
+  else if(key === "d"){
+    params.theme = params.theme === "light" ? "dark" : "light";
+    applyTheme();
+    persistHash();
+  }
+}
+
+/* ==========================================================================
+   INIT
+   ========================================================================== */
+function init(){
+  loadFromHash();
+  buildInstances();
+  bindControls();
+  syncControlsFromParams();
+  updateCssVars();
+  resizeAll();
+  updateContrastBadges();
+  applyTheme();
+  applyViewport();
+  subscribe(function(eng, dt){
+    allInstances.forEach(function(inst){ inst.onEngine(eng, dt); });
+    updateFakeInputs(eng);
+  });
+  document.addEventListener("keydown", onKeydown);
+}
+
+if(document.readyState === "loading"){
+  document.addEventListener("DOMContentLoaded", init);
+} else {
+  init();
+}
+
+})();
+</script>
+</body>
+</html>
