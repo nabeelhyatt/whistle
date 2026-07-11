@@ -53,21 +53,21 @@ fi
 echo "$$" > "$LOCK_DIR/pid"
 trap 'rm -rf "$LOCK_DIR"' EXIT
 
-# --- Compare origin/main to what's checked out --------------------------------
+# --- Compare origin/main to what was last successfully installed --------------
 cd "$REPO_DIR"
 REMOTE_SHA="$(git ls-remote origin refs/heads/main | cut -f1)"
-LOCAL_SHA="$(git rev-parse HEAD)"
+INSTALLED_SHA="$(cat "$STATE_DIR/installed-commit" 2>/dev/null || true)"
 
 if [[ -z "$REMOTE_SHA" ]]; then
   log "ERROR: could not read origin/main (network down?) — exiting"
   exit 1
 fi
 
-if [[ "$REMOTE_SHA" == "$LOCAL_SHA" ]]; then
+if [[ -n "$INSTALLED_SHA" && "$REMOTE_SHA" == "$INSTALLED_SHA" ]]; then
   exit 0
 fi
 
-log "origin/main moved ($LOCAL_SHA -> $REMOTE_SHA) — rebuilding"
+log "origin/main moved ($INSTALLED_SHA -> $REMOTE_SHA) — rebuilding"
 git fetch origin main --quiet
 git reset --hard origin/main --quiet
 

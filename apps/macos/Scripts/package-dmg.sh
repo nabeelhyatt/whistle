@@ -69,120 +69,35 @@ else
   log ".env.local not found at $ENV_FILE — relying on ambient environment"
 fi
 
-# --- Generate the Xcode project ----------------------------------------------
-cd "$MACOS_DIR"
-if ! command -v xcodegen >/dev/null 2>&1; then
-  log "ERROR: xcodegen not installed (brew install xcodegen)"
-  exit 1
-fi
-log "Generating Whistle.xcodeproj from project.yml"
-xcodegen generate --quiet
-
-# --- Signing identity (env-gated) ----------------------------------------------
-# project.yml pins CODE_SIGN_IDENTITY="Developer ID Application" for Release.
-# When no such identity exists (e.g. CI before secrets are provisioned,
-# see SECRETS.md), fall back to ad-hoc so the build still succeeds — the
-# artifact is then explicitly non-distributable.
-HAVE_SIGNING_IDENTITY=0
-SIGN_TEAM="${SIGN_TEAM:-}"
-IDENTITY_LINE="$(security find-identity -v -p codesigning 2>/dev/null | grep "$SIGN_IDENTITY" | head -n1 || true)"
-if [[ -n "$IDENTITY_LINE" ]]; then
-  HAVE_SIGNING_IDENTITY=1
-  # Manual signing needs DEVELOPMENT_TEAM as well as the identity; derive
-  # the team ID from the identity's own name, e.g.
-  #   "Developer ID Application: Nabeel HYATT (73JZ8HJ79F)" -> 73JZ8HJ79F
-  if [[ -z "$SIGN_TEAM" ]]; then
-    SIGN_TEAM="$(sed -n 's/.*(\([A-Z0-9]\{10\}\))".*/\1/p' <<<"$IDENTITY_LINE")"
-  fi
-  log "Signing identity found: \"$SIGN_IDENTITY\" (team: ${SIGN_TEAM:-<none>})"
-else
-  log "SKIP Developer ID signing: no \"$SIGN_IDENTITY\" identity in the keychain — building ad-hoc signed (NOT distributable; see SECRETS.md)"
-fi
-
-# --- Build --------------------------------------------------------------------
+# --- Build + sign + verify (shared with install-local.sh) ---------------------
+# See build-and-sign.sh for xcodegen project generation, signing-identity
+# detection, the xcodebuild invocation, Sparkle nested-component
+# re-signing, and the codesign --verify --deep --strict check — extracted
+# there so a fix to any of that doesn't have to be duplicated by hand into
+# install-local.sh (or vice versa).
 log "Building Whistle ($CONFIGURATION)"
 rm -rf "$DIST_DIR"
 mkdir -p "$DIST_DIR"
-
-XCODEBUILD_ARGS=(
-  -project Whistle.xcodeproj
-  -scheme Whistle
-  -configuration "$CONFIGURATION"
-  -derivedDataPath "$DERIVED_DATA"
-  -destination "generic/platform=macOS"
-  # arm64-only on purpose: convex-swift ships an arm64-only
-  # libconvexmobile-rs.xcframework, so a universal (x86_64 slice) Release
-  # build cannot link. Apple Silicon-only distribution until upstream
-  # ships a universal binary.
-  ARCHS=arm64
-  build
-)
-if [[ "$HAVE_SIGNING_IDENTITY" == 1 ]]; then
-  # --timestamp: notarization requires a secure timestamp on every
-  # signature; xcodebuild does not add one for plain (non-archive) builds.
-  # DEVELOPMENT_TEAM: manual signing fails without a team even when the
-  # identity is fully specified.
-  # CODE_SIGN_INJECT_BASE_ENTITLEMENTS=NO: plain (non-archive) builds
-  # otherwise inject com.apple.security.get-task-allow (a debugger
-  # entitlement), which Apple's notary service rejects outright.
-  XCODEBUILD_ARGS+=(
-    OTHER_CODE_SIGN_FLAGS=--timestamp
-    "DEVELOPMENT_TEAM=$SIGN_TEAM"
-    CODE_SIGN_INJECT_BASE_ENTITLEMENTS=NO
-  )
-else
-  XCODEBUILD_ARGS+=(CODE_SIGN_IDENTITY=- DEVELOPMENT_TEAM=)
-fi
-xcodebuild "${XCODEBUILD_ARGS[@]}" | tail -n 5
-
-APP_PATH="$DERIVED_DATA/Build/Products/$CONFIGURATION/Whistle.app"
-if [[ ! -d "$APP_PATH" ]]; then
-  log "ERROR: built app not found at $APP_PATH"
-  exit 1
-fi
+APP_PATH="$(
+  CONFIGURATION="$CONFIGURATION" \
+  SIGN_IDENTITY="$SIGN_IDENTITY" \
+  SIGN_TEAM="${SIGN_TEAM:-}" \
+  DEVELOPER_DIR="$DEVELOPER_DIR" \
+  DERIVED_DATA_DIR="$DERIVED_DATA" \
+  "$SCRIPT_DIR/build-and-sign.sh"
+)"
 
 VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP_PATH/Contents/Info.plist")"
 log "Built Whistle.app version $VERSION"
 
-# --- Re-sign Sparkle's nested components ----------------------------------------
-# SPM-distributed Sparkle.framework ships with Sparkle's own signatures on
-# its nested code (XPC services, Autoupdate, Updater.app), and xcodebuild
-# does NOT deep re-sign those on embed — Apple's notary service rejects
-# them ("not signed with a valid Developer ID certificate" / "signature
-# does not include a secure timestamp"). Re-sign inside-out with our
-# identity, hardened runtime, and a secure timestamp, per Sparkle's own
-# signing docs. Downloader.xpc keeps its upstream entitlements
-# (--preserve-metadata=entitlements); the app is re-signed last so its
-# seal covers the updated framework.
-if [[ "$HAVE_SIGNING_IDENTITY" == 1 ]]; then
-  SPARKLE_FW="$APP_PATH/Contents/Frameworks/Sparkle.framework"
-  if [[ -d "$SPARKLE_FW" ]]; then
-    log "Re-signing Sparkle.framework nested components for notarization"
-    codesign -f -s "$SIGN_IDENTITY" -o runtime --timestamp --preserve-metadata=entitlements \
-      "$SPARKLE_FW/Versions/B/XPCServices/Downloader.xpc"
-    codesign -f -s "$SIGN_IDENTITY" -o runtime --timestamp \
-      "$SPARKLE_FW/Versions/B/XPCServices/Installer.xpc"
-    codesign -f -s "$SIGN_IDENTITY" -o runtime --timestamp \
-      "$SPARKLE_FW/Versions/B/Autoupdate"
-    codesign -f -s "$SIGN_IDENTITY" -o runtime --timestamp \
-      "$SPARKLE_FW/Versions/B/Updater.app"
-    codesign -f -s "$SIGN_IDENTITY" -o runtime --timestamp \
-      "$SPARKLE_FW"
-    log "Re-signing Whistle.app (seal over the re-signed framework)"
-    # Use the PROCESSED entitlements from the Xcode-signed app, not the
-    # source Whistle.entitlements: the source file contains
-    # $(PRODUCT_BUNDLE_IDENTIFIER) substitutions that only Xcode expands.
-    APP_ENTITLEMENTS="$DIST_DIR/app-entitlements.plist"
-    codesign -d --entitlements - --xml "$APP_PATH" > "$APP_ENTITLEMENTS"
-    codesign -f -s "$SIGN_IDENTITY" -o runtime --timestamp \
-      --entitlements "$APP_ENTITLEMENTS" \
-      "$APP_PATH"
-  fi
+# Re-derive whether the app is genuinely Developer ID signed (vs. ad-hoc)
+# from the artifact itself, so the DMG-signing/notarization gating below
+# always matches what build-and-sign.sh actually did — no separate
+# keychain lookup to keep in sync.
+HAVE_SIGNING_IDENTITY=0
+if codesign -dvvv "$APP_PATH" 2>&1 | grep -q '^Authority='; then
+  HAVE_SIGNING_IDENTITY=1
 fi
-
-# --- Verify the app signature --------------------------------------------------
-log "Verifying app signature (codesign --verify --deep --strict)"
-codesign --verify --deep --strict --verbose=2 "$APP_PATH"
 
 # --- Package the DMG ------------------------------------------------------------
 DMG_PATH="$DIST_DIR/Whistle-$VERSION.dmg"
