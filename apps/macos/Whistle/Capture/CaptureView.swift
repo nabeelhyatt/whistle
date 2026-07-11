@@ -29,7 +29,7 @@ struct CaptureView: View {
     @FocusState private var transcriptFieldFocused: Bool
     @FocusState private var projectPickerFocused: Bool
 
-    private static let halftoneStripSize = CGSize(width: 412, height: 74)
+    fileprivate static let captureBoxSize = CGSize(width: 200, height: 74)
 
     var body: some View {
         VStack(spacing: 0) {
@@ -85,8 +85,14 @@ struct CaptureView: View {
 
     private var header: some View {
         HStack(spacing: 8) {
-            Image(systemName: "tram.fill")
-                .foregroundStyle(PanelTheme.iconMuted)
+            Image(nsImage: NSImage(named: NSImage.applicationIconName) ?? NSApp.applicationIconImage)
+                .resizable()
+                .frame(width: 20, height: 20)
+                .clipShape(RoundedRectangle(cornerRadius: 4, style: .continuous))
+
+            Text("Whistle to Conductor")
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(PanelTheme.ink)
 
             Spacer()
 
@@ -167,7 +173,7 @@ struct CaptureView: View {
         VStack(alignment: .leading, spacing: 8) {
             transcriptEditor
             notesEditor
-            halftoneStrip
+            captureBoxesRow
         }
         .padding(9)
         .background(Color.white.opacity(0.03))
@@ -218,10 +224,20 @@ struct CaptureView: View {
             .clipShape(RoundedRectangle(cornerRadius: PanelTheme.notesSubmitRadius, style: .continuous))
     }
 
+    /// Two equal-width boxes, always shown, so the input card reads as a
+    /// matched pair of "things you can attach" slots rather than a
+    /// screenshot-only strip that pops in/out of layout.
+    private var captureBoxesRow: some View {
+        HStack(spacing: 8) {
+            screenshotBox
+            uploadBox
+        }
+    }
+
     @ViewBuilder
-    private var halftoneStrip: some View {
+    private var screenshotBox: some View {
+        let size = Self.captureBoxSize
         if let data = viewModel.screenshotData {
-            let size = Self.halftoneStripSize
             ZStack(alignment: .topTrailing) {
                 if let halftone = HalftoneImage.render(data, displaySize: size) {
                     Image(nsImage: halftone)
@@ -246,14 +262,31 @@ struct CaptureView: View {
                 .padding(6)
                 .help("Remove screenshot")
             }
-            .frame(width: size.width, height: size.height)
-            .background(PanelTheme.railBackground)
-            .clipShape(RoundedRectangle(cornerRadius: PanelTheme.thumbRadius, style: .continuous))
-            .overlay {
-                RoundedRectangle(cornerRadius: PanelTheme.thumbRadius, style: .continuous)
-                    .strokeBorder(PanelTheme.borderHigh, lineWidth: 1)
+            .captureBoxChrome()
+        } else {
+            VStack(spacing: 4) {
+                Image(systemName: "photo")
+                    .foregroundStyle(PanelTheme.iconMuted)
+                Text("Screenshot")
+                    .font(.system(size: 10))
+                    .foregroundStyle(PanelTheme.placeholderInk)
             }
+            .captureBoxChrome()
         }
+    }
+
+    /// Static mockup only -- no tap target, no drop target, no file picker
+    /// wiring yet. Purely establishes the paired-box layout for a future
+    /// "add image / doc" affordance.
+    private var uploadBox: some View {
+        VStack(spacing: 4) {
+            Image(systemName: "square.and.arrow.up")
+                .foregroundStyle(PanelTheme.iconMuted)
+            Text("Add image / doc")
+                .font(.system(size: 10))
+                .foregroundStyle(PanelTheme.placeholderInk)
+        }
+        .captureBoxChrome()
     }
 
     // MARK: - Status rail (mic status, destination project, submit -- everything about STATE)
@@ -305,8 +338,10 @@ struct CaptureView: View {
     }
 
     private var submitButton: some View {
-        Button("Submit") {
+        Button {
             onSubmit()
+        } label: {
+            Label("Submit", systemImage: "tram.fill")
         }
         .keyboardShortcut(.return, modifiers: [])
         .disabled(!viewModel.canSubmit)
@@ -314,14 +349,40 @@ struct CaptureView: View {
     }
 }
 
+/// Shared chrome for the two capture-card boxes (screenshot + upload) so
+/// they're guaranteed to render as an identical matched pair: same fill,
+/// same corner radius, same hairline border -- only the content differs.
+private struct CaptureBoxChrome: ViewModifier {
+    func body(content: Content) -> some View {
+        content
+            .frame(width: CaptureView.captureBoxSize.width, height: CaptureView.captureBoxSize.height)
+            .background(PanelTheme.railBackground)
+            .clipShape(RoundedRectangle(cornerRadius: PanelTheme.thumbRadius, style: .continuous))
+            .overlay {
+                RoundedRectangle(cornerRadius: PanelTheme.thumbRadius, style: .continuous)
+                    .strokeBorder(PanelTheme.borderHigh, lineWidth: 1)
+            }
+    }
+}
+
+private extension View {
+    func captureBoxChrome() -> some View {
+        modifier(CaptureBoxChrome())
+    }
+}
+
 /// Submit is the one Action element in the dual-accent system: fixed
 /// Whistle Orange background, white ink -- never the amber used for
-/// instrumentation elsewhere on the rail.
+/// instrumentation elsewhere on the rail. The tram glyph rides left of the
+/// label (not tinted amber -- it inherits the same white ink as "Submit"
+/// since it's part of this one Action element, not an instrumentation cue).
 private struct SubmitButtonStyle: ButtonStyle {
     @Environment(\.isEnabled) private var isEnabled
 
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
+            .labelStyle(.titleAndIcon)
+            .imageScale(.small)
             .font(.system(size: 12, weight: .bold))
             .foregroundStyle(.white)
             .padding(.horizontal, 16)
