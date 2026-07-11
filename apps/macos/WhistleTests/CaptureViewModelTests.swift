@@ -970,7 +970,7 @@ final class CapturePanelControllerTests: XCTestCase {
             defer { try? FileManager.default.removeItem(at: tempDir) }
             try store.saveProjectsSnapshot([TestSupport.project1])
 
-            let controller = CapturePanelController(store: store, mode: mode, micPermissionStatus: { .granted }, speechPermissionStatus: { .granted })
+            let controller = CapturePanelController(store: store, mode: mode, micPermissionStatus: { .granted }, speechPermissionStatus: { .granted }, transcriptionServiceFactory: { FakeTranscriptionService() })
             controller.trigger()
             // Poll rather than a fixed sleep: `.activating` mode's
             // NSApp.activate()/makeKeyAndOrderFront() can lag under
@@ -998,7 +998,7 @@ final class CapturePanelControllerTests: XCTestCase {
 
             let counter = CaptureCounter()
             let screenshotService = makeCountingScreenshotService(counter: counter)
-            let controller = CapturePanelController(store: store, screenshotService: screenshotService, mode: mode, micPermissionStatus: { .granted }, speechPermissionStatus: { .granted })
+            let controller = CapturePanelController(store: store, screenshotService: screenshotService, mode: mode, micPermissionStatus: { .granted }, speechPermissionStatus: { .granted }, transcriptionServiceFactory: { FakeTranscriptionService() })
 
             controller.trigger()
             // Allow the async screenshot capture task to run.
@@ -1022,7 +1022,7 @@ final class CapturePanelControllerTests: XCTestCase {
 
             let counter = CaptureCounter()
             let screenshotService = makeCountingScreenshotService(counter: counter)
-            let controller = CapturePanelController(store: store, screenshotService: screenshotService, mode: mode, micPermissionStatus: { .granted }, speechPermissionStatus: { .granted })
+            let controller = CapturePanelController(store: store, screenshotService: screenshotService, mode: mode, micPermissionStatus: { .granted }, speechPermissionStatus: { .granted }, transcriptionServiceFactory: { FakeTranscriptionService() })
 
             controller.trigger()
             try await Task.sleep(nanoseconds: 20_000_000)
@@ -1055,7 +1055,7 @@ final class CapturePanelControllerTests: XCTestCase {
         let (store, tempDir) = try makeStore()
         defer { try? FileManager.default.removeItem(at: tempDir) }
 
-        let controller = CapturePanelController(store: store, micPermissionStatus: { .granted }, speechPermissionStatus: { .granted })
+        let controller = CapturePanelController(store: store, micPermissionStatus: { .granted }, speechPermissionStatus: { .granted }, transcriptionServiceFactory: { FakeTranscriptionService() })
         controller.trigger()
         try await Whistle_waitUntil { controller.isPanelOpen }
 
@@ -1076,7 +1076,7 @@ final class CapturePanelControllerTests: XCTestCase {
 
         let counter = CaptureCounter()
         let screenshotService = makeCountingScreenshotService(counter: counter)
-        let controller = CapturePanelController(store: store, screenshotService: screenshotService, micPermissionStatus: { .granted }, speechPermissionStatus: { .granted })
+        let controller = CapturePanelController(store: store, screenshotService: screenshotService, micPermissionStatus: { .granted }, speechPermissionStatus: { .granted }, transcriptionServiceFactory: { FakeTranscriptionService() })
 
         controller.trigger()
         try await Task.sleep(nanoseconds: 20_000_000)
@@ -1106,7 +1106,7 @@ final class CapturePanelControllerTests: XCTestCase {
         let (store, tempDir) = try makeStore()
         defer { try? FileManager.default.removeItem(at: tempDir) }
 
-        let controller = CapturePanelController(store: store, micPermissionStatus: { .granted }, speechPermissionStatus: { .granted })
+        let controller = CapturePanelController(store: store, micPermissionStatus: { .granted }, speechPermissionStatus: { .granted }, transcriptionServiceFactory: { FakeTranscriptionService() })
         controller.trigger()
         try await Whistle_waitUntil { controller.isPanelOpen }
 
@@ -1137,7 +1137,8 @@ final class CapturePanelControllerTests: XCTestCase {
             store: store,
             refreshProjectsIfStale: { refreshCallCount += 1 },
             micPermissionStatus: { .granted },
-            speechPermissionStatus: { .granted }
+            speechPermissionStatus: { .granted },
+            transcriptionServiceFactory: { FakeTranscriptionService() }
         )
 
         controller.trigger()

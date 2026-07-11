@@ -81,6 +81,17 @@ public final class CapturePanelController: NSObject, NSWindowDelegate {
     private let requestMicPermission: @MainActor () async -> Bool
     private let speechPermissionStatus: @MainActor () -> PermissionState
     private let requestSpeechPermission: @MainActor () async -> Bool
+    /// Threaded straight into every `CaptureViewModel` this controller
+    /// creates, matching `CaptureViewModel`'s own default. Tests that
+    /// hardcode `micPermissionStatus`/`speechPermissionStatus` as `.granted`
+    /// (to exercise the transcription-starts path) must ALSO override this
+    /// with a fake -- otherwise `beginRunningTranscription()` constructs a
+    /// real `TranscriptionServiceFactory.make()` transcriber, which starts a
+    /// real `AVAudioEngine` tap. On hardware-less CI runners that traps
+    /// fatally deep inside AVFAudio (uncatchable), looping xcodebuild's
+    /// crash recovery for hours -- see the CI-spend incident this seam
+    /// exists to prevent.
+    private let transcriptionServiceFactory: () -> any TranscriptionService
 
     private var panel: NSPanel?
     private var viewModel: CaptureViewModel?
@@ -142,7 +153,8 @@ public final class CapturePanelController: NSObject, NSWindowDelegate {
         micPermissionStatus: @escaping @MainActor () -> PermissionState = { MicPermission.status() },
         requestMicPermission: @escaping @MainActor () async -> Bool = { await MicPermission.request() },
         speechPermissionStatus: @escaping @MainActor () -> PermissionState = { SpeechRecognitionPermission.status() },
-        requestSpeechPermission: @escaping @MainActor () async -> Bool = { await SpeechRecognitionPermission.request() }
+        requestSpeechPermission: @escaping @MainActor () async -> Bool = { await SpeechRecognitionPermission.request() },
+        transcriptionServiceFactory: @escaping () -> any TranscriptionService = { TranscriptionServiceFactory.make() }
     ) {
         self.store = store
         self.screenshotService = screenshotService
@@ -152,6 +164,7 @@ public final class CapturePanelController: NSObject, NSWindowDelegate {
         self.requestMicPermission = requestMicPermission
         self.speechPermissionStatus = speechPermissionStatus
         self.requestSpeechPermission = requestSpeechPermission
+        self.transcriptionServiceFactory = transcriptionServiceFactory
         super.init()
     }
 
@@ -240,6 +253,7 @@ public final class CapturePanelController: NSObject, NSWindowDelegate {
         let viewModel = CaptureViewModel(
             store: store,
             screenshotService: screenshotService,
+            transcriptionServiceFactory: transcriptionServiceFactory,
             micPermissionStatus: micPermissionStatus,
             requestMicPermission: requestMicPermission,
             speechPermissionStatus: speechPermissionStatus,
