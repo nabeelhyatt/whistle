@@ -165,17 +165,20 @@ public actor SyncEngine {
     private let convex: any ConvexServiceProtocol
     private let uploader: any ScreenshotUploading
     private let networkMonitor: (any NetworkMonitoring)?
+    private let logger: @Sendable (String) -> Void
 
     public init(
         store: CaptureStore,
         convex: any ConvexServiceProtocol,
         uploader: any ScreenshotUploading = URLSessionScreenshotUploader(),
-        networkMonitor: (any NetworkMonitoring)? = nil
+        networkMonitor: (any NetworkMonitoring)? = nil,
+        logger: @escaping @Sendable (String) -> Void = { NSLog("%@", $0) }
     ) {
         self.store = store
         self.convex = convex
         self.uploader = uploader
         self.networkMonitor = networkMonitor
+        self.logger = logger
     }
 
     /// Attempts to drain every `queued`/`syncFailed` draft once, in
@@ -194,8 +197,14 @@ public actor SyncEngine {
         do {
             drafts = try store.drafts(in: [.queued, .syncFailed])
         } catch {
+            logger("Whistle: SyncEngine failed to read pending drafts: \(error)")
             return []
         }
+
+        if drafts.isEmpty {
+            return []
+        }
+        logger("Whistle: SyncEngine draining \(drafts.count) draft(s)")
 
         var synced: [String] = []
         for draft in drafts {
@@ -204,6 +213,7 @@ public actor SyncEngine {
                 let serverId = try await syncOne(draft)
                 try store.updateLocalState(clientId: draft.clientId, to: .synced, serverId: serverId, localError: nil)
                 synced.append(draft.clientId)
+                logger("Whistle: SyncEngine synced \(draft.clientId) -> \(serverId)")
             } catch {
                 _ = try? store.incrementLocalAttempt(clientId: draft.clientId)
                 _ = try? store.updateLocalState(
@@ -211,6 +221,7 @@ public actor SyncEngine {
                     to: .syncFailed,
                     localError: String(describing: error)
                 )
+                logger("Whistle: SyncEngine sync failed for \(draft.clientId): \(error)")
             }
         }
         return synced

@@ -7,6 +7,22 @@ import Foundation
 import XCTest
 @testable import WhistleCore
 
+// MARK: - Log collector for the injected SyncEngine logger
+
+/// Minimal thread-safe sink for `SyncEngine`'s injected `logger` closure so
+/// tests can assert on emitted messages without touching real `NSLog`
+/// output (plan U2: logger seam for Console.app/`log stream` visibility).
+final class LogCollector: @unchecked Sendable {
+    private let lock = NSLock()
+    private(set) var messages: [String] = []
+
+    func log(_ message: String) {
+        lock.lock()
+        messages.append(message)
+        lock.unlock()
+    }
+}
+
 final class SyncEngineTests: XCTestCase {
     private var tempDir: URL!
 
@@ -185,5 +201,105 @@ final class SyncEngineTests: XCTestCase {
         XCTAssertEqual(synced, ["good"])
         XCTAssertEqual(try store.draft(clientId: "good")?.localState, .synced)
         XCTAssertEqual(try store.draft(clientId: "bad")?.localState, .syncFailed)
+    }
+
+    // MARK: - Logging (plan U2): failures visible via the injected logger seam
+
+    func testSuccessfulSyncLogsSyncedMessage() async throws {
+        let (store, tempDir) = try TestSupport.makeStore()
+        self.tempDir = tempDir
+
+        let draft = TestSupport.makeDraft(clientId: "log-happy")
+        try store.saveDraft(draft)
+
+        let convex = FakeConvexService()
+        let logs = LogCollector()
+        let engine = SyncEngine(store: store, convex: convex, logger: logs.log)
+
+        let synced = await engine.drainOnce()
+
+        XCTAssertEqual(synced, ["log-happy"])
+        XCTAssertTrue(
+            logs.messages.contains { $0.contains("synced log-happy") },
+            "expected a 'synced <clientId>' log message, got: \(logs.messages)"
+        )
+    }
+
+    func testCapturesCreateFailureLogsSyncFailedMessage() async throws {
+        let (store, tempDir) = try TestSupport.makeStore()
+        self.tempDir = tempDir
+
+        let draft = TestSupport.makeDraft(clientId: "log-fail")
+        try store.saveDraft(draft)
+
+        let convex = FakeConvexService()
+        convex.onCapturesCreate = { _ in
+            throw ConvexServiceError.requestFailed("simulated failure")
+        }
+
+        let logs = LogCollector()
+        let engine = SyncEngine(store: store, convex: convex, logger: logs.log)
+
+        let synced = await engine.drainOnce()
+
+        XCTAssertEqual(synced, [])
+        XCTAssertEqual(try store.draft(clientId: "log-fail")?.localState, .syncFailed)
+        XCTAssertTrue(
+            logs.messages.contains { $0.contains("sync failed for log-fail") },
+            "expected a 'sync failed for <clientId>' log message, got: \(logs.messages)"
+        )
+    }
+
+    func testEmptyQueueLogsNoDrainStartMessage() async throws {
+        let (store, tempDir) = try TestSupport.makeStore()
+        self.tempDir = tempDir
+
+        let convex = FakeConvexService()
+        let logs = LogCollector()
+        let engine = SyncEngine(store: store, convex: convex, logger: logs.log)
+
+        let synced = await engine.drainOnce()
+
+        XCTAssertEqual(synced, [])
+        XCTAssertTrue(logs.messages.isEmpty, "expected no log messages for an empty queue, got: \(logs.messages)")
+    }
+
+    // MARK: - Currently-silent `store.drafts(in:)` read failure is now logged
+
+    func testDraftsReadFailureLogsReadFailureMessage() async throws {
+        let (store, tempDir) = try TestSupport.makeStore()
+        self.tempDir = tempDir
+
+        let draft = TestSupport.makeDraft(clientId: "will-be-orphaned")
+        try store.saveDraft(draft)
+
+        // CaptureStore has no public API to simulate a read failure, so this
+        // reaches past it and drops the underlying table via the sqlite3 CLI
+        // -- the same failure shape a real corrupted/locked DB would produce
+        // for `store.drafts(in:)`, which today fails silently inside
+        // `drainOnce()`.
+        let dbURL = try XCTUnwrap(
+            try FileManager.default
+                .contentsOfDirectory(at: tempDir, includingPropertiesForKeys: nil)
+                .first { $0.pathExtension == "sqlite" }
+        )
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/sqlite3")
+        process.arguments = [dbURL.path, "DROP TABLE pending_captures;"]
+        try process.run()
+        process.waitUntilExit()
+        XCTAssertEqual(process.terminationStatus, 0, "expected sqlite3 CLI to drop the table successfully")
+
+        let convex = FakeConvexService()
+        let logs = LogCollector()
+        let engine = SyncEngine(store: store, convex: convex, logger: logs.log)
+
+        let synced = await engine.drainOnce()
+
+        XCTAssertEqual(synced, [])
+        XCTAssertTrue(
+            logs.messages.contains { $0.contains("read") },
+            "expected a log message describing the drafts-read failure, got: \(logs.messages)"
+        )
     }
 }
