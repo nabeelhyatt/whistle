@@ -128,6 +128,11 @@ public final class HistoryViewModel: ObservableObject {
     /// >=1 capture `ready` and unopened (TECH-SPEC §4.1 ready-indicator).
     @Published public private(set) var hasUnreadReadyCaptures: Bool = false
 
+    /// Local `syncFailed` rows' "Retry" affordance (`.localRetry`) — wired by
+    /// `AppDelegate` to `syncEngine.drainOnce()`; defaults to no-op so
+    /// previews/tests that don't care can omit it.
+    public var onLocalRetryRequested: () -> Void = {}
+
     private let store: CaptureStore
     private let convex: any ConvexServiceProtocol
     private let notificationService: NotificationServiceProtocol
@@ -317,6 +322,14 @@ public final class HistoryViewModel: ObservableObject {
         }
     }
 
+    /// Local `syncFailed` rows (`.localRetry`): no server record exists yet,
+    /// so there's nothing to `captures.retry` -- instead this re-drains
+    /// `SyncEngine` to retry the local-to-server sync. Wired by
+    /// `AppDelegate` (`onLocalRetryRequested`) to `syncEngine.drainOnce()`.
+    public func localRetry(_ row: HistoryRowViewModel) {
+        onLocalRetryRequested()
+    }
+
     /// "Duplicate as new capture" (TECH-SPEC §4.1 HistoryWindow/
     /// CaptureViewModel rows, PRD F3.6): builds the `CapturePreFill` from
     /// this row's content. Screenshot bytes are resolved by the caller
@@ -355,7 +368,8 @@ struct HistoryWindow: View {
                         onArchive: { viewModel.archive(row) },
                         onRetry: { viewModel.retry(row) },
                         onDuplicate: { onDuplicate(row) },
-                        onOpenSettings: onOpenSettings
+                        onOpenSettings: onOpenSettings,
+                        onLocalRetry: { viewModel.localRetry(row) }
                     )
                 }
                 .listStyle(.plain)

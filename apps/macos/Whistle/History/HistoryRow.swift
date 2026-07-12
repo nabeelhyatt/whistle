@@ -19,6 +19,12 @@ struct HistoryRow: View {
     /// to the real SettingsWindow by U10; defaults to no-op so previews/
     /// tests that don't care can omit it.
     var onOpenSettings: () -> Void = {}
+    /// Local `syncFailed` rows (`.localRetry`): manually re-drains
+    /// `SyncEngine` rather than calling `captures.retry` server-side (there
+    /// is no server record yet). Wired by `AppDelegate` to
+    /// `syncEngine.drainOnce()`; defaults to no-op so previews/tests that
+    /// don't care can omit it.
+    var onLocalRetry: () -> Void = {}
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -103,7 +109,10 @@ struct HistoryRow: View {
             case .openSettingsApiKey:
                 Button("Open Settings", action: onOpenSettings)
                     .buttonStyle(.link)
-            case .localRetry, .automatic, .none:
+            case .localRetry:
+                Button("Retry", action: onLocalRetry)
+                    .buttonStyle(.link)
+            case .automatic, .none:
                 EmptyView()
             }
 

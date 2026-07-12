@@ -141,6 +141,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         self.historyViewModel = historyViewModel
         historyViewModel.start()
 
+        // Manual retry for a capture stuck in local `syncFailed` state
+        // (`.localRetry` affordance): re-drains SyncEngine rather than
+        // calling `captures.retry` server-side (no server record exists
+        // yet for a local-only row).
+        historyViewModel.onLocalRetryRequested = { [weak syncEngine] in
+            Task { await syncEngine?.drainOnce() }
+        }
+
         // Ready-indicator (TECH-SPEC §4.1 StatusItemController row): this
         // unit computes the >=1-ready-and-unopened count from the same
         // subscription HistoryViewModel drives, and pushes it onto the
