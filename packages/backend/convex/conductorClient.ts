@@ -152,12 +152,13 @@ export async function conductorFetch<T = unknown>(
     // Network-level failure (DNS, connection refused, etc.) — always
     // transient per §6. Log so this is visible in the Convex dashboard's
     // live function logs (never log the API key or request body).
+    const message = err instanceof Error ? err.message : String(err);
     console.error(
-      `Conductor API network error: ${method} ${path} — ${(err as Error).message}`,
+      `Conductor API network error: ${method} ${path} — ${message}`,
     );
     throw new ConductorApiError({
       errorClass: "network",
-      userMessage: `Network error calling Conductor API: ${(err as Error).message}`,
+      userMessage: `Network error calling Conductor API: ${message}`,
     });
   }
 

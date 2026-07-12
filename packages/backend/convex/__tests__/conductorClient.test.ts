@@ -44,6 +44,34 @@ describe("conductorFetch logging", () => {
     expect(message).not.toContain("sk-should-never-be-logged");
   });
 
+  test("network-level throw with a non-Error rejection value still stringifies safely (no 'undefined')", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(() => Promise.reject("ECONNREFUSED: connection refused")),
+    );
+
+    let thrown: ConductorApiError | undefined;
+    try {
+      await conductorFetch({
+        apiKey: "sk-should-never-be-logged",
+        method: "GET",
+        path: "/v0/projects",
+      });
+    } catch (err) {
+      thrown = err as ConductorApiError;
+    }
+
+    expect(thrown).toBeInstanceOf(ConductorApiError);
+    expect(thrown?.errorClass).toBe("network");
+    expect(thrown?.userMessage).toContain("ECONNREFUSED: connection refused");
+    expect(thrown?.userMessage).not.toContain("undefined");
+
+    expect(errorSpy).toHaveBeenCalledTimes(1);
+    const [message] = errorSpy.mock.calls[0];
+    expect(message).toContain("ECONNREFUSED: connection refused");
+    expect(message).not.toContain("undefined");
+  });
+
   test("non-2xx response logs method/path/status/errorClass and still throws a classified ConductorApiError", async () => {
     vi.stubGlobal(
       "fetch",

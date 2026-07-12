@@ -476,7 +476,7 @@ async function handleTransientOrTerminal(
   if (capture === null) return;
 
   if (err instanceof ConductorApiError && err.errorClass === "auth") {
-    logPipelineError(origin, captureId, err, { decision: "terminal", errorCode: "auth" });
+    logPipelineError(origin, captureId, err, { decision: "terminal" });
     await patchCapture(ctx, captureId, {
       status: "failed",
       errorCode: "auth",
@@ -512,13 +512,12 @@ async function handleTransientOrTerminal(
         ? err.message
         : String(err);
 
-  logPipelineError(origin, captureId, err, { decision: "terminal", errorCode });
+  logPipelineError(origin, captureId, err, { decision: "terminal" });
   await patchCapture(ctx, captureId, {
     status: "failed",
     errorCode,
     error: errorMessage,
   });
-  void origin;
 }
 
 // ─── pipeline.awaitWorkspaceReady ────────────────────────────────────────
@@ -635,12 +634,13 @@ export const watch = internalAction({
       // Entire body is in try/catch: a thrown error reschedules the watch —
       // it never strands the capture. Deadline is enforced by runWatch's own
       // messageSentAt check on the next tick, not by this catch block.
+      const delay = Math.min(args.backoffMs, WATCH_MAX_MS);
       logPipelineError("watch", args.captureId, err, {
         decision: "rescheduling",
-        backoffMs: Math.min(args.backoffMs, WATCH_MAX_MS),
+        backoffMs: delay,
       });
       await ctx.scheduler.runAfter(
-        Math.min(args.backoffMs, WATCH_MAX_MS),
+        delay,
         internal.pipeline.watch,
         { captureId: args.captureId, backoffMs: Math.min(args.backoffMs * 2, WATCH_MAX_MS) },
       );
