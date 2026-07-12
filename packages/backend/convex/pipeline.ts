@@ -203,6 +203,37 @@ export function extractSummaryAndQuestions(agentText: string): {
 
 // ─── captures.status transition helper (shared by every internal action) ─
 
+/**
+ * Structured `console.error` for pipeline failure chokepoints (U3 — makes
+ * Conductor/pipeline failures visible in the Convex dashboard's live
+ * function logs; DB fields like status/errorCode alone are invisible
+ * there). Never log the API key or a rendered prompt — only the
+ * classification/message already captured on `err`/`extra`.
+ */
+function logPipelineError(
+  stage: string,
+  captureId: Id<"captures">,
+  err: unknown,
+  extra?: Record<string, unknown>,
+): void {
+  const errorCode =
+    err instanceof ConductorApiError ? err.errorClass : undefined;
+  const message =
+    err instanceof Error ? err.message : String(err);
+  const extraStr =
+    extra !== undefined
+      ? " " +
+        Object.entries(extra)
+          .map(([k, v]) => `${k}=${String(v)}`)
+          .join(" ")
+      : "";
+  console.error(
+    `Pipeline error [${stage}] captureId=${captureId}` +
+      (errorCode !== undefined ? ` errorCode=${errorCode}` : "") +
+      ` message=${message}${extraStr}`,
+  );
+}
+
 async function patchCapture(
   ctx: ActionCtx,
   captureId: Id<"captures">,
@@ -445,6 +476,7 @@ async function handleTransientOrTerminal(
   if (capture === null) return;
 
   if (err instanceof ConductorApiError && err.errorClass === "auth") {
+    logPipelineError(origin, captureId, err, { decision: "terminal", errorCode: "auth" });
     await patchCapture(ctx, captureId, {
       status: "failed",
       errorCode: "auth",
@@ -457,6 +489,11 @@ async function handleTransientOrTerminal(
   if (attempt < MAX_SUBMIT_ATTEMPTS) {
     const backoff =
       SUBMIT_BACKOFF_MS[Math.min(attempt, SUBMIT_BACKOFF_MS.length - 1)];
+    logPipelineError(origin, captureId, err, {
+      decision: "rescheduling",
+      nextAttempt: attempt + 1,
+      backoffMs: backoff,
+    });
     await patchCapture(ctx, captureId, { attempt: attempt + 1 });
     await ctx.scheduler.runAfter(backoff, internal.pipeline.submit, {
       captureId,
@@ -475,6 +512,7 @@ async function handleTransientOrTerminal(
         ? err.message
         : String(err);
 
+  logPipelineError(origin, captureId, err, { decision: "terminal", errorCode });
   await patchCapture(ctx, captureId, {
     status: "failed",
     errorCode,
@@ -573,12 +611,15 @@ export const awaitWorkspaceReady = internalAction({
     } catch (err) {
       // Never die silently — always reschedule until the deadline logic
       // above naturally terminates it.
+      logPipelineError("awaitWorkspaceReady", args.captureId, err, {
+        decision: "rescheduling",
+        pollCount: args.pollCount + 1,
+      });
       await ctx.scheduler.runAfter(
         AWAIT_READY_INITIAL_MS,
         internal.pipeline.awaitWorkspaceReady,
         { captureId: args.captureId, pollCount: args.pollCount + 1 },
       );
-      void err;
     }
   },
 });
@@ -594,12 +635,15 @@ export const watch = internalAction({
       // Entire body is in try/catch: a thrown error reschedules the watch —
       // it never strands the capture. Deadline is enforced by runWatch's own
       // messageSentAt check on the next tick, not by this catch block.
+      logPipelineError("watch", args.captureId, err, {
+        decision: "rescheduling",
+        backoffMs: Math.min(args.backoffMs, WATCH_MAX_MS),
+      });
       await ctx.scheduler.runAfter(
         Math.min(args.backoffMs, WATCH_MAX_MS),
         internal.pipeline.watch,
         { captureId: args.captureId, backoffMs: Math.min(args.backoffMs * 2, WATCH_MAX_MS) },
       );
-      void err;
     }
   },
 });
@@ -749,10 +793,12 @@ export const watchdog = internalAction({
     } catch (err) {
       // Never die silently — retry the watchdog check shortly rather than
       // leaving a possibly-stalled capture completely unchecked.
+      logPipelineError("watchdog", args.captureId, err, {
+        decision: "rescheduling",
+      });
       await ctx.scheduler.runAfter(60_000, internal.pipeline.watchdog, {
         captureId: args.captureId,
       });
-      void err;
     }
   },
 });
