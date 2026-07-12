@@ -23,6 +23,38 @@ final class LogCollector: @unchecked Sendable {
     }
 }
 
+// MARK: - Test signal for deterministic concurrency tests
+
+/// A one-shot flag a producer fires and a waiter polls for, so a test can
+/// deterministically sequence two concurrent `drainOnce()` calls without
+/// reaching into `SyncEngine`'s internals. Mirrors the bounded-wait polling
+/// style already used by `FakeConvexService.yieldProjects`.
+final class TestSignal: @unchecked Sendable {
+    private let lock = NSLock()
+    private var fired = false
+
+    func fire() {
+        lock.lock()
+        fired = true
+        lock.unlock()
+    }
+
+    func wait(timeout: TimeInterval = 2) async {
+        let deadline = Date().addingTimeInterval(timeout)
+        while true {
+            lock.lock()
+            let isFired = fired
+            lock.unlock()
+            if isFired { return }
+            if Date() >= deadline {
+                XCTFail("TestSignal.wait timed out")
+                return
+            }
+            try? await Task.sleep(nanoseconds: 2_000_000)
+        }
+    }
+}
+
 final class SyncEngineTests: XCTestCase {
     private var tempDir: URL!
 
@@ -262,6 +294,77 @@ final class SyncEngineTests: XCTestCase {
 
         XCTAssertEqual(synced, [])
         XCTAssertTrue(logs.messages.isEmpty, "expected no log messages for an empty queue, got: \(logs.messages)")
+    }
+
+    // MARK: - Reentrancy guard: overlapping drainOnce() calls coalesce
+    // instead of double-processing the same draft
+
+    func testConcurrentDrainOnceCallsDoNotDoubleProcessSameDraft() async throws {
+        let (store, tempDir) = try TestSupport.makeStore()
+        self.tempDir = tempDir
+
+        let first = TestSupport.makeDraft(clientId: "concurrent-first", capturedAt: Date(timeIntervalSince1970: 100))
+        let second = TestSupport.makeDraft(clientId: "concurrent-second", capturedAt: Date(timeIntervalSince1970: 200))
+        try store.saveDraft(first)
+        try store.saveDraft(second)
+
+        let convex = FakeConvexService()
+        // Blocks the first drainOnce() call's loop mid-`syncOne` for
+        // "concurrent-first" until the test explicitly releases it, so a
+        // second drainOnce() call can be started while the first is
+        // provably still draining -- the exact race the reentrancy guard
+        // exists to prevent.
+        let firstCallStarted = TestSignal()
+        let releaseFirstCall = TestSignal()
+        convex.onCapturesCreate = { input in
+            if input.clientId == "concurrent-first" {
+                firstCallStarted.fire()
+                await releaseFirstCall.wait()
+            }
+            return "server-\(input.clientId)"
+        }
+
+        let engine = SyncEngine(store: store, convex: convex)
+
+        async let firstDrain = engine.drainOnce()
+        await firstCallStarted.wait()
+
+        // At this point the first call has snapshotted both drafts, marked
+        // "concurrent-first" `.syncing`, and is suspended inside
+        // `syncOne` -- "concurrent-second" is still sitting `.queued` from
+        // any other caller's point of view. Pre-fix, a second drainOnce()
+        // call here would take its own snapshot (seeing "concurrent-second"
+        // as queued), sync it, and then the *first* call would sync it
+        // again once it resumed to its own original snapshot -- two
+        // `capturesCreate` calls for the same clientId.
+        async let secondDrain = engine.drainOnce()
+
+        // Give the second call's actor-isolated code a moment to actually
+        // run (and coalesce at the `isDraining` guard) before unblocking the
+        // first call.
+        try await Task.sleep(nanoseconds: 50_000_000)
+        releaseFirstCall.fire()
+
+        let (firstResult, secondResult) = await (firstDrain, secondDrain)
+        let allSynced = firstResult + secondResult
+
+        XCTAssertEqual(
+            Set(allSynced), ["concurrent-first", "concurrent-second"],
+            "expected both drafts synced exactly once across both calls, got: \(allSynced)"
+        )
+        XCTAssertEqual(allSynced.count, 2, "expected no draft synced twice, got: \(allSynced)")
+
+        let clientIds = convex.capturesCreateCalls.map(\.clientId)
+        XCTAssertEqual(
+            clientIds.filter { $0 == "concurrent-first" }.count, 1,
+            "expected exactly one capturesCreate call for concurrent-first, got: \(clientIds)"
+        )
+        XCTAssertEqual(
+            clientIds.filter { $0 == "concurrent-second" }.count, 1,
+            "expected exactly one capturesCreate call for concurrent-second, got: \(clientIds)"
+        )
+        XCTAssertEqual(try store.draft(clientId: "concurrent-first")?.localState, .synced)
+        XCTAssertEqual(try store.draft(clientId: "concurrent-second")?.localState, .synced)
     }
 
     // MARK: - Currently-silent `store.drafts(in:)` read failure is now logged

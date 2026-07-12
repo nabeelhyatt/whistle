@@ -167,6 +167,18 @@ public actor SyncEngine {
     private let networkMonitor: (any NetworkMonitoring)?
     private let logger: @Sendable (String) -> Void
 
+    /// Reentrancy guard for `drainOnce()`: true while a drain pass is
+    /// in-flight. Without this, two concurrently-invoked `drainOnce()` calls
+    /// (e.g. the launch-time `runForever()` drain still mid-loop when a
+    /// capture submit triggers its own `drainOnce()`) can each snapshot the
+    /// same `.queued`/`.syncFailed` draft before either has marked it
+    /// `.syncing`, causing a duplicate upload + `captures.create` for it.
+    private var isDraining = false
+    /// Set when `drainOnce()` is called while a pass is already in-flight, so
+    /// the in-flight pass loops back for another pass instead of the caller's
+    /// request being silently dropped.
+    private var rerunRequested = false
+
     public init(
         store: CaptureStore,
         convex: any ConvexServiceProtocol,
@@ -193,6 +205,29 @@ public actor SyncEngine {
             return []
         }
 
+        // Coalesce overlapping calls: if a pass is already running, ask it to
+        // run again once it's done instead of racing it with our own
+        // snapshot of the same queued/syncFailed drafts.
+        if isDraining {
+            rerunRequested = true
+            return []
+        }
+
+        isDraining = true
+        defer { isDraining = false }
+
+        var allSynced: [String] = []
+        repeat {
+            rerunRequested = false
+            allSynced += await drainPass()
+        } while rerunRequested
+        return allSynced
+    }
+
+    /// A single fetch-and-process pass over the current
+    /// `queued`/`syncFailed` drafts. Only ever called from within
+    /// `drainOnce()`'s `isDraining` guard.
+    private func drainPass() async -> [String] {
         let drafts: [CaptureDraft]
         do {
             drafts = try store.drafts(in: [.queued, .syncFailed])
