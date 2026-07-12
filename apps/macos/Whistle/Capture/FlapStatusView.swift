@@ -57,6 +57,8 @@ struct FlapStatusView: View {
                 .font(.system(size: 8.5, weight: .bold).width(.condensed))
                 .tracking(1.5)
                 .foregroundColor(PanelTheme.accentAmber)
+                .lineLimit(1)
+                .fixedSize(horizontal: false, vertical: true)
         }
     }
 }

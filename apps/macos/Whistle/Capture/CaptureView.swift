@@ -328,13 +328,17 @@ struct CaptureView: View {
     }
 
     private var clearButton: some View {
-        Button("Clear") {
+        Button {
             viewModel.clear()
+        } label: {
+            Image(systemName: "xmark.circle")
+                .font(.system(size: 14, weight: .medium))
         }
-        .font(.system(size: 12, weight: .medium))
         .buttonStyle(.plain)
         .foregroundStyle(PanelTheme.placeholderInk)
         .disabled(!viewModel.hasContent)
+        .help("Clear")
+        .accessibilityLabel("Clear")
     }
 
     private var submitButton: some View {
