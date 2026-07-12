@@ -448,7 +448,7 @@ final class NotificationRoutingTests: XCTestCase {
         var localRetryRequestedCount = 0
         viewModel.onLocalRetryRequested = { localRetryRequestedCount += 1 }
 
-        viewModel.localRetry(row)
+        viewModel.localRetry()
 
         XCTAssertEqual(localRetryRequestedCount, 1)
     }

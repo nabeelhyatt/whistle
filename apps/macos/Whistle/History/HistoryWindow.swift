@@ -326,7 +326,7 @@ public final class HistoryViewModel: ObservableObject {
     /// so there's nothing to `captures.retry` -- instead this re-drains
     /// `SyncEngine` to retry the local-to-server sync. Wired by
     /// `AppDelegate` (`onLocalRetryRequested`) to `syncEngine.drainOnce()`.
-    public func localRetry(_ row: HistoryRowViewModel) {
+    public func localRetry() {
         onLocalRetryRequested()
     }
 
@@ -369,7 +369,7 @@ struct HistoryWindow: View {
                         onRetry: { viewModel.retry(row) },
                         onDuplicate: { onDuplicate(row) },
                         onOpenSettings: onOpenSettings,
-                        onLocalRetry: { viewModel.localRetry(row) }
+                        onLocalRetry: { viewModel.localRetry() }
                     )
                 }
                 .listStyle(.plain)
