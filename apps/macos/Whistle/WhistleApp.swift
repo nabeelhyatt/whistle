@@ -40,6 +40,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// the snapshot table the picker actually reads). Started once at
     /// launch, independent of any window being open.
     private var projectsSyncCoordinator: ProjectsSyncCoordinator?
+    /// Drains the local queued/syncFailed capture queue against Convex
+    /// (fix: this is the exact engine that was never constructed anywhere
+    /// in the app target -- submissions wrote to local SQLite as `queued`
+    /// and sat there forever since nothing ever called `captures.create`).
+    private var syncEngine: SyncEngine?
     private var historyViewModel: HistoryViewModel?
     private var historyWindowController: HistoryWindowController?
     private var notificationService: NotificationService?
@@ -109,6 +114,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         self.projectsSyncCoordinator = projectsSyncCoordinator
         Task { await projectsSyncCoordinator.start() }
 
+        // Core fix: SyncEngine was implemented and tested (WhistleCore) but
+        // never constructed anywhere in the app target, so submitted
+        // captures never left the local queue. Drains are gated on signed-in
+        // auth state below; otherwise launch can turn queued captures into
+        // syncFailed before AuthController has resolved a cached session.
+        let networkMonitor = NWPathMonitorNetworkMonitor()
+        let syncEngine = SyncEngine(
+            store: store,
+            convex: convexService,
+            networkMonitor: networkMonitor
+        )
+        self.syncEngine = syncEngine
+        Task { [weak self, weak networkMonitor] in
+            guard let networkMonitor else { return }
+            for await online in networkMonitor.pathUpdates() where online {
+                await self?.drainSyncIfSignedIn()
+            }
+        }
+
         let notificationService = NotificationService()
         self.notificationService = notificationService
 
@@ -121,6 +145,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         self.historyViewModel = historyViewModel
         historyViewModel.start()
 
+        // Manual retry for a capture stuck in local `syncFailed` state
+        // (`.localRetry` affordance): re-drains SyncEngine rather than
+        // calling `captures.retry` server-side (no server record exists
+        // yet for a local-only row).
+        historyViewModel.onLocalRetryRequested = { [weak self] in
+            Task { await self?.drainSyncIfSignedIn() }
+        }
+
         // Ready-indicator (TECH-SPEC §4.1 StatusItemController row): this
         // unit computes the >=1-ready-and-unopened count from the same
         // subscription HistoryViewModel drives, and pushes it onto the
@@ -129,6 +161,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             .receive(on: DispatchQueue.main)
             .sink { [weak statusItem] hasUnread in
                 statusItem?.hasUnreadReadyCaptures = hasUnread
+            }
+            .store(in: &cancellables)
+
+        auth.$state
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] state in
+                guard state == .signedIn else { return }
+                Task { await self?.drainSyncIfSignedIn() }
             }
             .store(in: &cancellables)
 
@@ -143,6 +183,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         )
         capturePanel.onHistoryRequested = { [weak self] in self?.showHistory() }
         capturePanel.onSettingsRequested = { [weak self] in self?.showSettings() }
+        // Immediate drain on submit -- don't wait for the next network-path-
+        // change event, which may not fire again for hours on a stable
+        // connection.
+        capturePanel.onCaptureSubmitted = { [weak self] _ in
+            Task { await self?.drainSyncIfSignedIn() }
+        }
         // Fix #2: anchor the panel beneath the real status item icon rather
         // than a hardcoded screen-corner guess.
         capturePanel.statusItemButtonFrameProvider = { [weak statusItem] in statusItem?.buttonWindowFrame }
@@ -220,8 +266,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         // The guided test capture goes through the REAL capture panel; its
         // submit callback is what advances the wizard to the screenshot
-        // upsell (PRD F5.1 step 5 -> 6).
-        capturePanelController.onCaptureSubmitted = { [weak viewModel] _ in
+        // upsell (PRD F5.1 step 5 -> 6). Compose with (never replace) the
+        // existing onCaptureSubmitted closure -- replacing it would
+        // silently wipe out the sync-drain trigger set at launch, meaning
+        // the onboarding wizard's own guided test capture would never sync.
+        let existingOnSubmit = capturePanelController.onCaptureSubmitted
+        capturePanelController.onCaptureSubmitted = { [weak viewModel] clientId in
+            existingOnSubmit(clientId)
             viewModel?.noteTestCaptureSubmitted()
         }
 
@@ -241,6 +292,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func showHistory() {
         historyWindowController?.show()
+    }
+
+    private func drainSyncIfSignedIn() async {
+        guard authController?.state == .signedIn, let syncEngine else { return }
+        _ = await syncEngine.drainOnce()
     }
 
     /// Resolves screenshot bytes for "Duplicate as new capture" (PRD F3.6):

@@ -424,6 +424,35 @@ final class NotificationRoutingTests: XCTestCase {
         XCTAssertEqual(row.presentation.chip, "Sync failed")
     }
 
+    // U4: `.localRetry` affordance's "Retry" button (`HistoryRow.onLocalRetry`)
+    // is wired through `HistoryViewModel.localRetry(_:)` to
+    // `onLocalRetryRequested`, which `AppDelegate` wires to
+    // `syncEngine.drainOnce()` -- there is no server record yet for a
+    // local-only `syncFailed` row, so `captures.retry` doesn't apply.
+    func testLocalRetryOnLocalSyncFailedRowInvokesOnLocalRetryRequested() async throws {
+        let (store, tempDir) = try HistoryTestSupport.makeStore()
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let convex = FakeHistoryConvexService()
+        let notificationService = NotificationService(center: FakeUserNotificationCenter())
+        let viewModel = HistoryViewModel(store: store, convex: convex, notificationService: notificationService, lastSeenStore: InMemoryLastSeenStatusStore())
+
+        try store.saveDraft(CaptureDraft(clientId: "client-localretry", transcript: "t", notes: "", projectId: "proj-1", projectName: "Project One", agent: "claude", localState: .syncFailed, localError: "network down"))
+
+        viewModel.start()
+        await HistoryTestSupport.waitUntil { !viewModel.rows.isEmpty }
+
+        let row = try XCTUnwrap(viewModel.rows.first { $0.clientId == "client-localretry" })
+        XCTAssertEqual(row.presentation.affordance, .localRetry)
+
+        var localRetryRequestedCount = 0
+        viewModel.onLocalRetryRequested = { localRetryRequestedCount += 1 }
+
+        viewModel.localRetry()
+
+        XCTAssertEqual(localRetryRequestedCount, 1)
+    }
+
     func testServerFailedRowShowsServerRetryAffordance() async throws {
         let (store, tempDir) = try HistoryTestSupport.makeStore()
         defer { try? FileManager.default.removeItem(at: tempDir) }

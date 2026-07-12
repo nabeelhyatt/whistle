@@ -220,6 +220,7 @@ class MockConductor {
 }
 
 let mock: MockConductor;
+let errorSpy: ReturnType<typeof vi.spyOn>;
 
 beforeEach(() => {
   vi.useFakeTimers();
@@ -228,11 +229,16 @@ beforeEach(() => {
     "fetch",
     vi.fn((url: string, init?: RequestInit) => mock.handle(url, init)),
   );
+  // U3: pipeline failure chokepoints now log via console.error (in addition
+  // to the existing DB status/errorCode patches). Spy rather than assert on
+  // real log output, per the plan.
+  errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
 });
 
 afterEach(() => {
   vi.useRealTimers();
   vi.unstubAllGlobals();
+  errorSpy.mockRestore();
 });
 
 async function setupUserWithCapture(
@@ -567,6 +573,16 @@ describe("error: 5xx on create", () => {
     expect(capture?.status).toBe("queued");
     expect(capture?.attempt).toBe(1);
 
+    // U3: this transient failure is logged as "rescheduling", never
+    // "terminal" — attempt count is still under MAX_SUBMIT_ATTEMPTS.
+    const reschedulingCalls = errorSpy.mock.calls.filter((call) =>
+      String(call[0]).includes("rescheduling"),
+    );
+    expect(reschedulingCalls.length).toBeGreaterThan(0);
+    for (const call of reschedulingCalls) {
+      expect(String(call[0])).not.toContain("decision=terminal");
+    }
+
     await tick(t, 60_000);
     capture = await asUser.query(api.captures.get, { captureId });
     expect(capture?.status).toBe("queued");
@@ -703,6 +719,14 @@ describe("error: 401 anywhere -> failed/auth, no retry scheduled", () => {
     expect(capture?.status).toBe("failed");
     expect(capture?.errorCode).toBe("auth");
 
+    // U3: the terminal auth decision is logged (not just patched to the DB).
+    const authLogCall = errorSpy.mock.calls.find((call) =>
+      String(call[0]).includes("terminal"),
+    );
+    expect(authLogCall).toBeDefined();
+    expect(String(authLogCall?.[0])).toContain("submit");
+    expect(String(authLogCall?.[0])).not.toContain("rescheduling");
+
     // No further scheduled functions remain pending for this capture (no
     // retry scheduled on a terminal auth failure).
     const pending = await t.run(async (ctx) =>
@@ -747,6 +771,14 @@ describe("edge: pipeline.watch status poll throws", () => {
     // Still in-flight (not stranded) despite the throwing poll.
     capture = await asUser.query(api.captures.get, { captureId });
     expect(capture?.status).toBe("agentWorking");
+
+    // U3: the previously-silent `void err` catch now logs, but the
+    // reschedule behavior (still agentWorking, no patch) is unchanged.
+    const watchLogCall = errorSpy.mock.calls.find((call) =>
+      String(call[0]).includes("[watch]"),
+    );
+    expect(watchLogCall).toBeDefined();
+    expect(String(watchLogCall?.[0])).toContain("simulated network blip");
 
     // Next tick succeeds normally and can still reach ready.
     mock.sessions.get(sessionId)!.status = "idle";

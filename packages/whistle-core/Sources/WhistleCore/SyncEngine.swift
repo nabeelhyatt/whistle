@@ -36,7 +36,7 @@ public protocol NetworkMonitoring: Sendable {
         private let monitor = NWPathMonitor()
         private let queue = DispatchQueue(label: "com.whistle.core.network-monitor")
         private let lock = NSLock()
-        private var lastStatus: Bool = true
+        private var lastStatus: Bool?
         private var continuations: [Int: AsyncStream<Bool>.Continuation] = [:]
         private var nextId = 0
 
@@ -53,19 +53,21 @@ public protocol NetworkMonitoring: Sendable {
 
         public var isOnline: Bool {
             get async {
-                lock.withLock { lastStatus }
+                lock.withLock { lastStatus ?? false }
             }
         }
 
         public func pathUpdates() -> AsyncStream<Bool> {
             AsyncStream { continuation in
-                let (id, current): (Int, Bool) = lock.withLock {
+                let (id, current): (Int, Bool?) = lock.withLock {
                     let id = nextId
                     nextId += 1
                     continuations[id] = continuation
                     return (id, lastStatus)
                 }
-                continuation.yield(current)
+                if let current {
+                    continuation.yield(current)
+                }
                 continuation.onTermination = { [weak self] _ in
                     self?.lock.withLock { _ = self?.continuations.removeValue(forKey: id) }
                 }
@@ -165,17 +167,32 @@ public actor SyncEngine {
     private let convex: any ConvexServiceProtocol
     private let uploader: any ScreenshotUploading
     private let networkMonitor: (any NetworkMonitoring)?
+    private let logger: @Sendable (String) -> Void
+
+    /// Reentrancy guard for `drainOnce()`: true while a drain pass is
+    /// in-flight. Without this, two concurrently-invoked `drainOnce()` calls
+    /// (e.g. the launch-time `runForever()` drain still mid-loop when a
+    /// capture submit triggers its own `drainOnce()`) can each snapshot the
+    /// same `.queued`/`.syncFailed` draft before either has marked it
+    /// `.syncing`, causing a duplicate upload + `captures.create` for it.
+    private var isDraining = false
+    /// Set when `drainOnce()` is called while a pass is already in-flight, so
+    /// the in-flight pass loops back for another pass instead of the caller's
+    /// request being silently dropped.
+    private var rerunRequested = false
 
     public init(
         store: CaptureStore,
         convex: any ConvexServiceProtocol,
         uploader: any ScreenshotUploading = URLSessionScreenshotUploader(),
-        networkMonitor: (any NetworkMonitoring)? = nil
+        networkMonitor: (any NetworkMonitoring)? = nil,
+        logger: @escaping @Sendable (String) -> Void = { NSLog("%@", $0) }
     ) {
         self.store = store
         self.convex = convex
         self.uploader = uploader
         self.networkMonitor = networkMonitor
+        self.logger = logger
     }
 
     /// Attempts to drain every `queued`/`syncFailed` draft once, in
@@ -190,12 +207,41 @@ public actor SyncEngine {
             return []
         }
 
+        // Coalesce overlapping calls: if a pass is already running, ask it to
+        // run again once it's done instead of racing it with our own
+        // snapshot of the same queued/syncFailed drafts.
+        if isDraining {
+            rerunRequested = true
+            return []
+        }
+
+        isDraining = true
+        defer { isDraining = false }
+
+        var allSynced: [String] = []
+        repeat {
+            rerunRequested = false
+            allSynced += await drainPass()
+        } while rerunRequested
+        return allSynced
+    }
+
+    /// A single fetch-and-process pass over the current
+    /// `queued`/`syncFailed` drafts. Only ever called from within
+    /// `drainOnce()`'s `isDraining` guard.
+    private func drainPass() async -> [String] {
         let drafts: [CaptureDraft]
         do {
             drafts = try store.drafts(in: [.queued, .syncFailed])
         } catch {
+            logger("Whistle: SyncEngine failed to read pending drafts: \(error)")
             return []
         }
+
+        if drafts.isEmpty {
+            return []
+        }
+        logger("Whistle: SyncEngine draining \(drafts.count) draft(s)")
 
         var synced: [String] = []
         for draft in drafts {
@@ -204,6 +250,7 @@ public actor SyncEngine {
                 let serverId = try await syncOne(draft)
                 try store.updateLocalState(clientId: draft.clientId, to: .synced, serverId: serverId, localError: nil)
                 synced.append(draft.clientId)
+                logger("Whistle: SyncEngine synced \(draft.clientId) -> \(serverId)")
             } catch {
                 _ = try? store.incrementLocalAttempt(clientId: draft.clientId)
                 _ = try? store.updateLocalState(
@@ -211,6 +258,7 @@ public actor SyncEngine {
                     to: .syncFailed,
                     localError: String(describing: error)
                 )
+                logger("Whistle: SyncEngine sync failed for \(draft.clientId): \(error)")
             }
         }
         return synced
