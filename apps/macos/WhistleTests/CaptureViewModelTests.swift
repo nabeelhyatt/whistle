@@ -959,6 +959,18 @@ final class CapturePanelControllerTests: XCTestCase {
         )
     }
 
+    @MainActor
+    private func waitForScreenshotCount(
+        _ expected: Int,
+        counter: CaptureCounter,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) async throws {
+        try await Whistle_waitUntil(file: file, line: line) {
+            counter.count == expected
+        }
+    }
+
     // MARK: Happy: submit with all fields, run against BOTH panel modes ->
     // draft queued, panel closed (plan U8 verification: "Run against both
     // panel modes").
@@ -1001,12 +1013,10 @@ final class CapturePanelControllerTests: XCTestCase {
             let controller = CapturePanelController(store: store, screenshotService: screenshotService, mode: mode, micPermissionStatus: { .granted }, speechPermissionStatus: { .granted }, transcriptionServiceFactory: { FakeTranscriptionService() })
 
             controller.trigger()
-            // Allow the async screenshot capture task to run.
-            try await Task.sleep(nanoseconds: 20_000_000)
+            try await waitForScreenshotCount(1, counter: counter)
             XCTAssertEqual(counter.count, 1, "mode \(mode): first trigger should capture exactly one screenshot")
 
             controller.trigger()
-            try await Task.sleep(nanoseconds: 20_000_000)
             XCTAssertEqual(counter.count, 1, "mode \(mode): duplicate trigger while open must not re-screenshot")
         }
     }
@@ -1079,7 +1089,7 @@ final class CapturePanelControllerTests: XCTestCase {
         let controller = CapturePanelController(store: store, screenshotService: screenshotService, micPermissionStatus: { .granted }, speechPermissionStatus: { .granted }, transcriptionServiceFactory: { FakeTranscriptionService() })
 
         controller.trigger()
-        try await Task.sleep(nanoseconds: 20_000_000)
+        try await waitForScreenshotCount(1, counter: counter)
         XCTAssertEqual(counter.count, 1)
 
         controller.currentViewModel?.transcriptText = "first capture"
@@ -1090,7 +1100,7 @@ final class CapturePanelControllerTests: XCTestCase {
         XCTAssertFalse(controller.hasPreservedDraft, "submit must fully tear down, leaving nothing to resume")
 
         controller.trigger()
-        try await Task.sleep(nanoseconds: 20_000_000)
+        try await waitForScreenshotCount(2, counter: counter)
 
         XCTAssertEqual(controller.currentViewModel?.transcriptText, "", "next capture after submit starts empty")
         XCTAssertEqual(counter.count, 2, "next capture after submit takes a brand-new screenshot")

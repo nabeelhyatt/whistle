@@ -116,18 +116,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Core fix: SyncEngine was implemented and tested (WhistleCore) but
         // never constructed anywhere in the app target, so submitted
-        // captures never left the local queue. `runForever()`'s network
-        // monitor yields the current online state at subscription time, so
-        // this alone drains anything stranded from a prior session at
-        // launch; `capturePanel.onCaptureSubmitted` below triggers an
-        // immediate drain for mid-session submits.
+        // captures never left the local queue. Drains are gated on signed-in
+        // auth state below; otherwise launch can turn queued captures into
+        // syncFailed before AuthController has resolved a cached session.
+        let networkMonitor = NWPathMonitorNetworkMonitor()
         let syncEngine = SyncEngine(
             store: store,
             convex: convexService,
-            networkMonitor: NWPathMonitorNetworkMonitor()
+            networkMonitor: networkMonitor
         )
         self.syncEngine = syncEngine
-        Task { await syncEngine.runForever() }
+        Task { [weak self, weak networkMonitor] in
+            guard let networkMonitor else { return }
+            for await online in networkMonitor.pathUpdates() where online {
+                await self?.drainSyncIfSignedIn()
+            }
+        }
 
         let notificationService = NotificationService()
         self.notificationService = notificationService
@@ -145,8 +149,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // (`.localRetry` affordance): re-drains SyncEngine rather than
         // calling `captures.retry` server-side (no server record exists
         // yet for a local-only row).
-        historyViewModel.onLocalRetryRequested = { [weak syncEngine] in
-            Task { await syncEngine?.drainOnce() }
+        historyViewModel.onLocalRetryRequested = { [weak self] in
+            Task { await self?.drainSyncIfSignedIn() }
         }
 
         // Ready-indicator (TECH-SPEC §4.1 StatusItemController row): this
@@ -157,6 +161,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             .receive(on: DispatchQueue.main)
             .sink { [weak statusItem] hasUnread in
                 statusItem?.hasUnreadReadyCaptures = hasUnread
+            }
+            .store(in: &cancellables)
+
+        auth.$state
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] state in
+                guard state == .signedIn else { return }
+                Task { await self?.drainSyncIfSignedIn() }
             }
             .store(in: &cancellables)
 
@@ -174,8 +186,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Immediate drain on submit -- don't wait for the next network-path-
         // change event, which may not fire again for hours on a stable
         // connection.
-        capturePanel.onCaptureSubmitted = { [weak syncEngine] _ in
-            Task { await syncEngine?.drainOnce() }
+        capturePanel.onCaptureSubmitted = { [weak self] _ in
+            Task { await self?.drainSyncIfSignedIn() }
         }
         // Fix #2: anchor the panel beneath the real status item icon rather
         // than a hardcoded screen-corner guess.
@@ -280,6 +292,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func showHistory() {
         historyWindowController?.show()
+    }
+
+    private func drainSyncIfSignedIn() async {
+        guard authController?.state == .signedIn, let syncEngine else { return }
+        _ = await syncEngine.drainOnce()
     }
 
     /// Resolves screenshot bytes for "Duplicate as new capture" (PRD F3.6):

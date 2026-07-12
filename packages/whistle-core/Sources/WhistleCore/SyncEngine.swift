@@ -36,7 +36,7 @@ public protocol NetworkMonitoring: Sendable {
         private let monitor = NWPathMonitor()
         private let queue = DispatchQueue(label: "com.whistle.core.network-monitor")
         private let lock = NSLock()
-        private var lastStatus: Bool = true
+        private var lastStatus: Bool?
         private var continuations: [Int: AsyncStream<Bool>.Continuation] = [:]
         private var nextId = 0
 
@@ -53,19 +53,21 @@ public protocol NetworkMonitoring: Sendable {
 
         public var isOnline: Bool {
             get async {
-                lock.withLock { lastStatus }
+                lock.withLock { lastStatus ?? false }
             }
         }
 
         public func pathUpdates() -> AsyncStream<Bool> {
             AsyncStream { continuation in
-                let (id, current): (Int, Bool) = lock.withLock {
+                let (id, current): (Int, Bool?) = lock.withLock {
                     let id = nextId
                     nextId += 1
                     continuations[id] = continuation
                     return (id, lastStatus)
                 }
-                continuation.yield(current)
+                if let current {
+                    continuation.yield(current)
+                }
                 continuation.onTermination = { [weak self] _ in
                     self?.lock.withLock { _ = self?.continuations.removeValue(forKey: id) }
                 }
