@@ -40,6 +40,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// the snapshot table the picker actually reads). Started once at
     /// launch, independent of any window being open.
     private var projectsSyncCoordinator: ProjectsSyncCoordinator?
+    /// Drains the local queued/syncFailed capture queue against Convex
+    /// (fix: this is the exact engine that was never constructed anywhere
+    /// in the app target -- submissions wrote to local SQLite as `queued`
+    /// and sat there forever since nothing ever called `captures.create`).
+    private var syncEngine: SyncEngine?
     private var historyViewModel: HistoryViewModel?
     private var historyWindowController: HistoryWindowController?
     private var notificationService: NotificationService?
@@ -109,6 +114,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         self.projectsSyncCoordinator = projectsSyncCoordinator
         Task { await projectsSyncCoordinator.start() }
 
+        // Core fix: SyncEngine was implemented and tested (WhistleCore) but
+        // never constructed anywhere in the app target, so submitted
+        // captures never left the local queue. `runForever()`'s network
+        // monitor yields the current online state at subscription time, so
+        // this alone drains anything stranded from a prior session at
+        // launch; `capturePanel.onCaptureSubmitted` below triggers an
+        // immediate drain for mid-session submits.
+        let syncEngine = SyncEngine(
+            store: store,
+            convex: convexService,
+            networkMonitor: NWPathMonitorNetworkMonitor()
+        )
+        self.syncEngine = syncEngine
+        Task { await syncEngine.runForever() }
+
         let notificationService = NotificationService()
         self.notificationService = notificationService
 
@@ -143,6 +163,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         )
         capturePanel.onHistoryRequested = { [weak self] in self?.showHistory() }
         capturePanel.onSettingsRequested = { [weak self] in self?.showSettings() }
+        // Immediate drain on submit -- don't wait for the next network-path-
+        // change event, which may not fire again for hours on a stable
+        // connection.
+        capturePanel.onCaptureSubmitted = { [weak syncEngine] _ in
+            Task { await syncEngine?.drainOnce() }
+        }
         // Fix #2: anchor the panel beneath the real status item icon rather
         // than a hardcoded screen-corner guess.
         capturePanel.statusItemButtonFrameProvider = { [weak statusItem] in statusItem?.buttonWindowFrame }
@@ -220,8 +246,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         // The guided test capture goes through the REAL capture panel; its
         // submit callback is what advances the wizard to the screenshot
-        // upsell (PRD F5.1 step 5 -> 6).
-        capturePanelController.onCaptureSubmitted = { [weak viewModel] _ in
+        // upsell (PRD F5.1 step 5 -> 6). Compose with (never replace) the
+        // existing onCaptureSubmitted closure -- replacing it would
+        // silently wipe out the sync-drain trigger set at launch, meaning
+        // the onboarding wizard's own guided test capture would never sync.
+        let existingOnSubmit = capturePanelController.onCaptureSubmitted
+        capturePanelController.onCaptureSubmitted = { [weak viewModel] clientId in
+            existingOnSubmit(clientId)
             viewModel?.noteTestCaptureSubmitted()
         }
 
