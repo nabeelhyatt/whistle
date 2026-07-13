@@ -380,15 +380,26 @@ public struct CaptureCreateInput: Equatable, Sendable {
         }
 
         public func settingsUpdate(_ patch: SettingsPatch) async throws {
-            try await authedMutation(
-                "settings:update",
-                with: [
-                    "defaultProjectId": patch.defaultProjectId,
-                    "agent": patch.agent,
-                    "model": patch.model,
-                    "screenshotsEnabled": patch.screenshotsEnabled,
-                ]
-            )
+            // Same nil-key encoding issue as `capturesCreate` above: every
+            // field here is `v.optional(...)` on the backend specifically so
+            // a partial patch can update just one field and leave the rest
+            // untouched, but a nil-valued dict entry serializes as literal
+            // JSON `null`, which `v.optional(...)` rejects. Omit unset
+            // fields entirely instead of sending them as `null`.
+            var args: [String: ConvexEncodable?] = [:]
+            if let defaultProjectId = patch.defaultProjectId {
+                args["defaultProjectId"] = defaultProjectId
+            }
+            if let agent = patch.agent {
+                args["agent"] = agent
+            }
+            if let model = patch.model {
+                args["model"] = model
+            }
+            if let screenshotsEnabled = patch.screenshotsEnabled {
+                args["screenshotsEnabled"] = screenshotsEnabled
+            }
+            try await authedMutation("settings:update", with: args)
         }
 
         public func settingsSetConductorKey(_ key: String) async throws {
@@ -449,20 +460,30 @@ public struct CaptureCreateInput: Equatable, Sendable {
         // MARK: captures
 
         public func capturesCreate(_ input: CaptureCreateInput) async throws -> String {
-            try await authedMutation(
-                "captures:create",
-                with: [
-                    "clientId": input.clientId,
-                    "transcript": input.transcript,
-                    "notes": input.notes,
-                    "screenshotId": input.screenshotStorageId,
-                    "projectId": input.projectId,
-                    "projectName": input.projectName,
-                    "agent": input.agent,
-                    "model": input.model,
-                    "capturedAt": input.capturedAt.timeIntervalSince1970 * 1000,
-                ]
-            )
+            // `screenshotId`/`model` are omitted entirely when nil rather than
+            // included with a `nil` value: the backend validator is
+            // `v.optional(...)`, which only tolerates the key being ABSENT --
+            // convex-swift's dictionary encoder has no way to express "omit
+            // this key," so a nil-valued entry in the args dict always
+            // serializes as the literal JSON `null`, which `v.optional(...)`
+            // rejects (`ArgumentValidationError`, observed in production:
+            // every capture with no model/screenshot was failing to sync).
+            var args: [String: ConvexEncodable?] = [
+                "clientId": input.clientId,
+                "transcript": input.transcript,
+                "notes": input.notes,
+                "projectId": input.projectId,
+                "projectName": input.projectName,
+                "agent": input.agent,
+                "capturedAt": input.capturedAt.timeIntervalSince1970 * 1000,
+            ]
+            if let screenshotId = input.screenshotStorageId {
+                args["screenshotId"] = screenshotId
+            }
+            if let model = input.model {
+                args["model"] = model
+            }
+            return try await authedMutation("captures:create", with: args)
         }
 
         public func capturesListRecent(limit: Int) -> AsyncStream<[ServerCaptureRecord]> {
