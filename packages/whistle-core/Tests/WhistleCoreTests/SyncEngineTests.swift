@@ -282,6 +282,39 @@ final class SyncEngineTests: XCTestCase {
         )
     }
 
+    func testNotAuthenticatedFailureRevertsToQueuedInsteadOfSyncFailed() async throws {
+        let (store, tempDir) = try TestSupport.makeStore()
+        self.tempDir = tempDir
+
+        let draft = TestSupport.makeDraft(clientId: "not-signed-in")
+        try store.saveDraft(draft)
+
+        let convex = FakeConvexService()
+        convex.onCapturesCreate = { _ in
+            throw ConvexServiceError.notAuthenticated
+        }
+
+        let logs = LogCollector()
+        let engine = SyncEngine(store: store, convex: convex, logger: logs.log)
+
+        let synced = await engine.drainOnce()
+
+        XCTAssertEqual(synced, [])
+        // Not `.syncFailed`: there's no server-record/local-sync problem to
+        // retry-with-backoff, and `.syncFailed` would surface a misleading
+        // ".localRetry" button for a condition a local retry can't fix.
+        // Also must not be left `.syncing` (which has no retry affordance
+        // at all) -- reverts to `.queued` so the next drain, once signed
+        // in, picks it back up.
+        let reverted = try store.draft(clientId: "not-signed-in")
+        XCTAssertEqual(reverted?.localState, .queued)
+        XCTAssertEqual(reverted?.localAttempt, 0, "must not consume a retry attempt for an auth failure")
+        XCTAssertTrue(
+            logs.messages.contains { $0.contains("sync deferred for not-signed-in") },
+            "expected a 'sync deferred for <clientId>' log message, got: \(logs.messages)"
+        )
+    }
+
     func testEmptyQueueLogsNoDrainStartMessage() async throws {
         let (store, tempDir) = try TestSupport.makeStore()
         self.tempDir = tempDir

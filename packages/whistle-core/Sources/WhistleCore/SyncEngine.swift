@@ -253,6 +253,21 @@ public actor SyncEngine {
                 try store.updateLocalState(clientId: draft.clientId, to: .synced, serverId: serverId, localError: nil)
                 synced.append(draft.clientId)
                 logger("Whistle: SyncEngine synced \(draft.clientId) -> \(serverId)")
+            } catch ConvexServiceError.notAuthenticated {
+                // Not a local sync failure -- there's nothing a manual
+                // ".localRetry" click could fix while genuinely signed out,
+                // and marking `.syncFailed` here would surface a misleading
+                // "Retry" affordance for a condition that isn't the local
+                // queue's fault. Revert to `.queued` (never leave it stuck
+                // in `.syncing`) so the next drain -- once auth actually
+                // resolves -- picks it back up, with no wasted attempt
+                // increment. This matters most for `runPeriodicDrain()`,
+                // which (unlike every other trigger) deliberately calls
+                // `drainOnce()` without an auth gate, so a persistently
+                // signed-out user would otherwise see every queued draft
+                // flip to `.syncFailed` on every periodic tick forever.
+                _ = try? store.updateLocalState(clientId: draft.clientId, to: .queued, localError: nil)
+                logger("Whistle: SyncEngine sync deferred for \(draft.clientId): not authenticated")
             } catch {
                 _ = try? store.incrementLocalAttempt(clientId: draft.clientId)
                 _ = try? store.updateLocalState(
