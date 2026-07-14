@@ -126,12 +126,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             networkMonitor: networkMonitor
         )
         self.syncEngine = syncEngine
+        // Recover any drafts a previous process left stranded in `.syncing`
+        // (a hang or kill mid-sync), then drain -- `drainPass` only re-fetches
+        // `.queued`/`.syncFailed`, so without this a strand would never sync,
+        // not even after a relaunch. Runs before the triggers below so the
+        // reverted drafts are visible to the very first drain.
+        Task { [weak syncEngine] in
+            await syncEngine?.recoverStrandedSyncing()
+            _ = await syncEngine?.drainOnce()
+        }
         Task { [weak self, weak networkMonitor] in
             guard let networkMonitor else { return }
             for await online in networkMonitor.pathUpdates() where online {
                 await self?.drainSyncIfSignedIn()
             }
         }
+        // Safety net, not the primary sync path: the trigger-based drain
+        // above (and the launch/submit/manual-retry drains elsewhere) can in
+        // principle silently miss firing or fail to recover. This
+        // independent periodic loop self-heals a stuck capture within a
+        // bounded time without requiring a manual relaunch. It calls
+        // `drainOnce()` directly (not gated on signed-in state like
+        // `drainSyncIfSignedIn()`) since `drainOnce()` is already a no-op
+        // while offline/no drafts, and by the time the first 180s tick
+        // elapses, auth state has long since resolved.
+        Task { await syncEngine.runPeriodicDrain() }
 
         let notificationService = NotificationService()
         self.notificationService = notificationService
@@ -295,7 +314,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func drainSyncIfSignedIn() async {
-        guard authController?.state == .signedIn, let syncEngine else { return }
+        guard authController?.state == .signedIn, let syncEngine else {
+            NSLog("Whistle: drainSyncIfSignedIn skipped — authState=%@ syncEngine=%@",
+                  String(describing: authController?.state), syncEngine == nil ? "nil" : "present")
+            return
+        }
         _ = await syncEngine.drainOnce()
     }
 

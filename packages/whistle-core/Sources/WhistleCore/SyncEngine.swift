@@ -204,6 +204,7 @@ public actor SyncEngine {
     @discardableResult
     public func drainOnce() async -> [String] {
         if let networkMonitor, await networkMonitor.isOnline == false {
+            logger("Whistle: SyncEngine skipping drain — network monitor reports offline")
             return []
         }
 
@@ -212,6 +213,7 @@ public actor SyncEngine {
         // snapshot of the same queued/syncFailed drafts.
         if isDraining {
             rerunRequested = true
+            logger("Whistle: SyncEngine drain already in flight, requesting rerun")
             return []
         }
 
@@ -251,6 +253,21 @@ public actor SyncEngine {
                 try store.updateLocalState(clientId: draft.clientId, to: .synced, serverId: serverId, localError: nil)
                 synced.append(draft.clientId)
                 logger("Whistle: SyncEngine synced \(draft.clientId) -> \(serverId)")
+            } catch ConvexServiceError.notAuthenticated {
+                // Not a local sync failure -- there's nothing a manual
+                // ".localRetry" click could fix while genuinely signed out,
+                // and marking `.syncFailed` here would surface a misleading
+                // "Retry" affordance for a condition that isn't the local
+                // queue's fault. Revert to `.queued` (never leave it stuck
+                // in `.syncing`) so the next drain -- once auth actually
+                // resolves -- picks it back up, with no wasted attempt
+                // increment. This matters most for `runPeriodicDrain()`,
+                // which (unlike every other trigger) deliberately calls
+                // `drainOnce()` without an auth gate, so a persistently
+                // signed-out user would otherwise see every queued draft
+                // flip to `.syncFailed` on every periodic tick forever.
+                _ = try? store.updateLocalState(clientId: draft.clientId, to: .queued, localError: nil)
+                logger("Whistle: SyncEngine sync deferred for \(draft.clientId): not authenticated")
             } catch {
                 _ = try? store.incrementLocalAttempt(clientId: draft.clientId)
                 _ = try? store.updateLocalState(
@@ -313,6 +330,62 @@ public actor SyncEngine {
             if online {
                 _ = await drainOnce()
             }
+        }
+    }
+
+    /// Safety net, not the primary sync path: every trigger-based drain
+    /// (launch, network-path change, capture submit, manual retry) can in
+    /// principle miss firing or fail to recover, leaving a capture stuck
+    /// `queued`/`syncFailed` until the app is relaunched. This independent
+    /// loop guarantees a capture is retried within `interval` regardless of
+    /// whether any other trigger ever fires. It is intentionally a separate
+    /// loop from `runForever()` rather than folded into its
+    /// `networkMonitor.pathUpdates()` loop, so a hung/absent network monitor
+    /// can never suppress the periodic retry too. Safe to run concurrently
+    /// with any other caller of `drainOnce()` -- the `isDraining`/
+    /// `rerunRequested` guard above coalesces overlapping passes.
+    public func runPeriodicDrain(interval: Duration = .seconds(180)) async {
+        // `Task.sleep(for:)` throws `CancellationError` once the driving
+        // Task is cancelled, but Swift's cooperative cancellation is
+        // opt-in -- a bare `try?` around the sleep would silently swallow
+        // that error and `Task.sleep` returns immediately once cancelled,
+        // so without the explicit `Task.isCancelled` checks below this loop
+        // would busy-spin calling `drainOnce()` forever instead of actually
+        // stopping when a caller (e.g. a test) cancels it.
+        while !Task.isCancelled {
+            try? await Task.sleep(for: interval)
+            if Task.isCancelled { break }
+            _ = await drainOnce()
+        }
+    }
+
+    /// Recovers drafts a previous process left stranded in `.syncing`.
+    ///
+    /// `drainPass` marks a draft `.syncing` *before* the awaited network
+    /// call, and only ever re-fetches `.queued`/`.syncFailed`. So if that
+    /// call never returns (a hang, or the process being killed mid-sync),
+    /// the draft is frozen `.syncing` forever: the next drain skips it, and
+    /// even a relaunch -- the documented fallback -- never picks it back up,
+    /// because a fresh process's `drainPass` still only looks at
+    /// `.queued`/`.syncFailed`. Reverting these to `.queued` at launch closes
+    /// that hole.
+    ///
+    /// Call this ONCE at launch, before any drain starts. It is unsafe to
+    /// call concurrently with an in-flight drain within the same process,
+    /// where `.syncing` legitimately means "being processed right now" -- but
+    /// at launch no drain has run yet, so every `.syncing` draft is
+    /// necessarily a stale strand from a prior process.
+    public func recoverStrandedSyncing() async {
+        let stranded: [CaptureDraft]
+        do {
+            stranded = try store.drafts(in: [.syncing])
+        } catch {
+            logger("Whistle: SyncEngine failed to read stranded .syncing drafts: \(error)")
+            return
+        }
+        for draft in stranded {
+            _ = try? store.updateLocalState(clientId: draft.clientId, to: .queued, localError: nil)
+            logger("Whistle: SyncEngine recovered stranded .syncing draft \(draft.clientId) -> .queued")
         }
     }
 }

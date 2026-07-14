@@ -380,6 +380,7 @@ public final class CapturePanelController: NSObject, NSWindowDelegate {
         let result = viewModel?.submit()
         closePanel()
         if case .submitted(let clientId)? = result {
+            NSLog("Whistle: capture submitted, clientId=%@", clientId)
             onCaptureSubmitted(clientId)
         }
     }

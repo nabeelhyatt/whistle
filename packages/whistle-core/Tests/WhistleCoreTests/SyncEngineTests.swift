@@ -282,6 +282,39 @@ final class SyncEngineTests: XCTestCase {
         )
     }
 
+    func testNotAuthenticatedFailureRevertsToQueuedInsteadOfSyncFailed() async throws {
+        let (store, tempDir) = try TestSupport.makeStore()
+        self.tempDir = tempDir
+
+        let draft = TestSupport.makeDraft(clientId: "not-signed-in")
+        try store.saveDraft(draft)
+
+        let convex = FakeConvexService()
+        convex.onCapturesCreate = { _ in
+            throw ConvexServiceError.notAuthenticated
+        }
+
+        let logs = LogCollector()
+        let engine = SyncEngine(store: store, convex: convex, logger: logs.log)
+
+        let synced = await engine.drainOnce()
+
+        XCTAssertEqual(synced, [])
+        // Not `.syncFailed`: there's no server-record/local-sync problem to
+        // retry-with-backoff, and `.syncFailed` would surface a misleading
+        // ".localRetry" button for a condition a local retry can't fix.
+        // Also must not be left `.syncing` (which has no retry affordance
+        // at all) -- reverts to `.queued` so the next drain, once signed
+        // in, picks it back up.
+        let reverted = try store.draft(clientId: "not-signed-in")
+        XCTAssertEqual(reverted?.localState, .queued)
+        XCTAssertEqual(reverted?.localAttempt, 0, "must not consume a retry attempt for an auth failure")
+        XCTAssertTrue(
+            logs.messages.contains { $0.contains("sync deferred for not-signed-in") },
+            "expected a 'sync deferred for <clientId>' log message, got: \(logs.messages)"
+        )
+    }
+
     func testEmptyQueueLogsNoDrainStartMessage() async throws {
         let (store, tempDir) = try TestSupport.makeStore()
         self.tempDir = tempDir
@@ -324,7 +357,8 @@ final class SyncEngineTests: XCTestCase {
             return "server-\(input.clientId)"
         }
 
-        let engine = SyncEngine(store: store, convex: convex)
+        let logs = LogCollector()
+        let engine = SyncEngine(store: store, convex: convex, logger: logs.log)
 
         async let firstDrain = engine.drainOnce()
         await firstCallStarted.wait()
@@ -354,6 +388,11 @@ final class SyncEngineTests: XCTestCase {
         )
         XCTAssertEqual(allSynced.count, 2, "expected no draft synced twice, got: \(allSynced)")
 
+        XCTAssertTrue(
+            logs.messages.contains { $0.contains("drain already in flight, requesting rerun") },
+            "expected the coalesced second drainOnce() call to log that a drain was already in flight, got: \(logs.messages)"
+        )
+
         let clientIds = convex.capturesCreateCalls.map(\.clientId)
         XCTAssertEqual(
             clientIds.filter { $0 == "concurrent-first" }.count, 1,
@@ -365,6 +404,169 @@ final class SyncEngineTests: XCTestCase {
         )
         XCTAssertEqual(try store.draft(clientId: "concurrent-first")?.localState, .synced)
         XCTAssertEqual(try store.draft(clientId: "concurrent-second")?.localState, .synced)
+    }
+
+    // MARK: - Periodic drain (safety net for a missed/failed trigger, U2)
+
+    /// Polls `condition` until it's true, mirroring `TestSignal.wait`'s
+    /// bounded-wait polling style for assertions that can't be driven by a
+    /// single one-shot flag (here: a call count that increases over
+    /// multiple ticks of `runPeriodicDrain`'s loop).
+    private func waitUntil(timeout: TimeInterval = 2, _ condition: () -> Bool) async {
+        let deadline = Date().addingTimeInterval(timeout)
+        while !condition() {
+            if Date() >= deadline {
+                XCTFail("waitUntil timed out")
+                return
+            }
+            try? await Task.sleep(nanoseconds: 2_000_000)
+        }
+    }
+
+    func testRunPeriodicDrainCallsDrainOnceRepeatedlyOverBoundedWindow() async throws {
+        let (store, tempDir) = try TestSupport.makeStore()
+        self.tempDir = tempDir
+
+        let convex = FakeConvexService()
+        let engine = SyncEngine(store: store, convex: convex)
+
+        // A short interval keeps this test's window well under a second;
+        // real usage is minutes (see `runPeriodicDrain`'s default), never
+        // wall-clock milliseconds.
+        let periodicTask = Task { await engine.runPeriodicDrain(interval: .milliseconds(10)) }
+
+        // Queue a draft and wait for the loop's own (not test-driven) next
+        // tick to drain it -- this proves runPeriodicDrain is invoking
+        // drainOnce() on its own with no external trigger.
+        try store.saveDraft(TestSupport.makeDraft(clientId: "tick-1"))
+        await waitUntil { convex.capturesCreateCalls.count >= 1 }
+
+        // Only queue the second draft after the first has already synced,
+        // so a second successful capturesCreate call can only be produced
+        // by a *subsequent* tick of the same loop, not a single call.
+        try store.saveDraft(TestSupport.makeDraft(clientId: "tick-2"))
+        await waitUntil { convex.capturesCreateCalls.count >= 2 }
+
+        periodicTask.cancel()
+
+        XCTAssertGreaterThanOrEqual(convex.capturesCreateCalls.count, 2)
+        XCTAssertEqual(Set(convex.capturesCreateCalls.map(\.clientId)), ["tick-1", "tick-2"])
+        XCTAssertEqual(try store.draft(clientId: "tick-1")?.localState, .synced)
+        XCTAssertEqual(try store.draft(clientId: "tick-2")?.localState, .synced)
+    }
+
+    func testPeriodicDrainOverlappingWithExplicitDrainOnceCoalescesWithoutDoubleProcessing() async throws {
+        let (store, tempDir) = try TestSupport.makeStore()
+        self.tempDir = tempDir
+
+        let first = TestSupport.makeDraft(clientId: "periodic-first", capturedAt: Date(timeIntervalSince1970: 100))
+        let second = TestSupport.makeDraft(clientId: "periodic-second", capturedAt: Date(timeIntervalSince1970: 200))
+        try store.saveDraft(first)
+        try store.saveDraft(second)
+
+        let convex = FakeConvexService()
+        // Same technique as
+        // testConcurrentDrainOnceCallsDoNotDoubleProcessSameDraft: block the
+        // periodic loop's first tick mid-`syncOne` for "periodic-first"
+        // until the test explicitly releases it, so an explicit drainOnce()
+        // call (simulating e.g. a capture-submit trigger) can be started
+        // while the periodic loop's own drainOnce() call is provably still
+        // draining -- the exact race the `isDraining` guard exists to
+        // prevent, now exercised across two independent loops instead of
+        // two direct calls.
+        let firstCallStarted = TestSignal()
+        let releaseFirstCall = TestSignal()
+        convex.onCapturesCreate = { input in
+            if input.clientId == "periodic-first" {
+                firstCallStarted.fire()
+                await releaseFirstCall.wait()
+            }
+            return "server-\(input.clientId)"
+        }
+
+        let engine = SyncEngine(store: store, convex: convex)
+
+        // Short interval so the periodic loop's first tick fires almost
+        // immediately -- the test only needs that one tick to overlap with
+        // the explicit call below.
+        let periodicTask = Task { await engine.runPeriodicDrain(interval: .milliseconds(5)) }
+
+        await firstCallStarted.wait()
+
+        // At this point the periodic loop's drainOnce() has snapshotted
+        // both drafts, marked "periodic-first" `.syncing`, and is suspended
+        // inside `syncOne` -- an explicit drainOnce() call here must
+        // coalesce via the `isDraining` guard rather than taking its own
+        // snapshot and double-processing "periodic-second".
+        async let explicitDrain = engine.drainOnce()
+
+        try await Task.sleep(nanoseconds: 50_000_000)
+        releaseFirstCall.fire()
+
+        _ = await explicitDrain
+        // Let the periodic loop's in-flight pass (which may loop once more
+        // via `rerunRequested`) finish before cancelling and asserting.
+        await waitUntil { (try? store.draft(clientId: "periodic-second")?.localState) == .synced }
+        periodicTask.cancel()
+
+        let clientIds = convex.capturesCreateCalls.map(\.clientId)
+        XCTAssertEqual(
+            clientIds.filter { $0 == "periodic-first" }.count, 1,
+            "expected exactly one capturesCreate call for periodic-first, got: \(clientIds)"
+        )
+        XCTAssertEqual(
+            clientIds.filter { $0 == "periodic-second" }.count, 1,
+            "expected exactly one capturesCreate call for periodic-second, got: \(clientIds)"
+        )
+        XCTAssertEqual(try store.draft(clientId: "periodic-first")?.localState, .synced)
+        XCTAssertEqual(try store.draft(clientId: "periodic-second")?.localState, .synced)
+    }
+
+    // MARK: - Launch-time recovery of drafts stranded `.syncing` (U-followup)
+
+    func testRecoverStrandedSyncingRevertsSyncingDraftsToQueued() async throws {
+        let (store, tempDir) = try TestSupport.makeStore()
+        self.tempDir = tempDir
+
+        // A draft frozen `.syncing` by a prior process that hung/was killed
+        // mid-`syncOne`. `drainPass` only re-fetches `.queued`/`.syncFailed`,
+        // so without recovery this would never sync again -- not even after a
+        // relaunch.
+        try store.saveDraft(TestSupport.makeDraft(clientId: "stranded"))
+        try store.updateLocalState(clientId: "stranded", to: .syncing)
+
+        let logs = LogCollector()
+        let engine = SyncEngine(store: store, convex: FakeConvexService(), logger: logs.log)
+
+        await engine.recoverStrandedSyncing()
+
+        XCTAssertEqual(
+            try store.draft(clientId: "stranded")?.localState, .queued,
+            "a stranded .syncing draft must be reverted to .queued so the next drain retries it"
+        )
+        XCTAssertTrue(
+            logs.messages.contains { $0.contains("recovered stranded .syncing draft stranded") },
+            "expected a recovery log line, got: \(logs.messages)"
+        )
+    }
+
+    func testRecoverStrandedSyncingLeavesNonSyncingDraftsUntouched() async throws {
+        let (store, tempDir) = try TestSupport.makeStore()
+        self.tempDir = tempDir
+
+        try store.saveDraft(TestSupport.makeDraft(clientId: "queued-one"))  // stays .queued
+        try store.saveDraft(TestSupport.makeDraft(clientId: "failed-one"))
+        try store.updateLocalState(clientId: "failed-one", to: .syncFailed)
+
+        let engine = SyncEngine(store: store, convex: FakeConvexService())
+
+        await engine.recoverStrandedSyncing()
+
+        XCTAssertEqual(try store.draft(clientId: "queued-one")?.localState, .queued)
+        XCTAssertEqual(
+            try store.draft(clientId: "failed-one")?.localState, .syncFailed,
+            "recovery must only touch .syncing drafts, not .syncFailed ones (which keep their retry affordance)"
+        )
     }
 
     // MARK: - Currently-silent `store.drafts(in:)` read failure is now logged
