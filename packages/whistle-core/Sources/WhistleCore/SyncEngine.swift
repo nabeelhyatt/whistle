@@ -213,6 +213,7 @@ public actor SyncEngine {
         // snapshot of the same queued/syncFailed drafts.
         if isDraining {
             rerunRequested = true
+            logger("Whistle: SyncEngine drain already in flight, requesting rerun")
             return []
         }
 

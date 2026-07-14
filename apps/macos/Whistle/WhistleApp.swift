@@ -305,7 +305,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func drainSyncIfSignedIn() async {
-        guard authController?.state == .signedIn, let syncEngine else { return }
+        guard authController?.state == .signedIn, let syncEngine else {
+            NSLog("Whistle: drainSyncIfSignedIn skipped — authState=%@ syncEngine=%@",
+                  String(describing: authController?.state), syncEngine == nil ? "nil" : "present")
+            return
+        }
         _ = await syncEngine.drainOnce()
     }
 

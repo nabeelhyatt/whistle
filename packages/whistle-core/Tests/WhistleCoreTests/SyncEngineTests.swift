@@ -324,7 +324,8 @@ final class SyncEngineTests: XCTestCase {
             return "server-\(input.clientId)"
         }
 
-        let engine = SyncEngine(store: store, convex: convex)
+        let logs = LogCollector()
+        let engine = SyncEngine(store: store, convex: convex, logger: logs.log)
 
         async let firstDrain = engine.drainOnce()
         await firstCallStarted.wait()
@@ -353,6 +354,11 @@ final class SyncEngineTests: XCTestCase {
             "expected both drafts synced exactly once across both calls, got: \(allSynced)"
         )
         XCTAssertEqual(allSynced.count, 2, "expected no draft synced twice, got: \(allSynced)")
+
+        XCTAssertTrue(
+            logs.messages.contains { $0.contains("drain already in flight, requesting rerun") },
+            "expected the coalesced second drainOnce() call to log that a drain was already in flight, got: \(logs.messages)"
+        )
 
         let clientIds = convex.capturesCreateCalls.map(\.clientId)
         XCTAssertEqual(
