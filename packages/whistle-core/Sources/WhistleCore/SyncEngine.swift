@@ -204,6 +204,7 @@ public actor SyncEngine {
     @discardableResult
     public func drainOnce() async -> [String] {
         if let networkMonitor, await networkMonitor.isOnline == false {
+            logger("Whistle: SyncEngine skipping drain — network monitor reports offline")
             return []
         }
 
