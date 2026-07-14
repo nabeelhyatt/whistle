@@ -314,12 +314,24 @@ public struct CaptureCreateInput: Equatable, Sendable {
 
         // MARK: - Authenticated call helpers (attach auth, then call)
 
+        /// Bounded wait for an authenticated mutation, so a hung
+        /// `client.mutation(...)` call (dropped connection with no error,
+        /// a network-transition edge case) fails instead of suspending the
+        /// caller forever — see `Self.withTimeout` for the mechanics. A
+        /// hang here previously also permanently wedged `SyncEngine`'s
+        /// `isDraining` reentrancy guard, silently disabling all future
+        /// capture syncing for the rest of the process's life (observed
+        /// live: captures sat unsynced for 20+ hours until an app relaunch).
+        private static let authedCallTimeout: Duration = .seconds(15)
+
         private func authedMutation<T: Decodable>(
             _ name: String, with args: [String: ConvexEncodable?]? = nil
         ) async throws -> T {
             try await ensureAuthAttached()
             do {
-                return try await client.mutation(name, with: args)
+                return try await Self.withTimeout(Self.authedCallTimeout) {
+                    try await self.client.mutation(name, with: args)
+                }
             } catch {
                 NSLog("Whistle: Convex mutation %@ failed: %@", name, String(describing: error))
                 throw Self.mapAuthError(error)
@@ -337,7 +349,9 @@ public struct CaptureCreateInput: Equatable, Sendable {
         ) async throws -> T {
             try await ensureAuthAttached()
             do {
-                return try await client.action(name, with: args)
+                return try await Self.withTimeout(Self.authedCallTimeout) {
+                    try await self.client.action(name, with: args)
+                }
             } catch {
                 NSLog("Whistle: Convex action %@ failed: %@", name, String(describing: error))
                 throw Self.mapAuthError(error)
@@ -580,6 +594,41 @@ public struct CaptureCreateInput: Equatable, Sendable {
                 continuation.onTermination = { _ in
                     subscriptionTask.cancel()
                 }
+            }
+        }
+
+        // MARK: - Bounded-wait helper (shared by mutations/actions/queries)
+
+        /// Races `operation` against `timeout`, throwing a
+        /// `ConvexServiceError` if the timeout elapses first. Same
+        /// task-group race-two-tasks-cancel-the-loser shape as
+        /// `firstValue` below (a task running the real work, a second task
+        /// that sleeps then throws, `defer { group.cancelAll() }` so the
+        /// loser is always torn down) — extracted here so `authedMutation`/
+        /// `authedAction` can apply the same bounded-wait guarantee that
+        /// one-shot queries already had via `firstValue`, without duplicating
+        /// the task-group plumbing.
+        ///
+        /// Internal (not private) and free of any `LiveConvexService`
+        /// instance state, so it's unit-testable in isolation against a
+        /// synthetic `operation`; see `ConvexTimeoutTests`.
+        static func withTimeout<T: Sendable>(
+            _ timeout: Duration,
+            operation: @escaping @Sendable () async throws -> T
+        ) async throws -> T {
+            try await withThrowingTaskGroup(of: T.self) { group in
+                group.addTask {
+                    try await operation()
+                }
+                group.addTask {
+                    try await Task.sleep(for: timeout)
+                    throw ConvexServiceError.requestFailed("operation timed out")
+                }
+                defer { group.cancelAll() }
+                guard let result = try await group.next() else {
+                    throw ConvexServiceError.requestFailed("operation produced no result")
+                }
+                return result
             }
         }
 
