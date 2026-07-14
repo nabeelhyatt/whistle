@@ -10,27 +10,23 @@
 // all future capture syncing for the rest of that process's life (observed
 // live: captures sat unsynced for 20+ hours until an app relaunch).
 //
-// The fix extracts `LiveConvexService.withTimeout`, the same
-// task-group race-two-tasks shape `firstValue` already used, and wraps the
-// mutation/action calls with it. `LiveConvexService` itself can't be
-// driven hermetically (convex-swift's ffi-client seam is internal to the
-// package, same constraint noted in ConvexAuthAttachmentTests /
-// ConvexOneShotQueryTests), but `withTimeout` takes a plain `@Sendable`
-// async closure and has no instance state, so it's fully testable in
-// isolation.
+// The fix wraps the mutation/action calls in `LiveConvexService.withTimeout`,
+// which runs the operation in an unstructured `Task` and races it against a
+// timer via a single-resume continuation -- so it returns the instant the
+// timeout fires even if the operation never finishes AND never checks
+// cancellation. `LiveConvexService` itself can't be driven hermetically
+// (convex-swift's ffi-client seam is internal to the package, same constraint
+// noted in ConvexAuthAttachmentTests / ConvexOneShotQueryTests), but
+// `withTimeout` takes a plain `@Sendable` async closure and has no instance
+// state, so it's fully testable in isolation.
 //
-// Important scope note (see `withTimeout`'s doc comment): this bounds the
-// common "slow but eventually answers" case. For a genuinely-stuck
-// convex-swift FFI call that never checks Swift task cancellation, the
-// timeout task still fires and this function still returns promptly to
-// ITS caller -- but the underlying `withThrowingTaskGroup` scope in
-// `authedMutation`/`authedAction` cannot fully exit until that FFI call
-// eventually settles, per Swift's structured-concurrency guarantee that a
-// task group awaits all children before returning. These tests use a
-// synthetic `operation` (a `Task.sleep`), which IS cancellation-aware, so
-// they verify `withTimeout`'s own race/return logic correctly, but they
-// cannot exercise -- and therefore cannot regress-guard -- the
-// non-cancellation-aware-FFI-call scenario that motivated this fix.
+// Crucially, `testReturnsPromptlyWhenOperationIgnoresCancellation` below
+// reproduces the exact motivating scenario -- an operation that neither
+// completes nor honors cancellation (via a continuation that never resumes),
+// modeling the non-cancellation-aware convex-swift FFI call. The previous
+// `withThrowingTaskGroup` implementation would hang there forever (a task
+// group cannot return until every child finishes, per SE-0304); the current
+// implementation returns at the timeout. That regression is now guarded.
 
 import XCTest
 
@@ -49,6 +45,43 @@ import XCTest
                 XCTFail("must throw when the operation never completes before the timeout")
             } catch {
                 XCTAssertEqual(error as? ConvexServiceError, .requestFailed("operation timed out"))
+            }
+        }
+
+        func testReturnsPromptlyWhenOperationIgnoresCancellation() async {
+            // The heart of the fix: an operation that never completes and
+            // never checks `Task.isCancelled` -- exactly how convex-swift's
+            // `uniffiRustCallAsync` polling loop behaves on a hung/dropped
+            // connection. `withCheckedContinuation { _ in }` never resumes and
+            // has no cancellation handler, so cancelling its task does nothing.
+            // The old task-group version would block here forever (wedging
+            // `SyncEngine.isDraining`); this must still return at the timeout.
+            let start = Date()
+            do {
+                _ = try await LiveConvexService.withTimeout(.milliseconds(50)) {
+                    await withCheckedContinuation { (_: CheckedContinuation<Void, Never>) in }
+                    return "unreachable"
+                }
+                XCTFail("must throw a timeout even when the operation ignores cancellation")
+            } catch {
+                XCTAssertEqual(error as? ConvexServiceError, .requestFailed("operation timed out"))
+            }
+            let elapsed = Date().timeIntervalSince(start)
+            XCTAssertLessThan(
+                elapsed, 2.0,
+                "withTimeout must return at the timeout, not wait for the hung operation (elapsed: \(elapsed)s)"
+            )
+        }
+
+        func testUsesTheProvidedTimeoutMessage() async {
+            do {
+                _ = try await LiveConvexService.withTimeout(.milliseconds(20), timeoutMessage: "custom message") {
+                    try await Task.sleep(for: .seconds(60))
+                    return "unreachable"
+                }
+                XCTFail("must throw")
+            } catch {
+                XCTAssertEqual(error as? ConvexServiceError, .requestFailed("custom message"))
             }
         }
 

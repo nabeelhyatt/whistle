@@ -358,4 +358,34 @@ public actor SyncEngine {
             _ = await drainOnce()
         }
     }
+
+    /// Recovers drafts a previous process left stranded in `.syncing`.
+    ///
+    /// `drainPass` marks a draft `.syncing` *before* the awaited network
+    /// call, and only ever re-fetches `.queued`/`.syncFailed`. So if that
+    /// call never returns (a hang, or the process being killed mid-sync),
+    /// the draft is frozen `.syncing` forever: the next drain skips it, and
+    /// even a relaunch -- the documented fallback -- never picks it back up,
+    /// because a fresh process's `drainPass` still only looks at
+    /// `.queued`/`.syncFailed`. Reverting these to `.queued` at launch closes
+    /// that hole.
+    ///
+    /// Call this ONCE at launch, before any drain starts. It is unsafe to
+    /// call concurrently with an in-flight drain within the same process,
+    /// where `.syncing` legitimately means "being processed right now" -- but
+    /// at launch no drain has run yet, so every `.syncing` draft is
+    /// necessarily a stale strand from a prior process.
+    public func recoverStrandedSyncing() async {
+        let stranded: [CaptureDraft]
+        do {
+            stranded = try store.drafts(in: [.syncing])
+        } catch {
+            logger("Whistle: SyncEngine failed to read stranded .syncing drafts: \(error)")
+            return
+        }
+        for draft in stranded {
+            _ = try? store.updateLocalState(clientId: draft.clientId, to: .queued, localError: nil)
+            logger("Whistle: SyncEngine recovered stranded .syncing draft \(draft.clientId) -> .queued")
+        }
+    }
 }

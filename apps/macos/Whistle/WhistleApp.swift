@@ -126,6 +126,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             networkMonitor: networkMonitor
         )
         self.syncEngine = syncEngine
+        // Recover any drafts a previous process left stranded in `.syncing`
+        // (a hang or kill mid-sync), then drain -- `drainPass` only re-fetches
+        // `.queued`/`.syncFailed`, so without this a strand would never sync,
+        // not even after a relaunch. Runs before the triggers below so the
+        // reverted drafts are visible to the very first drain.
+        Task { [weak syncEngine] in
+            await syncEngine?.recoverStrandedSyncing()
+            _ = await syncEngine?.drainOnce()
+        }
         Task { [weak self, weak networkMonitor] in
             guard let networkMonitor else { return }
             for await online in networkMonitor.pathUpdates() where online {

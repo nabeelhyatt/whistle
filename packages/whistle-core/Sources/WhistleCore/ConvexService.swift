@@ -276,11 +276,25 @@ public struct CaptureCreateInput: Equatable, Sendable {
 
         private func ensureAuthAttached() async throws {
             let attached = await authGate.runIfNeeded { [client] in
-                switch await client.loginFromCache() {
-                case .success:
-                    return true
-                case let .failure(error):
-                    NSLog("Whistle: attaching auth to Convex client failed: %@", String(describing: error))
+                // `loginFromCache()` is itself a network-touching call with
+                // no internal timeout; a hang here (before `withTimeout` ever
+                // wraps the mutation/action below) would wedge syncing just
+                // like a hung mutation once did. Bound it too, so a stuck
+                // login defers (revert-to-`.queued` via `.notAuthenticated`)
+                // instead of blocking the drain forever.
+                do {
+                    let result = try await Self.withTimeout(Self.authedCallTimeout) {
+                        await client.loginFromCache()
+                    }
+                    switch result {
+                    case .success:
+                        return true
+                    case let .failure(error):
+                        NSLog("Whistle: attaching auth to Convex client failed: %@", String(describing: error))
+                        return false
+                    }
+                } catch {
+                    NSLog("Whistle: attaching auth to Convex client timed out: %@", String(describing: error))
                     return false
                 }
             }
@@ -314,17 +328,15 @@ public struct CaptureCreateInput: Equatable, Sendable {
 
         // MARK: - Authenticated call helpers (attach auth, then call)
 
-        /// Bounded wait for an authenticated mutation, so a slow
-        /// `client.mutation(...)` call fails after `authedCallTimeout`
-        /// instead of the caller waiting indefinitely — see
-        /// `Self.withTimeout`'s doc comment for an important caveat: this
-        /// is a best-effort bound, not a hard kill switch, for a call that
-        /// never checks Swift task cancellation. A hang here previously
-        /// also permanently wedged `SyncEngine`'s `isDraining` reentrancy
-        /// guard, silently disabling all future capture syncing for the
-        /// rest of the process's life (observed live: captures sat
-        /// unsynced for 20+ hours until an app relaunch) — this reduces
-        /// but does not eliminate that risk; see `withTimeout` for why.
+        /// Upper bound on how long an authenticated mutation/action (and the
+        /// `loginFromCache()` attach) may block the caller. `Self.withTimeout`
+        /// enforces this as a real bound — it returns the instant this
+        /// elapses even if the underlying convex-swift FFI call never checks
+        /// cancellation (see `withTimeout`). This is what prevents a hung call
+        /// from permanently wedging `SyncEngine`'s `isDraining` reentrancy
+        /// guard, the failure that once left captures unsynced for 20+ hours
+        /// until an app relaunch. 15s is generous for a real slow network yet
+        /// short enough that a genuine hang self-resolves into a retry quickly.
         private static let authedCallTimeout: Duration = .seconds(15)
 
         private func authedMutation<T: Decodable>(
@@ -397,12 +409,26 @@ public struct CaptureCreateInput: Equatable, Sendable {
         }
 
         public func settingsUpdate(_ patch: SettingsPatch) async throws {
-            // Same nil-key encoding issue as `capturesCreate` above: every
-            // field here is `v.optional(...)` on the backend specifically so
-            // a partial patch can update just one field and leave the rest
-            // untouched, but a nil-valued dict entry serializes as literal
-            // JSON `null`, which `v.optional(...)` rejects. Omit unset
-            // fields entirely instead of sending them as `null`.
+            try await authedMutation("settings:update", with: Self.settingsUpdateArgs(patch))
+        }
+
+        /// Builds the `settings:update` argument dict, omitting unset fields
+        /// entirely rather than sending them as `null`. Every field is
+        /// `v.optional(...)` on the backend specifically so a partial patch
+        /// can update just one field and leave the rest untouched — but a
+        /// nil-valued dict entry serializes as literal JSON `null`, which
+        /// `v.optional(...)` rejects. Extracted as a pure, `internal` static
+        /// function so the omit-vs-null encoding (a real production fix) is
+        /// unit-testable without a live `ConvexClient`; see
+        /// `ConvexArgEncodingTests`.
+        ///
+        /// KNOWN LIMITATION (tracked separately): because a nil field means
+        /// "leave untouched," there is no way to *clear* a previously-set
+        /// field back to empty through this API — clearing the model or
+        /// deselecting the default project is silently a no-op. A true clear
+        /// needs a tri-state patch representation plus a backend clear
+        /// sentinel.
+        static func settingsUpdateArgs(_ patch: SettingsPatch) -> [String: ConvexEncodable?] {
             var args: [String: ConvexEncodable?] = [:]
             if let defaultProjectId = patch.defaultProjectId {
                 args["defaultProjectId"] = defaultProjectId
@@ -416,7 +442,7 @@ public struct CaptureCreateInput: Equatable, Sendable {
             if let screenshotsEnabled = patch.screenshotsEnabled {
                 args["screenshotsEnabled"] = screenshotsEnabled
             }
-            try await authedMutation("settings:update", with: args)
+            return args
         }
 
         public func settingsSetConductorKey(_ key: String) async throws {
@@ -477,14 +503,21 @@ public struct CaptureCreateInput: Equatable, Sendable {
         // MARK: captures
 
         public func capturesCreate(_ input: CaptureCreateInput) async throws -> String {
-            // `screenshotId`/`model` are omitted entirely when nil rather than
-            // included with a `nil` value: the backend validator is
-            // `v.optional(...)`, which only tolerates the key being ABSENT --
-            // convex-swift's dictionary encoder has no way to express "omit
-            // this key," so a nil-valued entry in the args dict always
-            // serializes as the literal JSON `null`, which `v.optional(...)`
-            // rejects (`ArgumentValidationError`, observed in production:
-            // every capture with no model/screenshot was failing to sync).
+            try await authedMutation("captures:create", with: Self.capturesCreateArgs(input))
+        }
+
+        /// Builds the `captures:create` argument dict, omitting the two
+        /// optional fields (`screenshotId`/`model`) entirely when nil rather
+        /// than including them with a `nil` value. The backend validator is
+        /// `v.optional(...)`, which only tolerates the key being ABSENT --
+        /// convex-swift's dictionary encoder has no way to express "omit this
+        /// key," so a nil-valued entry always serializes as the literal JSON
+        /// `null`, which `v.optional(...)` rejects (`ArgumentValidationError`,
+        /// observed in production: every capture with no model/screenshot was
+        /// failing to sync). Extracted as a pure, `internal` static function
+        /// so this encoding is unit-testable without a live `ConvexClient`;
+        /// see `ConvexArgEncodingTests`.
+        static func capturesCreateArgs(_ input: CaptureCreateInput) -> [String: ConvexEncodable?] {
             var args: [String: ConvexEncodable?] = [
                 "clientId": input.clientId,
                 "transcript": input.transcript,
@@ -500,7 +533,7 @@ public struct CaptureCreateInput: Equatable, Sendable {
             if let model = input.model {
                 args["model"] = model
             }
-            return try await authedMutation("captures:create", with: args)
+            return args
         }
 
         public func capturesListRecent(limit: Int) -> AsyncStream<[ServerCaptureRecord]> {
@@ -602,53 +635,91 @@ public struct CaptureCreateInput: Equatable, Sendable {
 
         // MARK: - Bounded-wait helper (shared by mutations/actions/queries)
 
-        /// Races `operation` against `timeout`, throwing a
-        /// `ConvexServiceError` if the timeout elapses first. Same
-        /// task-group race-two-tasks shape as `firstValue` below (a task
-        /// running the real work, a second task that sleeps then throws,
-        /// `defer { group.cancelAll() }`) — extracted here so
-        /// `authedMutation`/`authedAction` can apply the same bounded-wait
-        /// guarantee that one-shot queries already had via `firstValue`,
-        /// without duplicating the task-group plumbing.
+        /// Single-resume race arbiter for `withTimeout`: whichever of the
+        /// two racing tasks (the real work, or the timeout timer) finishes
+        /// first delivers its result to the awaiting caller; the loser's
+        /// later result is dropped. Thread-safe because the two tasks run
+        /// concurrently on the global executor.
+        private final class TimeoutState<T: Sendable>: @unchecked Sendable {
+            private let lock = NSLock()
+            private var result: Result<T, Error>?
+            private var continuation: CheckedContinuation<T, Error>?
+
+            /// Called by both racers; only the first call wins.
+            func finish(_ outcome: Result<T, Error>) {
+                let waiting: CheckedContinuation<T, Error>? = lock.withLock {
+                    guard result == nil else { return nil }
+                    result = outcome
+                    defer { continuation = nil }
+                    return continuation
+                }
+                waiting?.resume(with: outcome)
+            }
+
+            /// Awaited exactly once by `withTimeout`. Returns as soon as the
+            /// first racer finishes — it does NOT await the loser, which is
+            /// the whole point (see `withTimeout`).
+            func value() async throws -> T {
+                try await withCheckedThrowingContinuation { cont in
+                    let ready: Result<T, Error>? = lock.withLock {
+                        if let result { return result }
+                        continuation = cont
+                        return nil
+                    }
+                    if let ready { cont.resume(with: ready) }
+                }
+            }
+        }
+
+        /// Races `operation` against `timeout`, throwing
+        /// `ConvexServiceError.requestFailed(timeoutMessage)` if the timeout
+        /// elapses first. Extracted so `authedMutation`/`authedAction` and
+        /// `firstValue` share one bounded-wait implementation instead of
+        /// duplicating the plumbing.
         ///
-        /// IMPORTANT caveat, not a hard guarantee: `group.cancelAll()` only
-        /// sets cooperative cancellation on the losing task — it does not
-        /// forcibly stop it. `convex-swift` 0.8.1's `client.mutation`/
-        /// `client.action` bottom out in a UniFFI polling loop
-        /// (`uniffiRustCallAsync`) that never checks `Task.isCancelled`, so
-        /// on a genuinely-hung/dropped-connection call, the loser keeps
-        /// running in the background and `withThrowingTaskGroup` (which
-        /// cannot return until every child task has actually finished,
-        /// per SE-0304) still won't let this function return until that
-        /// FFI call eventually settles on its own — possibly never. This
-        /// bounds the common case (a slow-but-eventually-answering call)
-        /// and prevents the caller from waiting *longer* than `timeout` in
-        /// that case; it is not a true kill switch for a truly-stuck FFI
-        /// future. A real hard bound would require convex-swift to expose
-        /// call cancellation, or tearing down/reconnecting the whole
-        /// `ConvexClient` to force the stuck future to resolve.
+        /// Why this uses an unstructured `Task` + a single-resume
+        /// continuation rather than `withThrowingTaskGroup`: a task group
+        /// cannot return until *every* child task has finished (SE-0304),
+        /// and `cancelAll()` is cooperative-only. `convex-swift` 0.8.1's
+        /// `client.mutation`/`client.action` bottom out in a UniFFI polling
+        /// loop (`uniffiRustCallAsync`) that never checks `Task.isCancelled`,
+        /// so a genuinely-hung/dropped-connection call would keep a group
+        /// child running forever and a group-based race would never return —
+        /// which is exactly what previously left `SyncEngine`'s `isDraining`
+        /// reentrancy guard wedged `true` for the rest of the process's life
+        /// (observed live: captures sat unsynced for 20+ hours until a
+        /// relaunch). Running `operation` in an unstructured task means this
+        /// function returns the instant the timer fires: the timed-out call
+        /// is thrown to the caller, `isDraining` resets, and retries proceed.
+        /// The hung operation task is cancelled (a no-op for the
+        /// non-cancellation-aware FFI call) and leaks in the background until
+        /// the FFI future eventually settles on its own — a cheap suspended
+        /// task, and a strictly better trade than a permanent wedge. This
+        /// therefore delivers a real upper bound of `timeout` on the caller's
+        /// wait, unlike the previous group-based version.
         ///
         /// Internal (not private) and free of any `LiveConvexService`
         /// instance state, so it's unit-testable in isolation against a
         /// synthetic `operation`; see `ConvexTimeoutTests`.
         static func withTimeout<T: Sendable>(
             _ timeout: Duration,
+            timeoutMessage: String = "operation timed out",
             operation: @escaping @Sendable () async throws -> T
         ) async throws -> T {
-            try await withThrowingTaskGroup(of: T.self) { group in
-                group.addTask {
-                    try await operation()
-                }
-                group.addTask {
-                    try await Task.sleep(for: timeout)
-                    throw ConvexServiceError.requestFailed("operation timed out")
-                }
-                defer { group.cancelAll() }
-                guard let result = try await group.next() else {
-                    throw ConvexServiceError.requestFailed("operation produced no result")
-                }
-                return result
+            let state = TimeoutState<T>()
+            let work = Task {
+                do { state.finish(.success(try await operation())) }
+                catch { state.finish(.failure(error)) }
             }
+            let timer = Task {
+                try? await Task.sleep(for: timeout)
+                state.finish(.failure(ConvexServiceError.requestFailed(timeoutMessage)))
+            }
+            defer {
+                timer.cancel()
+                work.cancel()
+            }
+            return try await state.value()
         }
 
         // MARK: - One-shot query support (subscribe -> first value -> cancel)
@@ -667,30 +738,24 @@ public struct CaptureCreateInput: Equatable, Sendable {
         /// instance state — so it's unit-testable against a synthetic
         /// `AnyPublisher` without a live `ConvexClient`; see
         /// `ConvexOneShotQueryTests`.
+        ///
+        /// Shares the one bounded-wait primitive (`withTimeout`) rather than
+        /// duplicating the race plumbing. Unlike the mutation/action path,
+        /// the underlying `AsyncThrowingPublisher` IS cancellation-aware, so
+        /// when `withTimeout` cancels the losing work task the subscription
+        /// is actually torn down (returning out of the `for try await` loop
+        /// triggers `AnyPublisher.values`' cancel-on-task-cancel behavior).
         static func firstValue<T: Sendable>(
             from publisher: AnyPublisher<T, ClientError>,
             timeout: Duration = .seconds(10)
         ) async throws -> T {
-            try await withThrowingTaskGroup(of: T.self) { group in
-                group.addTask {
-                    for try await value in publisher.values {
-                        return value
-                    }
-                    throw ConvexServiceError.requestFailed(
-                        "query completed without yielding a value"
-                    )
+            try await withTimeout(timeout, timeoutMessage: "query timed out waiting for a value") {
+                for try await value in publisher.values {
+                    return value
                 }
-                group.addTask {
-                    try await Task.sleep(for: timeout)
-                    throw ConvexServiceError.requestFailed(
-                        "query timed out waiting for a value"
-                    )
-                }
-                defer { group.cancelAll() }
-                guard let result = try await group.next() else {
-                    throw ConvexServiceError.requestFailed("query produced no result")
-                }
-                return result
+                throw ConvexServiceError.requestFailed(
+                    "query completed without yielding a value"
+                )
             }
         }
     }

@@ -522,6 +522,53 @@ final class SyncEngineTests: XCTestCase {
         XCTAssertEqual(try store.draft(clientId: "periodic-second")?.localState, .synced)
     }
 
+    // MARK: - Launch-time recovery of drafts stranded `.syncing` (U-followup)
+
+    func testRecoverStrandedSyncingRevertsSyncingDraftsToQueued() async throws {
+        let (store, tempDir) = try TestSupport.makeStore()
+        self.tempDir = tempDir
+
+        // A draft frozen `.syncing` by a prior process that hung/was killed
+        // mid-`syncOne`. `drainPass` only re-fetches `.queued`/`.syncFailed`,
+        // so without recovery this would never sync again -- not even after a
+        // relaunch.
+        try store.saveDraft(TestSupport.makeDraft(clientId: "stranded"))
+        try store.updateLocalState(clientId: "stranded", to: .syncing)
+
+        let logs = LogCollector()
+        let engine = SyncEngine(store: store, convex: FakeConvexService(), logger: logs.log)
+
+        await engine.recoverStrandedSyncing()
+
+        XCTAssertEqual(
+            try store.draft(clientId: "stranded")?.localState, .queued,
+            "a stranded .syncing draft must be reverted to .queued so the next drain retries it"
+        )
+        XCTAssertTrue(
+            logs.messages.contains { $0.contains("recovered stranded .syncing draft stranded") },
+            "expected a recovery log line, got: \(logs.messages)"
+        )
+    }
+
+    func testRecoverStrandedSyncingLeavesNonSyncingDraftsUntouched() async throws {
+        let (store, tempDir) = try TestSupport.makeStore()
+        self.tempDir = tempDir
+
+        try store.saveDraft(TestSupport.makeDraft(clientId: "queued-one"))  // stays .queued
+        try store.saveDraft(TestSupport.makeDraft(clientId: "failed-one"))
+        try store.updateLocalState(clientId: "failed-one", to: .syncFailed)
+
+        let engine = SyncEngine(store: store, convex: FakeConvexService())
+
+        await engine.recoverStrandedSyncing()
+
+        XCTAssertEqual(try store.draft(clientId: "queued-one")?.localState, .queued)
+        XCTAssertEqual(
+            try store.draft(clientId: "failed-one")?.localState, .syncFailed,
+            "recovery must only touch .syncing drafts, not .syncFailed ones (which keep their retry affordance)"
+        )
+    }
+
     // MARK: - Currently-silent `store.drafts(in:)` read failure is now logged
 
     func testDraftsReadFailureLogsReadFailureMessage() async throws {
