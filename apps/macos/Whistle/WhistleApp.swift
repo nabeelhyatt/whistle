@@ -132,6 +132,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 await self?.drainSyncIfSignedIn()
             }
         }
+        // Safety net, not the primary sync path: the trigger-based drain
+        // above (and the launch/submit/manual-retry drains elsewhere) can in
+        // principle silently miss firing or fail to recover. This
+        // independent periodic loop self-heals a stuck capture within a
+        // bounded time without requiring a manual relaunch. It calls
+        // `drainOnce()` directly (not gated on signed-in state like
+        // `drainSyncIfSignedIn()`) since `drainOnce()` is already a no-op
+        // while offline/no drafts, and by the time the first 180s tick
+        // elapses, auth state has long since resolved.
+        Task { await syncEngine.runPeriodicDrain() }
 
         let notificationService = NotificationService()
         self.notificationService = notificationService

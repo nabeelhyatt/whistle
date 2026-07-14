@@ -316,4 +316,30 @@ public actor SyncEngine {
             }
         }
     }
+
+    /// Safety net, not the primary sync path: every trigger-based drain
+    /// (launch, network-path change, capture submit, manual retry) can in
+    /// principle miss firing or fail to recover, leaving a capture stuck
+    /// `queued`/`syncFailed` until the app is relaunched. This independent
+    /// loop guarantees a capture is retried within `interval` regardless of
+    /// whether any other trigger ever fires. It is intentionally a separate
+    /// loop from `runForever()` rather than folded into its
+    /// `networkMonitor.pathUpdates()` loop, so a hung/absent network monitor
+    /// can never suppress the periodic retry too. Safe to run concurrently
+    /// with any other caller of `drainOnce()` -- the `isDraining`/
+    /// `rerunRequested` guard above coalesces overlapping passes.
+    public func runPeriodicDrain(interval: Duration = .seconds(180)) async {
+        // `Task.sleep(for:)` throws `CancellationError` once the driving
+        // Task is cancelled, but Swift's cooperative cancellation is
+        // opt-in -- a bare `try?` around the sleep would silently swallow
+        // that error and `Task.sleep` returns immediately once cancelled,
+        // so without the explicit `Task.isCancelled` checks below this loop
+        // would busy-spin calling `drainOnce()` forever instead of actually
+        // stopping when a caller (e.g. a test) cancels it.
+        while !Task.isCancelled {
+            try? await Task.sleep(for: interval)
+            if Task.isCancelled { break }
+            _ = await drainOnce()
+        }
+    }
 }
