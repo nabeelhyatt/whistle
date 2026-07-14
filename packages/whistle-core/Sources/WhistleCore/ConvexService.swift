@@ -314,14 +314,17 @@ public struct CaptureCreateInput: Equatable, Sendable {
 
         // MARK: - Authenticated call helpers (attach auth, then call)
 
-        /// Bounded wait for an authenticated mutation, so a hung
-        /// `client.mutation(...)` call (dropped connection with no error,
-        /// a network-transition edge case) fails instead of suspending the
-        /// caller forever — see `Self.withTimeout` for the mechanics. A
-        /// hang here previously also permanently wedged `SyncEngine`'s
-        /// `isDraining` reentrancy guard, silently disabling all future
-        /// capture syncing for the rest of the process's life (observed
-        /// live: captures sat unsynced for 20+ hours until an app relaunch).
+        /// Bounded wait for an authenticated mutation, so a slow
+        /// `client.mutation(...)` call fails after `authedCallTimeout`
+        /// instead of the caller waiting indefinitely — see
+        /// `Self.withTimeout`'s doc comment for an important caveat: this
+        /// is a best-effort bound, not a hard kill switch, for a call that
+        /// never checks Swift task cancellation. A hang here previously
+        /// also permanently wedged `SyncEngine`'s `isDraining` reentrancy
+        /// guard, silently disabling all future capture syncing for the
+        /// rest of the process's life (observed live: captures sat
+        /// unsynced for 20+ hours until an app relaunch) — this reduces
+        /// but does not eliminate that risk; see `withTimeout` for why.
         private static let authedCallTimeout: Duration = .seconds(15)
 
         private func authedMutation<T: Decodable>(
@@ -601,13 +604,29 @@ public struct CaptureCreateInput: Equatable, Sendable {
 
         /// Races `operation` against `timeout`, throwing a
         /// `ConvexServiceError` if the timeout elapses first. Same
-        /// task-group race-two-tasks-cancel-the-loser shape as
-        /// `firstValue` below (a task running the real work, a second task
-        /// that sleeps then throws, `defer { group.cancelAll() }` so the
-        /// loser is always torn down) — extracted here so `authedMutation`/
-        /// `authedAction` can apply the same bounded-wait guarantee that
-        /// one-shot queries already had via `firstValue`, without duplicating
-        /// the task-group plumbing.
+        /// task-group race-two-tasks shape as `firstValue` below (a task
+        /// running the real work, a second task that sleeps then throws,
+        /// `defer { group.cancelAll() }`) — extracted here so
+        /// `authedMutation`/`authedAction` can apply the same bounded-wait
+        /// guarantee that one-shot queries already had via `firstValue`,
+        /// without duplicating the task-group plumbing.
+        ///
+        /// IMPORTANT caveat, not a hard guarantee: `group.cancelAll()` only
+        /// sets cooperative cancellation on the losing task — it does not
+        /// forcibly stop it. `convex-swift` 0.8.1's `client.mutation`/
+        /// `client.action` bottom out in a UniFFI polling loop
+        /// (`uniffiRustCallAsync`) that never checks `Task.isCancelled`, so
+        /// on a genuinely-hung/dropped-connection call, the loser keeps
+        /// running in the background and `withThrowingTaskGroup` (which
+        /// cannot return until every child task has actually finished,
+        /// per SE-0304) still won't let this function return until that
+        /// FFI call eventually settles on its own — possibly never. This
+        /// bounds the common case (a slow-but-eventually-answering call)
+        /// and prevents the caller from waiting *longer* than `timeout` in
+        /// that case; it is not a true kill switch for a truly-stuck FFI
+        /// future. A real hard bound would require convex-swift to expose
+        /// call cancellation, or tearing down/reconnecting the whole
+        /// `ConvexClient` to force the stuck future to resolve.
         ///
         /// Internal (not private) and free of any `LiveConvexService`
         /// instance state, so it's unit-testable in isolation against a

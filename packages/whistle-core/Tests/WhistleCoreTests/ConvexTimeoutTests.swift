@@ -11,13 +11,26 @@
 // live: captures sat unsynced for 20+ hours until an app relaunch).
 //
 // The fix extracts `LiveConvexService.withTimeout`, the same
-// task-group race-two-tasks-cancel-the-loser shape `firstValue` already
-// used, and wraps the mutation/action calls with it. `LiveConvexService`
-// itself can't be driven hermetically (convex-swift's ffi-client seam is
-// internal to the package, same constraint noted in
-// ConvexAuthAttachmentTests / ConvexOneShotQueryTests), but `withTimeout`
-// takes a plain `@Sendable` async closure and has no instance state, so
-// it's fully testable in isolation.
+// task-group race-two-tasks shape `firstValue` already used, and wraps the
+// mutation/action calls with it. `LiveConvexService` itself can't be
+// driven hermetically (convex-swift's ffi-client seam is internal to the
+// package, same constraint noted in ConvexAuthAttachmentTests /
+// ConvexOneShotQueryTests), but `withTimeout` takes a plain `@Sendable`
+// async closure and has no instance state, so it's fully testable in
+// isolation.
+//
+// Important scope note (see `withTimeout`'s doc comment): this bounds the
+// common "slow but eventually answers" case. For a genuinely-stuck
+// convex-swift FFI call that never checks Swift task cancellation, the
+// timeout task still fires and this function still returns promptly to
+// ITS caller -- but the underlying `withThrowingTaskGroup` scope in
+// `authedMutation`/`authedAction` cannot fully exit until that FFI call
+// eventually settles, per Swift's structured-concurrency guarantee that a
+// task group awaits all children before returning. These tests use a
+// synthetic `operation` (a `Task.sleep`), which IS cancellation-aware, so
+// they verify `withTimeout`'s own race/return logic correctly, but they
+// cannot exercise -- and therefore cannot regress-guard -- the
+// non-cancellation-aware-FFI-call scenario that motivated this fix.
 
 import XCTest
 
