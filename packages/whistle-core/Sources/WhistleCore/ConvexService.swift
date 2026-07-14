@@ -57,6 +57,14 @@ public protocol WhistleAuthProvider: Sendable {
     /// session (used by callers to decide whether to show a signed-in UI
     /// optimistically before the first token fetch completes).
     var isAuthenticated: Bool { get async }
+
+    /// Clears any cached/stored credentials so no later launch or call can
+    /// obtain a token for this session. Called by `AuthController.signOut()`
+    /// -- without it, sign-out only flipped in-memory UI state while the
+    /// real credentials (Keychain-backed for Auth0, in-memory for the dev/
+    /// mock providers) stayed put, so a relaunch (or a second sign-in as a
+    /// different user) could still mint tokens for the previous session.
+    func logout() async
 }
 
 // MARK: - Mock auth provider (used by tests, and by U6's one-shot smoke run)
@@ -66,7 +74,7 @@ public protocol WhistleAuthProvider: Sendable {
 /// The real Auth0 implementation lives in the app target (U6) — this
 /// package must not depend on Auth0 or convex-swift-auth0.
 public actor MockAuthProvider: WhistleAuthProvider {
-    private let fixedToken: String?
+    private var fixedToken: String?
 
     public init(fixedToken: String? = "mock-id-token") {
         self.fixedToken = fixedToken
@@ -78,6 +86,14 @@ public actor MockAuthProvider: WhistleAuthProvider {
 
     public var isAuthenticated: Bool {
         get async { fixedToken != nil }
+    }
+
+    /// Clears the mock's token, mirroring the real providers' logout()
+    /// contract -- tests can assert `currentIdToken()` returns `nil`
+    /// afterward. `fixedToken` is `var` (not `let`) specifically so this
+    /// has somewhere to write.
+    public func logout() async {
+        fixedToken = nil
     }
 }
 
@@ -100,6 +116,20 @@ public enum ConvexServiceError: Error, Equatable {
 public protocol ConvexServiceProtocol: Sendable {
     // MARK: users
     func usersEnsure() async throws -> String
+
+    // MARK: auth lifecycle
+
+    /// Drops the current websocket auth attachment and resets the internal
+    /// attach-once gate, so the next authenticated call must re-attach with
+    /// a fresh token instead of continuing to run under a previous session's
+    /// already-pinned JWT. Called by `AuthController.signOut()` (and must be
+    /// called before a different user signs in) -- without it, a second
+    /// sign-in short-circuited the attach gate (`if attached { return true }`)
+    /// and ran mutations under the FIRST user's token. Defaults to a no-op
+    /// via the extension below so existing fakes/tests stay source-
+    /// compatible without implementing it; `LiveConvexService` MUST override
+    /// this with a real implementation.
+    func detachAuth() async
 
     // MARK: settings
     func settingsGet() async throws -> SettingsSnapshot
@@ -132,6 +162,14 @@ public protocol ConvexServiceProtocol: Sendable {
     func capturesArchive(id: String) async throws
 }
 
+/// Default no-op so pre-existing `ConvexServiceProtocol` fakes (test doubles
+/// that predate `detachAuth()`) don't need to be touched just to keep
+/// conforming. Only `LiveConvexService` needs a real implementation; a fake
+/// that wants to assert on the call can still override it.
+public extension ConvexServiceProtocol {
+    func detachAuth() async {}
+}
+
 // MARK: - Supporting request/response shapes
 
 public struct SettingsSnapshot: Codable, Equatable, Sendable {
@@ -159,16 +197,27 @@ public struct SettingsSnapshot: Codable, Equatable, Sendable {
     }
 }
 
+/// Tri-state patch value for a settings field that has a real "clear"
+/// affordance in the UI (unlike `agent`/`screenshotsEnabled`, which have no
+/// way to be cleared through the UI, so a plain `Optional` is enough for
+/// them): `nil` means "leave untouched," `.set` writes a new value, `.clear`
+/// explicitly unsets the field server-side. See `settingsUpdateArgs` for how
+/// each case is encoded on the wire.
+public enum SettingsFieldPatch<Value: Equatable & Sendable>: Equatable, Sendable {
+    case set(Value)
+    case clear
+}
+
 public struct SettingsPatch: Equatable, Sendable {
-    public var defaultProjectId: String?
+    public var defaultProjectId: SettingsFieldPatch<String>?
     public var agent: String?
-    public var model: String?
+    public var model: SettingsFieldPatch<String>?
     public var screenshotsEnabled: Bool?
 
     public init(
-        defaultProjectId: String? = nil,
+        defaultProjectId: SettingsFieldPatch<String>? = nil,
         agent: String? = nil,
-        model: String? = nil,
+        model: SettingsFieldPatch<String>? = nil,
         screenshotsEnabled: Bool? = nil
     ) {
         self.defaultProjectId = defaultProjectId
@@ -317,13 +366,31 @@ public struct CaptureCreateInput: Equatable, Sendable {
         // MARK: users
 
         public func usersEnsure() async throws -> String {
-            try await ensureAuthAttached()
-            do {
-                return try await client.mutation("users:ensure")
-            } catch {
-                NSLog("Whistle: users:ensure failed: %@", String(describing: error))
-                throw Self.mapAuthError(error)
-            }
+            // Was calling `client.mutation` directly, bypassing
+            // `authedMutation`'s `Self.withTimeout` wrap -- interactive
+            // sign-in (which calls this right after Auth0 stores
+            // credentials) could hang indefinitely on a stuck network call
+            // instead of timing out into a retry like every other mutation.
+            try await authedMutation("users:ensure")
+        }
+
+        // MARK: auth lifecycle
+
+        /// `client.logout()` (convex-swift's own, not `WhistleAuthProvider`'s)
+        /// calls the bridge's `logout()` (a no-op -- WhistleCore never owns
+        /// credential storage), clears convex-swift's internal auth bridge,
+        /// and tears down the websocket's auth callback; it never throws
+        /// (internal errors are swallowed there, not surfaced to us). The
+        /// gate reset is what actually matters for correctness: without it,
+        /// `ensureAuthAttached()`'s `runIfNeeded` would see `attached == true`
+        /// left over from the previous session and skip re-attaching
+        /// entirely, so the very next authenticated call after a fresh
+        /// sign-in would ride on convex-swift's already-torn-down (or,
+        /// worse, still-live) previous-session attachment instead of pulling
+        /// a fresh token via `loginFromCache()`.
+        public func detachAuth() async {
+            await client.logout()
+            authGate.reset()
         }
 
         // MARK: - Authenticated call helpers (attach auth, then call)
@@ -422,27 +489,48 @@ public struct CaptureCreateInput: Equatable, Sendable {
         /// unit-testable without a live `ConvexClient`; see
         /// `ConvexArgEncodingTests`.
         ///
-        /// KNOWN LIMITATION (tracked separately): because a nil field means
-        /// "leave untouched," there is no way to *clear* a previously-set
-        /// field back to empty through this API — clearing the model or
-        /// deselecting the default project is silently a no-op. A true clear
-        /// needs a tri-state patch representation plus a backend clear
-        /// sentinel.
+        /// `defaultProjectId`/`model` are tri-state (`SettingsFieldPatch`):
+        /// `nil` omits the key (leave untouched), `.set(v)` sends the value,
+        /// and `.clear` sends an explicit key-present-with-`nil` entry, which
+        /// serializes to JSON `null` — the backend's `v.optional(v.union(...,
+        /// v.null()))` args treat that `null` as "unset this field" (see
+        /// `settings.ts`'s `update` mutation), distinct from the key being
+        /// absent entirely.
         static func settingsUpdateArgs(_ patch: SettingsPatch) -> [String: ConvexEncodable?] {
             var args: [String: ConvexEncodable?] = [:]
-            if let defaultProjectId = patch.defaultProjectId {
-                args["defaultProjectId"] = defaultProjectId
-            }
+            encodeTriState(patch.defaultProjectId, forKey: "defaultProjectId", into: &args)
             if let agent = patch.agent {
                 args["agent"] = agent
             }
-            if let model = patch.model {
-                args["model"] = model
-            }
+            encodeTriState(patch.model, forKey: "model", into: &args)
             if let screenshotsEnabled = patch.screenshotsEnabled {
                 args["screenshotsEnabled"] = screenshotsEnabled
             }
             return args
+        }
+
+        /// Encodes one tri-state field: absent (`nil`) omits the key,
+        /// `.set` stores the value, `.clear` stores the key mapped to a nil
+        /// value. For `.clear`, NOT `args[key] = nil` -- Dictionary's
+        /// subscript setter treats assigning `nil` as *removing* the key,
+        /// even though `Value` here (`ConvexEncodable?`) is itself optional.
+        /// `updateValue(_:forKey:)` doesn't have that special-case, so it
+        /// actually stores the key mapped to a nil value, which is what we
+        /// need to encode explicit JSON `null` (the backend's clear
+        /// sentinel).
+        private static func encodeTriState(
+            _ field: SettingsFieldPatch<String>?,
+            forKey key: String,
+            into args: inout [String: ConvexEncodable?]
+        ) {
+            switch field {
+            case .set(let value):
+                args[key] = value
+            case .clear:
+                args.updateValue(nil, forKey: key)
+            case nil:
+                break
+            }
         }
 
         public func settingsSetConductorKey(_ key: String) async throws {
@@ -787,6 +875,15 @@ public struct CaptureCreateInput: Equatable, Sendable {
                 lock.withLock { attached = true }
             }
             return success
+        }
+
+        /// Forces the next `runIfNeeded` call to re-attempt `attach`, even if
+        /// a prior attempt already succeeded. Called on sign-out (via
+        /// `detachAuth()`) so a later sign-in -- as the same user or a
+        /// different one -- can't short-circuit on the old `attached == true`
+        /// and skip pulling a fresh token.
+        func reset() {
+            lock.withLock { attached = false }
         }
     }
 

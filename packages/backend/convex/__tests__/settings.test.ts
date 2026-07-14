@@ -76,6 +76,71 @@ describe("settings.update", () => {
     expect(settings.agent).toBe("codex");
     expect(settings.screenshotsEnabled).toBe(false);
   });
+
+  test("an omitted (undefined) model/defaultProjectId leaves the existing value untouched", async () => {
+    const t = convexTest(schema, modules);
+    const asUser = withMockUser(t, "auth0|settings-update-untouched");
+    await asUser.mutation(api.users.ensure, {});
+
+    await asUser.mutation(api.settings.update, {
+      model: "opus",
+      defaultProjectId: "proj-1",
+    });
+    await asUser.mutation(api.settings.update, { agent: "codex" });
+
+    const settings = await asUser.query(api.settings.get, {});
+    expect(settings.model).toBe("opus");
+    expect(settings.defaultProjectId).toBe("proj-1");
+    expect(settings.agent).toBe("codex");
+  });
+
+  test("an explicit null clears a previously-set model", async () => {
+    const t = convexTest(schema, modules);
+    const asUser = withMockUser(t, "auth0|settings-update-clear-model");
+    await asUser.mutation(api.users.ensure, {});
+
+    await asUser.mutation(api.settings.update, { model: "opus" });
+    await asUser.mutation(api.settings.update, { model: null });
+
+    const settings = await asUser.query(api.settings.get, {});
+    expect(settings.model).toBeUndefined();
+  });
+
+  test("an explicit null clears a previously-set defaultProjectId", async () => {
+    const t = convexTest(schema, modules);
+    const asUser = withMockUser(t, "auth0|settings-update-clear-project");
+    await asUser.mutation(api.users.ensure, {});
+
+    await asUser.mutation(api.settings.update, { defaultProjectId: "proj-1" });
+    await asUser.mutation(api.settings.update, { defaultProjectId: null });
+
+    const settings = await asUser.query(api.settings.get, {});
+    expect(settings.defaultProjectId).toBeUndefined();
+  });
+
+  test("an explicit null on the insert path stores no literal null", async () => {
+    const t = convexTest(schema, modules);
+    const asUser = withMockUser(t, "auth0|settings-update-null-insert");
+    const userId = await asUser.mutation(api.users.ensure, {});
+
+    // First-ever settings mutation for this user carries nulls: the insert
+    // branch must normalize them to absent fields, not store literal null
+    // (which would violate the v.optional(v.string()) schema on read).
+    await asUser.mutation(api.settings.update, {
+      model: null,
+      defaultProjectId: null,
+    });
+
+    const row = await t.run(async (ctx) =>
+      ctx.db
+        .query("settings")
+        .withIndex("by_user", (q) => q.eq("userId", userId))
+        .unique(),
+    );
+    expect(row).not.toBeNull();
+    expect(row?.model).toBeUndefined();
+    expect(row?.defaultProjectId).toBeUndefined();
+  });
 });
 
 describe("cross-user denial", () => {

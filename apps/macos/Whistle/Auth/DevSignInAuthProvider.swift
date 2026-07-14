@@ -40,7 +40,10 @@ public actor DevSignInAuthProvider: WhistleAuthProvider {
         signedIn = true
     }
 
-    public func logout() {
+    /// Satisfies `WhistleAuthProvider.logout()` -- declared `async` (even
+    /// though there's nothing to await here) to match the protocol
+    /// requirement's shape explicitly, mirroring `Auth0AuthProvider.logout()`.
+    public func logout() async {
         signedIn = false
     }
 }

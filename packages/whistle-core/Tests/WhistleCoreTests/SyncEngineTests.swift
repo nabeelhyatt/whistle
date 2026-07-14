@@ -55,6 +55,21 @@ final class TestSignal: @unchecked Sendable {
     }
 }
 
+// MARK: - Thread-safe counter for the `onAuthDeferred` hook tests
+
+/// Minimal thread-safe counter, mirroring `LogCollector`'s style, for
+/// asserting how many times the injected `onAuthDeferred` closure fired.
+private final class Counter: @unchecked Sendable {
+    private let lock = NSLock()
+    private(set) var value = 0
+
+    func increment() {
+        lock.lock()
+        value += 1
+        lock.unlock()
+    }
+}
+
 final class SyncEngineTests: XCTestCase {
     private var tempDir: URL!
 
@@ -315,6 +330,92 @@ final class SyncEngineTests: XCTestCase {
         )
     }
 
+    func testNotAuthenticatedFailureStopsRestOfPassInsteadOfRetryingEachDraft() async throws {
+        let (store, tempDir) = try TestSupport.makeStore()
+        self.tempDir = tempDir
+
+        let first = TestSupport.makeDraft(clientId: "auth-first", capturedAt: Date(timeIntervalSince1970: 100))
+        let second = TestSupport.makeDraft(clientId: "auth-second", capturedAt: Date(timeIntervalSince1970: 200))
+        try store.saveDraft(first)
+        try store.saveDraft(second)
+
+        let convex = FakeConvexService()
+        convex.onCapturesCreate = { _ in
+            throw ConvexServiceError.notAuthenticated
+        }
+
+        let engine = SyncEngine(store: store, convex: convex)
+
+        let synced = await engine.drainOnce()
+
+        XCTAssertEqual(synced, [])
+        // Without the early-exit, a hanging auth attachment would be
+        // re-attempted once per remaining draft in the pass -- this proves
+        // the pass bails out after the first notAuthenticated instead.
+        XCTAssertEqual(
+            convex.capturesCreateCalls.count, 1,
+            "expected exactly one capturesCreate attempt for the whole pass, got: \(convex.capturesCreateCalls.count)"
+        )
+        XCTAssertEqual(try store.draft(clientId: "auth-first")?.localState, .queued)
+        XCTAssertEqual(
+            try store.draft(clientId: "auth-second")?.localState, .queued,
+            "the untouched remaining draft must stay .queued, not be re-attempted or left .syncing"
+        )
+    }
+
+    // MARK: - onAuthDeferred hook (fix: a persistently-deferring auth
+    // failure used to have no user-visible surface at all -- this hook is
+    // what the app target uses to escalate to a re-auth prompt).
+
+    func testNotAuthenticatedFailureInvokesOnAuthDeferredExactlyOncePerPass() async throws {
+        let (store, tempDir) = try TestSupport.makeStore()
+        self.tempDir = tempDir
+
+        let first = TestSupport.makeDraft(clientId: "auth-deferred-first", capturedAt: Date(timeIntervalSince1970: 100))
+        let second = TestSupport.makeDraft(clientId: "auth-deferred-second", capturedAt: Date(timeIntervalSince1970: 200))
+        try store.saveDraft(first)
+        try store.saveDraft(second)
+
+        let convex = FakeConvexService()
+        convex.onCapturesCreate = { _ in
+            throw ConvexServiceError.notAuthenticated
+        }
+
+        let deferredCallCount = Counter()
+        let engine = SyncEngine(
+            store: store, convex: convex,
+            onAuthDeferred: { deferredCallCount.increment() }
+        )
+
+        let synced = await engine.drainOnce()
+
+        XCTAssertEqual(synced, [])
+        // One notAuthenticated pass with two queued drafts must still only
+        // fire the hook once (the pass bails out after the first draft, so
+        // there's exactly one deferral to report, not one per draft).
+        XCTAssertEqual(deferredCallCount.value, 1)
+    }
+
+    func testSuccessfulDrainNeverInvokesOnAuthDeferred() async throws {
+        let (store, tempDir) = try TestSupport.makeStore()
+        self.tempDir = tempDir
+
+        let draft = TestSupport.makeDraft(clientId: "auth-deferred-not-triggered")
+        try store.saveDraft(draft)
+
+        let convex = FakeConvexService()
+        let deferredCallCount = Counter()
+        let engine = SyncEngine(
+            store: store, convex: convex,
+            onAuthDeferred: { deferredCallCount.increment() }
+        )
+
+        let synced = await engine.drainOnce()
+
+        XCTAssertEqual(synced, ["auth-deferred-not-triggered"])
+        XCTAssertEqual(deferredCallCount.value, 0)
+    }
+
     func testEmptyQueueLogsNoDrainStartMessage() async throws {
         let (store, tempDir) = try TestSupport.makeStore()
         self.tempDir = tempDir
@@ -453,6 +554,67 @@ final class SyncEngineTests: XCTestCase {
         XCTAssertEqual(Set(convex.capturesCreateCalls.map(\.clientId)), ["tick-1", "tick-2"])
         XCTAssertEqual(try store.draft(clientId: "tick-1")?.localState, .synced)
         XCTAssertEqual(try store.draft(clientId: "tick-2")?.localState, .synced)
+    }
+
+    func testRunPeriodicDrainSkipsTicksWhenGateReturnsFalse() async throws {
+        let (store, tempDir) = try TestSupport.makeStore()
+        self.tempDir = tempDir
+
+        try store.saveDraft(TestSupport.makeDraft(clientId: "gated-out"))
+
+        let convex = FakeConvexService()
+        let engine = SyncEngine(store: store, convex: convex)
+
+        let periodicTask = Task {
+            await engine.runPeriodicDrain(interval: .milliseconds(10), gate: { false })
+        }
+
+        // Give the loop several ticks' worth of time to prove it's actually
+        // running (not just idle) and still never drains.
+        try await Task.sleep(nanoseconds: 100_000_000)
+        periodicTask.cancel()
+
+        XCTAssertEqual(convex.capturesCreateCalls.count, 0, "a false gate must skip drainOnce() on every tick")
+        XCTAssertEqual(try store.draft(clientId: "gated-out")?.localState, .queued)
+    }
+
+    func testRunPeriodicDrainDrainsWhenGateReturnsTrue() async throws {
+        let (store, tempDir) = try TestSupport.makeStore()
+        self.tempDir = tempDir
+
+        try store.saveDraft(TestSupport.makeDraft(clientId: "gated-in"))
+
+        let convex = FakeConvexService()
+        let engine = SyncEngine(store: store, convex: convex)
+
+        let periodicTask = Task {
+            await engine.runPeriodicDrain(interval: .milliseconds(10), gate: { true })
+        }
+
+        await waitUntil { convex.capturesCreateCalls.count >= 1 }
+        periodicTask.cancel()
+
+        XCTAssertEqual(try store.draft(clientId: "gated-in")?.localState, .synced)
+    }
+
+    func testRunPeriodicDrainWithNonPositiveIntervalReturnsImmediatelyWithoutDraining() async throws {
+        let (store, tempDir) = try TestSupport.makeStore()
+        self.tempDir = tempDir
+
+        try store.saveDraft(TestSupport.makeDraft(clientId: "never-drained"))
+
+        let convex = FakeConvexService()
+        let logs = LogCollector()
+        let engine = SyncEngine(store: store, convex: convex, logger: logs.log)
+
+        await engine.runPeriodicDrain(interval: .zero)
+
+        XCTAssertEqual(convex.capturesCreateCalls.count, 0)
+        XCTAssertEqual(try store.draft(clientId: "never-drained")?.localState, .queued)
+        XCTAssertTrue(
+            logs.messages.contains { $0.contains("requires a positive interval") },
+            "expected a log message about the non-positive interval, got: \(logs.messages)"
+        )
     }
 
     func testPeriodicDrainOverlappingWithExplicitDrainOnceCoalescesWithoutDoubleProcessing() async throws {

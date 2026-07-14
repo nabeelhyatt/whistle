@@ -88,7 +88,7 @@ static func withTimeout<T: Sendable>(
 }
 ```
 
-Key property: returns the instant the timer fires **regardless of whether the hung operation ever checks cancellation**. The hung operation becomes a cheap suspended background `Task`; it eventually resolves on its own, harmlessly.
+Key property: returns the instant the timer fires **regardless of whether the hung operation ever checks cancellation**. The timed-out operation task remains suspended and retains captured state until the underlying call settles; if it never settles, repeated retries can accumulate leaked tasks. This bounds the caller's wait but does not reclaim the underlying work.
 
 ### 2. Wrap all three network-touching paths
 
@@ -97,37 +97,60 @@ private static let authedCallTimeout: Duration = .seconds(15)
 
 private func authedMutation<T: Decodable>(_ name: String, with args: ...) async throws -> T {
     try await ensureAuthAttached()  // also wrapped — see below
-    return try await Self.withTimeout(Self.authedCallTimeout) {
-        try await self.client.mutation(name, with: args)
+    do {
+        return try await Self.withTimeout(Self.authedCallTimeout) {
+            try await self.client.mutation(name, with: args)
+        }
+    } catch {
+        NSLog("Whistle: Convex mutation %@ failed: %@", name, String(describing: error))
+        throw Self.mapAuthError(error)
     }
 }
 
 private func authedAction<T: Decodable>(_ name: String, with args: ...) async throws -> T {
     try await ensureAuthAttached()
-    return try await Self.withTimeout(Self.authedCallTimeout) {
-        try await self.client.action(name, with: args)
+    do {
+        return try await Self.withTimeout(Self.authedCallTimeout) {
+            try await self.client.action(name, with: args)
+        }
+    } catch {
+        NSLog("Whistle: Convex action %@ failed: %@", name, String(describing: error))
+        throw Self.mapAuthError(error)
     }
 }
 ```
 
-Also wrap `loginFromCache()` inside `ensureAuthAttached` — a hung auth-attach would wedge `isDraining` on the same path before the mutation even starts.
+Also wrap `loginFromCache()` inside `ensureAuthAttached` — a hung auth-attach would wedge `isDraining` on the same path before the mutation even starts. `authedQuery`'s one-shot query path shares the same `withTimeout` mechanism indirectly, via `firstValue(from:timeout:)` (default 10s, vs. 15s for mutations/actions).
 
 ### 3. Add `recoverStrandedSyncing()` (launch-time cleanup)
 
 `drainPass` marks a draft `.syncing` *before* the awaited network call. If the process is killed mid-call, that draft is frozen `.syncing` forever — even a relaunch won't pick it up because `drainPass` only fetches `.queued`/`.syncFailed`. Call once at launch before the first drain:
 
 ```swift
-// In WhistleApp.swift, before Task { await syncEngine.runForever() }:
-await syncEngine.recoverStrandedSyncing()
+// In WhistleApp.swift, before any drain-triggering Task is started:
+Task { [weak syncEngine] in
+    await syncEngine?.recoverStrandedSyncing()
+    _ = await syncEngine?.drainOnce()
+}
 ```
 
 ```swift
 // SyncEngine.swift
 public func recoverStrandedSyncing() async {
-    let stranded = (try? store.drafts(in: [.syncing])) ?? []
+    let stranded: [CaptureDraft]
+    do {
+        stranded = try store.drafts(in: [.syncing])
+    } catch {
+        logger("Whistle: SyncEngine failed to read stranded .syncing drafts: \(error)")
+        return
+    }
     for draft in stranded {
-        _ = try? store.updateLocalState(clientId: draft.clientId, to: .queued, localError: nil)
-        logger("Whistle: SyncEngine recovered stranded .syncing draft \(draft.clientId) -> .queued")
+        do {
+            try store.updateLocalState(clientId: draft.clientId, to: .queued, localError: nil)
+            logger("Whistle: SyncEngine recovered stranded .syncing draft \(draft.clientId) -> .queued")
+        } catch {
+            logger("Whistle: SyncEngine failed to recover stranded .syncing draft \(draft.clientId): \(error)")
+        }
     }
 }
 ```
@@ -138,19 +161,29 @@ A periodic loop independent of all trigger-based paths guarantees a capture is r
 
 ```swift
 // SyncEngine.swift
-public func runPeriodicDrain(interval: Duration = .seconds(180)) async {
+public func runPeriodicDrain(
+    interval: Duration = .seconds(180),
+    gate: @escaping @Sendable () async -> Bool = { true }
+) async {
     while !Task.isCancelled {
         try? await Task.sleep(for: interval)
         if Task.isCancelled { break }
+        guard await gate() else { continue }
         _ = await drainOnce()
     }
 }
 ```
 
 ```swift
-// WhistleApp.swift (alongside the existing runForever task)
-Task { await syncEngine.runPeriodicDrain() }
+// WhistleApp.swift
+Task { [weak self] in
+    await syncEngine.runPeriodicDrain(gate: {
+        await MainActor.run { self?.authController?.state == .signedIn }
+    })
+}
 ```
+
+`gate` was added after the fact: at the time, `AuthController.signOut()` only flipped local state — nothing detached the Convex websocket's attached auth — so an ungated periodic tick after sign-out would upload any still-queued captures under the previous session. `signOut()` has since been fixed to clear provider credentials and call `ConvexServiceProtocol.detachAuth()` (which resets the attach-once gate), but the drain gate stays as defense in depth and keeps the periodic loop consistent with every other trigger, all of which route through `drainSyncIfSignedIn()`.
 
 Safe to run concurrently with trigger-based drains — the `isDraining`/`rerunRequested` coalescing guard handles overlap.
 
@@ -162,9 +195,9 @@ Added log lines in `drainOnce()` for both the offline early-return and the coale
 
 The root cause is a chain: `authedMutation` (and later `loginFromCache`) had no timeout → the convex-swift FFI can hang without error on a dropped connection that stays "connected" at the OS level → a single hanging `drainOnce()` call suspends indefinitely → `isDraining` stays `true` permanently via `defer` never firing → every subsequent drain silently returns `[]` forever.
 
-The `withThrowingTaskGroup` approach failed because Swift's structured concurrency requires all child tasks to complete before the group yields — `withThrowingTaskGroup` cancels the child operation when the timer fires, but a non-cooperative FFI call ignores Swift cancellation. The unstructured-`Task` + `CheckedContinuation` approach sidesteps this: the timer's `Task` delivers its result to the continuation regardless of what the operation `Task` is doing; the operation task becomes an abandoned background task that will eventually resolve or be reclaimed.
+The `withThrowingTaskGroup` approach failed because Swift's structured concurrency requires all child tasks to complete before the group yields — `withThrowingTaskGroup` cancels the child operation when the timer fires, but a non-cooperative FFI call ignores Swift cancellation. The unstructured-`Task` + `CheckedContinuation` approach sidesteps this: the timer's `Task` delivers its result to the continuation regardless of what the operation `Task` is doing; the operation task becomes an abandoned background task that keeps its captured state alive until the underlying call settles — which bounds the caller's wait but does not reclaim that work, so a call that never settles leaks for good.
 
-The periodic drain (`runPeriodicDrain`) is intentionally a separate loop from `runForever()` — so a hung or absent network monitor can never suppress the periodic retry too.
+The periodic drain (`runPeriodicDrain`) is intentionally a separate loop from `WhistleApp`'s own network-path-triggered loop (its `pathUpdates()` iteration calling `drainSyncIfSignedIn()` — `SyncEngine` is never driven via its own `runForever()` in the app target) — so a hung or absent network monitor can never suppress the periodic retry too.
 
 ## Prevention
 

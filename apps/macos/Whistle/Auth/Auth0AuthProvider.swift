@@ -172,6 +172,12 @@ public actor Auth0AuthProvider: WhistleAuthProvider {
         #endif
     }
 
+    // MARK: WhistleAuthProvider (logout)
+
+    /// Satisfies `WhistleAuthProvider.logout()` -- clears the Keychain-backed
+    /// `CredentialsManager` entry so no later launch (or concurrent call)
+    /// can mint a token for this session. Previously had zero callers; wired
+    /// into `AuthController.signOut()`.
     public func logout() async {
         #if canImport(Auth0)
             _ = credentialsManager?.clear()

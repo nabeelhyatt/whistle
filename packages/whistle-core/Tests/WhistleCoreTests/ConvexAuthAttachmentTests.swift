@@ -66,6 +66,31 @@ final class ConvexAuthAttachmentGateTests: XCTestCase {
         XCTAssertTrue(third)
         XCTAssertEqual(attempts.value, 2)
     }
+
+    // Regression coverage for the sign-out fix: a stale `attached == true`
+    // left over from a previous session used to make `runIfNeeded` skip
+    // re-attaching entirely, so a fresh sign-in (same user or a different
+    // one) could run mutations under the OLD session's already-pinned JWT.
+    func testResetForcesTheNextRunIfNeededToReattemptAttach() async {
+        let gate = ConvexAuthAttachmentGate()
+        let attempts = Counter()
+
+        let first = await gate.runIfNeeded {
+            attempts.increment()
+            return true
+        }
+        XCTAssertTrue(first)
+        XCTAssertEqual(attempts.value, 1)
+
+        gate.reset()
+
+        let second = await gate.runIfNeeded {
+            attempts.increment()
+            return true
+        }
+        XCTAssertTrue(second, "a re-attempt after reset() must actually re-run attach, not just report the old state")
+        XCTAssertEqual(attempts.value, 2, "reset() must force the next call to re-attempt attach instead of short-circuiting on stale state")
+    }
 }
 
 // MARK: - WhistleToConvexAuthProviderBridge

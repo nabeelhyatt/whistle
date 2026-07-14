@@ -99,5 +99,43 @@ import XCTest
                 "screenshotsEnabled: false is a real value and must be included, not confused with unset"
             )
         }
+
+        // MARK: settings:update — tri-state clear (`defaultProjectId`/`model`)
+
+        func testSettingsUpdateTriStateFieldsOmittedWhenLeftUntouched() {
+            let args = LiveConvexService.settingsUpdateArgs(SettingsPatch())
+            XCTAssertFalse(args.keys.contains("defaultProjectId"), "an untouched (nil) defaultProjectId must be omitted")
+            XCTAssertFalse(args.keys.contains("model"), "an untouched (nil) model must be omitted")
+        }
+
+        func testSettingsUpdateTriStateFieldsSendValueWhenSet() {
+            let args = LiveConvexService.settingsUpdateArgs(
+                SettingsPatch(defaultProjectId: .set("proj-1"), model: .set("opus-4.8"))
+            )
+            guard let projectValue = args["defaultProjectId"] ?? nil else {
+                return XCTFail("expected defaultProjectId to be present and non-nil, got: \(String(describing: args["defaultProjectId"]))")
+            }
+            guard let modelValue = args["model"] ?? nil else {
+                return XCTFail("expected model to be present and non-nil, got: \(String(describing: args["model"]))")
+            }
+            XCTAssertEqual(try? projectValue.convexEncode(), "\"proj-1\"")
+            XCTAssertEqual(try? modelValue.convexEncode(), "\"opus-4.8\"")
+        }
+
+        func testSettingsUpdateTriStateFieldsSendExplicitNullWhenCleared() {
+            let args = LiveConvexService.settingsUpdateArgs(
+                SettingsPatch(defaultProjectId: .clear, model: .clear)
+            )
+            XCTAssertTrue(args.keys.contains("defaultProjectId"), "a cleared defaultProjectId key must be present")
+            XCTAssertTrue(args.keys.contains("model"), "a cleared model key must be present")
+            XCTAssertNil(
+                args["defaultProjectId"] ?? nil,
+                "a cleared defaultProjectId must encode as an explicit null, not a value"
+            )
+            XCTAssertNil(
+                args["model"] ?? nil,
+                "a cleared model must encode as an explicit null, not a value"
+            )
+        }
     }
 #endif
