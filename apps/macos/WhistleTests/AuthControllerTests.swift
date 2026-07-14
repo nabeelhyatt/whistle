@@ -20,12 +20,20 @@ import XCTest
 private final class FakeConvexService: ConvexServiceProtocol, @unchecked Sendable {
     private let lock = NSLock()
     private(set) var usersEnsureCallCount = 0
+    private(set) var detachAuthCallCount = 0
     var usersEnsureError: Error?
 
     func usersEnsure() async throws -> String {
         lock.lock(); usersEnsureCallCount += 1; lock.unlock()
         if let usersEnsureError { throw usersEnsureError }
         return "user-1"
+    }
+
+    // MARK: auth lifecycle (overrides the protocol's no-op default so
+    // signOut()'s wiring is assertable -- see testSignOutDetachesConvexAndLogsOutProvider)
+
+    func detachAuth() async {
+        lock.lock(); detachAuthCallCount += 1; lock.unlock()
     }
 
     // MARK: settings (unused by AuthController; trivial stubs)
@@ -71,6 +79,30 @@ private final class FakeConvexService: ConvexServiceProtocol, @unchecked Sendabl
     func capturesDeleteScreenshot(id: String) async throws {}
     func capturesMarkOpened(id: String) async throws {}
     func capturesArchive(id: String) async throws {}
+}
+
+// MARK: - Local fake WhistleAuthProvider that records logout() calls
+// (MockAuthProvider itself now clears its token on logout(), but doesn't
+// expose a call count -- this wraps the same fixed-token behavior with one).
+
+private actor RecordingAuthProvider: WhistleAuthProvider {
+    private var token: String?
+    private(set) var logoutCallCount = 0
+
+    init(fixedToken: String? = "mock-id-token") {
+        token = fixedToken
+    }
+
+    func currentIdToken() async -> String? { token }
+
+    var isAuthenticated: Bool {
+        get async { token != nil }
+    }
+
+    func logout() async {
+        logoutCallCount += 1
+        token = nil
+    }
 }
 
 // MARK: - Tests
@@ -256,6 +288,30 @@ final class AuthControllerTests: XCTestCase {
 
         XCTAssertEqual(controller.state, .signedOut)
         XCTAssertFalse(breadcrumb.hasSignedInBefore())
+    }
+
+    // MARK: Sign-out actually ends the session (fix: signOut() previously
+    // only flipped local state -- neither the provider's cached credentials
+    // nor Convex's websocket auth attachment were ever cleared, so a
+    // relaunch or a second sign-in as a different user could still ride on
+    // the previous session).
+
+    func testSignOutDetachesConvexAndLogsOutProvider() async {
+        let recordingAuth = RecordingAuthProvider(fixedToken: "mock-id-token")
+        let convex = FakeConvexService()
+        let controller = AuthController(authProvider: recordingAuth, convexService: convex)
+
+        await controller.signIn()
+        XCTAssertEqual(controller.state, .signedIn)
+
+        await controller.signOut()
+
+        XCTAssertEqual(controller.state, .signedOut)
+        let logoutCallCount = await recordingAuth.logoutCallCount
+        XCTAssertEqual(logoutCallCount, 1, "signOut() must clear the provider's cached credentials")
+        XCTAssertEqual(convex.detachAuthCallCount, 1, "signOut() must detach the Convex websocket auth attachment")
+        let tokenAfterSignOut = await recordingAuth.currentIdToken()
+        XCTAssertNil(tokenAfterSignOut, "the provider's token must be gone after signOut()")
     }
 
     // MARK: Interactive login hook failure (e.g. user cancels Auth0 flow)

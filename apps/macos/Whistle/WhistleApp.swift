@@ -45,6 +45,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// in the app target -- submissions wrote to local SQLite as `queued`
     /// and sat there forever since nothing ever called `captures.create`).
     private var syncEngine: SyncEngine?
+    /// Counts consecutive drain passes that deferred on
+    /// `ConvexServiceError.notAuthenticated` (see `syncEngine`'s
+    /// `onAuthDeferred` hook). Auth deferral deliberately isn't
+    /// `.syncFailed`, so without this counter a server-revoked session with
+    /// locally-persisted `.signedIn` state would defer silently forever on
+    /// every periodic tick, with no user-visible surface at all. Reset
+    /// whenever `auth.$state` changes (see the `auth.$state` sink below).
+    private var consecutiveAuthDeferredDrains = 0
     private var historyViewModel: HistoryViewModel?
     private var historyWindowController: HistoryWindowController?
     private var notificationService: NotificationService?
@@ -123,17 +131,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let syncEngine = SyncEngine(
             store: store,
             convex: convexService,
-            networkMonitor: networkMonitor
+            networkMonitor: networkMonitor,
+            onAuthDeferred: { [weak self] in
+                await MainActor.run { self?.noteAuthDeferredDrain() }
+            }
         )
         self.syncEngine = syncEngine
         // Recover any drafts a previous process left stranded in `.syncing`
         // (a hang or kill mid-sync), then drain -- `drainPass` only re-fetches
         // `.queued`/`.syncFailed`, so without this a strand would never sync,
         // not even after a relaunch. Runs before the triggers below so the
-        // reverted drafts are visible to the very first drain.
-        Task { [weak syncEngine] in
+        // reverted drafts are visible to the very first drain. Recovery is
+        // unconditional (local-only), but the drain goes through the same
+        // signed-in gate as every other trigger, so a launch drain can never
+        // upload under an identity the UI doesn't consider signed in (the
+        // gate plus `signOut()`'s credential-clear/auth-detach are layered
+        // defenses). If auth hasn't resolved yet, the `auth.$state` sink
+        // below drains once it lands on `.signedIn`.
+        Task { [weak self, weak syncEngine] in
             await syncEngine?.recoverStrandedSyncing()
-            _ = await syncEngine?.drainOnce()
+            await self?.drainSyncIfSignedIn()
         }
         Task { [weak self, weak networkMonitor] in
             guard let networkMonitor else { return }
@@ -145,12 +162,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // above (and the launch/submit/manual-retry drains elsewhere) can in
         // principle silently miss firing or fail to recover. This
         // independent periodic loop self-heals a stuck capture within a
-        // bounded time without requiring a manual relaunch. It calls
-        // `drainOnce()` directly (not gated on signed-in state like
-        // `drainSyncIfSignedIn()`) since `drainOnce()` is already a no-op
-        // while offline/no drafts, and by the time the first 180s tick
-        // elapses, auth state has long since resolved.
-        Task { await syncEngine.runPeriodicDrain() }
+        // bounded time without requiring a manual relaunch. Gated on
+        // signed-in state, same as `drainSyncIfSignedIn()`: even though
+        // `AuthController.signOut()` now clears credentials and detaches the
+        // Convex websocket's auth, the gate keeps a post-sign-out tick from
+        // even attempting an upload -- defense in depth alongside the
+        // detach, and consistency with every other drain trigger.
+        Task { [weak self] in
+            await syncEngine.runPeriodicDrain(gate: { [weak self] in
+                await MainActor.run { self?.isSignedIn == true }
+            })
+        }
 
         let notificationService = NotificationService()
         self.notificationService = notificationService
@@ -186,6 +208,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         auth.$state
             .receive(on: DispatchQueue.main)
             .sink { [weak self] state in
+                // Any state transition (sign-in, sign-out, a fresh
+                // reauthRequired) means the deferral streak that led here,
+                // if any, is no longer relevant -- reset so a brand new
+                // session starts the threshold count from zero rather than
+                // inheriting a stale near-threshold count from before.
+                self?.consecutiveAuthDeferredDrains = 0
                 guard state == .signedIn else { return }
                 Task { await self?.drainSyncIfSignedIn() }
             }
@@ -313,13 +341,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         historyWindowController?.show()
     }
 
+    /// Single source of truth for the signed-in check every drain trigger
+    /// (launch, network-path change, submit, manual retry, periodic tick)
+    /// gates on.
+    private var isSignedIn: Bool {
+        authController?.state == .signedIn
+    }
+
     private func drainSyncIfSignedIn() async {
-        guard authController?.state == .signedIn, let syncEngine else {
+        guard isSignedIn, let syncEngine else {
             NSLog("Whistle: drainSyncIfSignedIn skipped — authState=%@ syncEngine=%@",
                   String(describing: authController?.state), syncEngine == nil ? "nil" : "present")
             return
         }
         _ = await syncEngine.drainOnce()
+    }
+
+    /// `SyncEngine`'s `onAuthDeferred` hook lands here (see its
+    /// construction above). A single deferred pass is expected and benign —
+    /// e.g. a brief launch-time race before Convex auth attaches — so this
+    /// only escalates after tolerating a few in a row, and only while the
+    /// local state still claims `.signedIn` (a `.reauthRequired`/`.signedOut`
+    /// state has already surfaced the problem; escalating again would be
+    /// redundant). 3 is a small, arbitrary threshold: enough to absorb a
+    /// launch-time hiccup, small enough that a genuinely revoked session
+    /// still surfaces quickly (each periodic tick is `runPeriodicDrain`'s
+    /// own interval apart).
+    private static let authDeferredEscalationThreshold = 3
+
+    private func noteAuthDeferredDrain() {
+        consecutiveAuthDeferredDrains += 1
+        guard consecutiveAuthDeferredDrains >= Self.authDeferredEscalationThreshold,
+              authController?.state == .signedIn
+        else { return }
+        authController?.handleTokenRefreshFailure()
+        consecutiveAuthDeferredDrains = 0
     }
 
     /// Resolves screenshot bytes for "Duplicate as new capture" (PRD F3.6):

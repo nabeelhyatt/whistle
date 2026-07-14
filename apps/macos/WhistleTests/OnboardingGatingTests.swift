@@ -458,7 +458,7 @@ final class OnboardingGatingTests: XCTestCase {
         XCTAssertEqual(viewModel.step, .testCapture, "single-project accounts skip the picker entirely")
         XCTAssertEqual(viewModel.selectedProjectId, "proj-only")
         XCTAssertEqual(convex.settingsUpdateCalls.count, 1)
-        XCTAssertEqual(convex.settingsUpdateCalls.first?.defaultProjectId, "proj-only")
+        XCTAssertEqual(convex.settingsUpdateCalls.first?.defaultProjectId, .set("proj-only"))
     }
 
     // MARK: Happy: multiple projects -> picker step shown
@@ -480,7 +480,7 @@ final class OnboardingGatingTests: XCTestCase {
         await viewModel.confirmProjectSelection()
 
         XCTAssertEqual(viewModel.step, .testCapture)
-        XCTAssertEqual(convex.settingsUpdateCalls.last?.defaultProjectId, "proj-b")
+        XCTAssertEqual(convex.settingsUpdateCalls.last?.defaultProjectId, .set("proj-b"))
     }
 
     // MARK: Happy: upsell only after first successful test capture; declining never blocks
@@ -642,13 +642,13 @@ final class SettingsViewModelTests: XCTestCase {
 
         viewModel.model = "  gpt-5.3-codex  "
         await viewModel.saveModel()
-        XCTAssertEqual(convex.settingsUpdateCalls.last?.model, "gpt-5.3-codex")
+        XCTAssertEqual(convex.settingsUpdateCalls.last?.model, .set("gpt-5.3-codex"))
 
         await viewModel.saveScreenshotsEnabled(false)
         XCTAssertEqual(convex.settingsUpdateCalls.last?.screenshotsEnabled, false)
 
         await viewModel.saveDefaultProject("proj-9")
-        XCTAssertEqual(convex.settingsUpdateCalls.last?.defaultProjectId, "proj-9")
+        XCTAssertEqual(convex.settingsUpdateCalls.last?.defaultProjectId, .set("proj-9"))
 
         XCTAssertEqual(convex.settingsUpdateCalls.count, 4)
     }

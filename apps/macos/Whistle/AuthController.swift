@@ -199,6 +199,17 @@ public final class AuthController: ObservableObject {
     }
 
     public func signOut() async {
+        // Order matters: clear the provider's cached credentials BEFORE
+        // detaching Convex's websocket attachment. If we detached Convex
+        // first, a concurrent authenticated call (e.g. a periodic
+        // SyncEngine drain) racing in during this `await` gap would see the
+        // gate reset, re-run `ensureAuthAttached()`, and pull a still-valid
+        // token from the not-yet-cleared provider -- silently re-latching
+        // the exact attachment we just tore down. Clearing the provider
+        // first means any such race fails closed (no token to attach)
+        // instead of reviving the old session.
+        await authProvider.logout()
+        await convexService.detachAuth()
         breadcrumbStore.setHasSignedInBefore(false)
         state = .signedOut
     }

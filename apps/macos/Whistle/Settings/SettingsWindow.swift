@@ -106,7 +106,7 @@ public final class SettingsViewModel: ObservableObject {
 
     public func saveModel() async {
         let trimmed = model.trimmingCharacters(in: .whitespacesAndNewlines)
-        try? await convex.settingsUpdate(SettingsPatch(model: trimmed.isEmpty ? nil : trimmed))
+        try? await convex.settingsUpdate(SettingsPatch(model: trimmed.isEmpty ? .clear : .set(trimmed)))
     }
 
     public func saveScreenshotsEnabled(_ enabled: Bool) async {
@@ -116,7 +116,7 @@ public final class SettingsViewModel: ObservableObject {
 
     public func saveDefaultProject(_ projectId: String?) async {
         defaultProjectId = projectId
-        try? await convex.settingsUpdate(SettingsPatch(defaultProjectId: projectId))
+        try? await convex.settingsUpdate(SettingsPatch(defaultProjectId: projectId.map { .set($0) } ?? .clear))
     }
 
     // MARK: API key management (PRD F5.2: masked, replaceable)

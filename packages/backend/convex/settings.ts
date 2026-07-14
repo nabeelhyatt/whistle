@@ -54,9 +54,16 @@ export const get = query({
  */
 export const update = mutation({
   args: {
-    defaultProjectId: v.optional(v.string()),
+    // `defaultProjectId`/`model` are tri-state: the key absent (`undefined`)
+    // means "leave untouched", an explicit `null` means "clear it", and a
+    // string means "set it". This is what lets the client's "clear" UI
+    // affordances (empty model field, deselecting the default project)
+    // actually clear the field instead of being silent no-ops — a plain
+    // `v.optional(v.string())` can't distinguish "not sent" from "send null
+    // to clear" since both collapse to `undefined` on the wire.
+    defaultProjectId: v.optional(v.union(v.string(), v.null())),
     agent: v.optional(v.string()),
-    model: v.optional(v.string()),
+    model: v.optional(v.union(v.string(), v.null())),
     screenshotsEnabled: v.optional(v.boolean()),
   },
   handler: async (ctx, args) => {
@@ -70,8 +77,10 @@ export const update = mutation({
       await ctx.db.insert("settings", {
         userId: user._id,
         agent: args.agent ?? DEFAULT_AGENT,
-        model: args.model,
-        defaultProjectId: args.defaultProjectId,
+        // No existing row to clear, so `null` and `undefined` both just mean
+        // "no value" here.
+        model: args.model ?? undefined,
+        defaultProjectId: args.defaultProjectId ?? undefined,
         screenshotsEnabled:
           args.screenshotsEnabled ?? DEFAULT_SCREENSHOTS_ENABLED,
       });
@@ -79,11 +88,18 @@ export const update = mutation({
     }
 
     await ctx.db.patch(existing._id, {
+      // `ctx.db.patch(id, { field: undefined })` unsets `field`; omitting
+      // the key entirely leaves it untouched. So an explicit `null` maps to
+      // `undefined` here (unset), while `undefined` args stay omitted from
+      // the patch object (untouched).
       ...(args.defaultProjectId !== undefined && {
-        defaultProjectId: args.defaultProjectId,
+        defaultProjectId:
+          args.defaultProjectId === null ? undefined : args.defaultProjectId,
       }),
       ...(args.agent !== undefined && { agent: args.agent }),
-      ...(args.model !== undefined && { model: args.model }),
+      ...(args.model !== undefined && {
+        model: args.model === null ? undefined : args.model,
+      }),
       ...(args.screenshotsEnabled !== undefined && {
         screenshotsEnabled: args.screenshotsEnabled,
       }),

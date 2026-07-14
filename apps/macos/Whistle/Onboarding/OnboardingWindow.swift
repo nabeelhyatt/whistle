@@ -297,7 +297,7 @@ public final class OnboardingViewModel: ObservableObject {
 
         if list.count == 1, let only = list.first {
             selectedProjectId = only.id
-            try? await convex.settingsUpdate(SettingsPatch(defaultProjectId: only.id))
+            try? await convex.settingsUpdate(SettingsPatch(defaultProjectId: .set(only.id)))
             advance(to: .testCapture)
         } else {
             // Pre-select the first project so Continue is always available
@@ -331,7 +331,7 @@ public final class OnboardingViewModel: ObservableObject {
 
     public func confirmProjectSelection() async {
         if let selectedProjectId {
-            try? await convex.settingsUpdate(SettingsPatch(defaultProjectId: selectedProjectId))
+            try? await convex.settingsUpdate(SettingsPatch(defaultProjectId: .set(selectedProjectId)))
         }
         // Zero-project accounts may continue without a default (never
         // hard-block outside sign-in and API key); the capture panel's

@@ -168,6 +168,17 @@ public actor SyncEngine {
     private let uploader: any ScreenshotUploading
     private let networkMonitor: (any NetworkMonitoring)?
     private let logger: @Sendable (String) -> Void
+    /// Invoked once per drain pass that hits `ConvexServiceError
+    /// .notAuthenticated` (see `drainPass`'s catch arm). Auth deferral is
+    /// deliberately NOT surfaced as `.syncFailed` (there's no local-retry
+    /// affordance that helps while genuinely signed out) -- but that also
+    /// means a server-revoked session with locally-persisted `.signedIn`
+    /// state defers silently forever, tick after tick, with no user-visible
+    /// surface at all. The app target uses repeated calls to this hook as a
+    /// signal to force re-auth (`AuthController.handleTokenRefreshFailure()`)
+    /// after tolerating a few deferred passes. `nil` by default so existing
+    /// callers/tests are unaffected.
+    private let onAuthDeferred: (@Sendable () async -> Void)?
 
     /// Reentrancy guard for `drainOnce()`: true while a drain pass is
     /// in-flight. Without this, two concurrently-invoked `drainOnce()` calls
@@ -186,13 +197,15 @@ public actor SyncEngine {
         convex: any ConvexServiceProtocol,
         uploader: any ScreenshotUploading = URLSessionScreenshotUploader(),
         networkMonitor: (any NetworkMonitoring)? = nil,
-        logger: @escaping @Sendable (String) -> Void = { NSLog("%@", $0) }
+        logger: @escaping @Sendable (String) -> Void = { NSLog("%@", $0) },
+        onAuthDeferred: (@Sendable () async -> Void)? = nil
     ) {
         self.store = store
         self.convex = convex
         self.uploader = uploader
         self.networkMonitor = networkMonitor
         self.logger = logger
+        self.onAuthDeferred = onAuthDeferred
     }
 
     /// Attempts to drain every `queued`/`syncFailed` draft once, in
@@ -246,7 +259,7 @@ public actor SyncEngine {
         logger("Whistle: SyncEngine draining \(drafts.count) draft(s)")
 
         var synced: [String] = []
-        for draft in drafts {
+        for (index, draft) in drafts.enumerated() {
             do {
                 try store.updateLocalState(clientId: draft.clientId, to: .syncing)
                 let serverId = try await syncOne(draft)
@@ -261,13 +274,31 @@ public actor SyncEngine {
                 // queue's fault. Revert to `.queued` (never leave it stuck
                 // in `.syncing`) so the next drain -- once auth actually
                 // resolves -- picks it back up, with no wasted attempt
-                // increment. This matters most for `runPeriodicDrain()`,
-                // which (unlike every other trigger) deliberately calls
-                // `drainOnce()` without an auth gate, so a persistently
-                // signed-out user would otherwise see every queued draft
-                // flip to `.syncFailed` on every periodic tick forever.
-                _ = try? store.updateLocalState(clientId: draft.clientId, to: .queued, localError: nil)
-                logger("Whistle: SyncEngine sync deferred for \(draft.clientId): not authenticated")
+                // increment. `runPeriodicDrain()`'s `gate` parameter keeps
+                // this from firing on every periodic tick for a persistently
+                // signed-out user, but the revert stays defensive here too
+                // (a gate can only check the app's local signed-in state --
+                // it can't detect e.g. a token the server has independently
+                // rejected).
+                do {
+                    try store.updateLocalState(clientId: draft.clientId, to: .queued, localError: nil)
+                    logger("Whistle: SyncEngine sync deferred for \(draft.clientId): not authenticated")
+                } catch {
+                    logger("Whistle: SyncEngine failed to revert \(draft.clientId) to .queued: \(error)")
+                }
+                let remaining = drafts.count - index - 1
+                if remaining > 0 {
+                    logger("Whistle: SyncEngine skipping remaining \(remaining) draft(s) this pass after not-authenticated")
+                }
+                // Fire once per deferred pass (not once per deferred draft --
+                // the `break` below means only the first draft in the pass
+                // ever reaches this arm). Without this, a server-revoked
+                // session combined with locally-persisted `.signedIn` state
+                // defers every single tick forever with nothing surfaced to
+                // the user; the app target counts these calls and escalates
+                // to a re-auth prompt after a threshold.
+                await onAuthDeferred?()
+                break
             } catch {
                 _ = try? store.incrementLocalAttempt(clientId: draft.clientId)
                 _ = try? store.updateLocalState(
@@ -344,7 +375,25 @@ public actor SyncEngine {
     /// can never suppress the periodic retry too. Safe to run concurrently
     /// with any other caller of `drainOnce()` -- the `isDraining`/
     /// `rerunRequested` guard above coalesces overlapping passes.
-    public func runPeriodicDrain(interval: Duration = .seconds(180)) async {
+    ///
+    /// - Parameter gate: Checked before every tick's `drainOnce()`; a tick
+    ///   whose gate returns `false` is skipped (the loop keeps running, it
+    ///   just doesn't drain that time). Defaults to always-true so existing
+    ///   callers/tests are unaffected. The app target passes a gate that
+    ///   mirrors `drainSyncIfSignedIn()`'s signed-in check, so a periodic
+    ///   tick firing after sign-out never even attempts an upload -- defense
+    ///   in depth alongside sign-out's credential-clear/auth-detach, and
+    ///   consistency with every other drain trigger (all of which route
+    ///   through the same signed-in check) instead of being the one ungated
+    ///   exception.
+    public func runPeriodicDrain(
+        interval: Duration = .seconds(180),
+        gate: @escaping @Sendable () async -> Bool = { true }
+    ) async {
+        guard interval > .zero else {
+            logger("Whistle: SyncEngine periodic drain requires a positive interval, got \(interval)")
+            return
+        }
         // `Task.sleep(for:)` throws `CancellationError` once the driving
         // Task is cancelled, but Swift's cooperative cancellation is
         // opt-in -- a bare `try?` around the sleep would silently swallow
@@ -355,6 +404,7 @@ public actor SyncEngine {
         while !Task.isCancelled {
             try? await Task.sleep(for: interval)
             if Task.isCancelled { break }
+            guard await gate() else { continue }
             _ = await drainOnce()
         }
     }
@@ -384,8 +434,12 @@ public actor SyncEngine {
             return
         }
         for draft in stranded {
-            _ = try? store.updateLocalState(clientId: draft.clientId, to: .queued, localError: nil)
-            logger("Whistle: SyncEngine recovered stranded .syncing draft \(draft.clientId) -> .queued")
+            do {
+                try store.updateLocalState(clientId: draft.clientId, to: .queued, localError: nil)
+                logger("Whistle: SyncEngine recovered stranded .syncing draft \(draft.clientId) -> .queued")
+            } catch {
+                logger("Whistle: SyncEngine failed to recover stranded .syncing draft \(draft.clientId): \(error)")
+            }
         }
     }
 }
