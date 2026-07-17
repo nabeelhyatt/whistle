@@ -1003,6 +1003,54 @@ final class CapturePanelControllerTests: XCTestCase {
     }
 
     @MainActor
+    func testSignedOutSubmitRetainsCaptureRequestsSignInAndQueuesNothing() async throws {
+        let (store, tempDir) = try makeStore()
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+        try store.saveProjectsSnapshot([TestSupport.project1])
+
+        var authState: AuthState = .signedOut
+        var signInRequestCount = 0
+        let controller = CapturePanelController(
+            store: store,
+            micPermissionStatus: { .granted },
+            speechPermissionStatus: { .granted },
+            transcriptionServiceFactory: { FakeTranscriptionService() },
+            authStateProvider: { authState },
+            requestSignIn: { signInRequestCount += 1 }
+        )
+        controller.trigger()
+        try await Whistle_waitUntil { controller.isPanelOpen }
+        controller.currentViewModel?.transcriptText = "keep this capture"
+        controller.currentViewModel?.selectProject(TestSupport.project1.id)
+
+        controller.submitCurrentForTesting()
+
+        XCTAssertTrue(controller.isPanelOpen)
+        XCTAssertEqual(controller.currentViewModel?.transcriptText, "keep this capture")
+        XCTAssertEqual(signInRequestCount, 1)
+        XCTAssertTrue(controller.currentViewModel?.submissionAuthNotice?.isSigningIn == true)
+        XCTAssertTrue(try store.allDrafts().isEmpty)
+
+        controller.updateAuthenticationState(.reauthRequired)
+        XCTAssertEqual(controller.currentViewModel?.submissionAuthNotice?.actionTitle, "Sign In Again")
+        controller.submitCurrentForTesting()
+        XCTAssertEqual(signInRequestCount, 2)
+        XCTAssertTrue(controller.currentViewModel?.submissionAuthNotice?.isSigningIn == true)
+
+        authState = .signedIn
+        controller.updateAuthenticationState(.signedIn)
+        XCTAssertNil(controller.currentViewModel?.submissionAuthNotice)
+
+        controller.submitCurrentForTesting()
+
+        XCTAssertFalse(controller.isPanelOpen)
+        let drafts = try store.allDrafts()
+        XCTAssertEqual(drafts.count, 1)
+        XCTAssertEqual(drafts.first?.transcript, "keep this capture")
+        XCTAssertEqual(drafts.first?.projectId, TestSupport.project1.id)
+    }
+
+    @MainActor
     func testDuplicateTriggerWhilePanelOpenFocusesExistingPanelWithoutSecondScreenshot() async throws {
         for mode in [CapturePanelMode.nonActivating, CapturePanelMode.activating] {
             let (store, tempDir) = try makeStore()

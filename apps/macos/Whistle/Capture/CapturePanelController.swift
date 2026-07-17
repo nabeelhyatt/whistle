@@ -92,6 +92,8 @@ public final class CapturePanelController: NSObject, NSWindowDelegate {
     /// crash recovery for hours -- see the CI-spend incident this seam
     /// exists to prevent.
     private let transcriptionServiceFactory: () -> any TranscriptionService
+    private let authStateProvider: @MainActor () -> AuthState
+    private let requestSignIn: @MainActor () -> Void
 
     private var panel: NSPanel?
     private var viewModel: CaptureViewModel?
@@ -134,6 +136,7 @@ public final class CapturePanelController: NSObject, NSWindowDelegate {
     var hasPreservedDraft: Bool { panel != nil && !(panel?.isVisible ?? false) }
     var currentViewModel: CaptureViewModel? { viewModel }
     func submitCurrentForTesting() { handleSubmit() }
+    func requestSignInForTesting() { handleSignIn() }
     func dismissPreservingDraftForTesting() { dismissPreservingDraft() }
 
     /// Debug-log hook for the trigger->panel-interactive timing called out
@@ -154,7 +157,9 @@ public final class CapturePanelController: NSObject, NSWindowDelegate {
         requestMicPermission: @escaping @MainActor () async -> Bool = { await MicPermission.request() },
         speechPermissionStatus: @escaping @MainActor () -> PermissionState = { SpeechRecognitionPermission.status() },
         requestSpeechPermission: @escaping @MainActor () async -> Bool = { await SpeechRecognitionPermission.request() },
-        transcriptionServiceFactory: @escaping () -> any TranscriptionService = { TranscriptionServiceFactory.make() }
+        transcriptionServiceFactory: @escaping () -> any TranscriptionService = { TranscriptionServiceFactory.make() },
+        authStateProvider: @escaping @MainActor () -> AuthState = { .signedIn },
+        requestSignIn: @escaping @MainActor () -> Void = {}
     ) {
         self.store = store
         self.screenshotService = screenshotService
@@ -165,6 +170,8 @@ public final class CapturePanelController: NSObject, NSWindowDelegate {
         self.speechPermissionStatus = speechPermissionStatus
         self.requestSpeechPermission = requestSpeechPermission
         self.transcriptionServiceFactory = transcriptionServiceFactory
+        self.authStateProvider = authStateProvider
+        self.requestSignIn = requestSignIn
         super.init()
     }
 
@@ -201,6 +208,7 @@ public final class CapturePanelController: NSObject, NSWindowDelegate {
         }
 
         if preFill == nil, let panel, let viewModel {
+            viewModel.updateSubmissionAuthState(authStateProvider())
             viewModel.resumeDraft()
             showPanel(panel)
             onTimingMeasured(Date().timeIntervalSince(start))
@@ -220,6 +228,7 @@ public final class CapturePanelController: NSObject, NSWindowDelegate {
         self.panel = panel
         self.viewModel = viewModel
 
+        viewModel.updateSubmissionAuthState(authStateProvider())
         viewModel.beginCapture(preFill: preFill)
         showPanel(panel)
 
@@ -266,17 +275,18 @@ public final class CapturePanelController: NSObject, NSWindowDelegate {
             onSubmit: { [weak self] in self?.handleSubmit() },
             onEscape: { [weak self] in self?.handleEscape() },
             onHistory: { [weak self] in self?.onHistoryRequested() },
-            onSettings: { [weak self] in self?.onSettingsRequested() }
+            onSettings: { [weak self] in self?.onSettingsRequested() },
+            onSignIn: { [weak self] in self?.handleSignIn() }
         )
 
         let hosting = NSHostingView(rootView: captureView)
-        // Height bumped from 360 -> 400 for the capture-panel-redesign
+        // Height bumped from 360 -> 430 for the capture-panel-redesign
         // spec's status rail (docs/design/capture-panel-redesign-spec.md,
         // file change #5): the rail adds ~44pt below the input card that
         // the original layout didn't have. `positionBeneathStatusItem`
         // reads `panel.frame.size` at call time, so it picks up the new
         // height automatically -- no separate change needed there.
-        hosting.frame = NSRect(x: 0, y: 0, width: 460, height: 400)
+        hosting.frame = NSRect(x: 0, y: 0, width: 460, height: 430)
         self.hostingView = hosting
 
         let styleMask: NSWindow.StyleMask
@@ -377,12 +387,33 @@ public final class CapturePanelController: NSObject, NSWindowDelegate {
     // MARK: - Submit / dismiss (plan U8 fix #4)
 
     private func handleSubmit() {
+        let authState = authStateProvider()
+        guard authState == .signedIn else {
+            switch authState {
+            case .signedOut, .reauthRequired:
+                handleSignIn()
+            case .signingIn:
+                viewModel?.updateSubmissionAuthState(authState)
+            case .signedIn:
+                break
+            }
+            return
+        }
         let result = viewModel?.submit()
         closePanel()
         if case .submitted(let clientId)? = result {
             NSLog("Whistle: capture submitted, clientId=%@", clientId)
             onCaptureSubmitted(clientId)
         }
+    }
+
+    private func handleSignIn() {
+        viewModel?.updateSubmissionAuthState(.signingIn)
+        requestSignIn()
+    }
+
+    public func updateAuthenticationState(_ state: AuthState, errorMessage: String? = nil) {
+        viewModel?.updateSubmissionAuthState(state, errorMessage: errorMessage)
     }
 
     /// Esc dismisses the panel but preserves the draft (fix #4d note: "keep
