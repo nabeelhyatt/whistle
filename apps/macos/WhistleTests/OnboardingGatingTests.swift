@@ -704,6 +704,16 @@ final class SettingsViewModelTests: XCTestCase {
         await viewModel.signOut()
         XCTAssertEqual(auth.state, .signedOut)
     }
+
+    func testSignInDelegatesToAuthAndPublishesTheNewState() async throws {
+        let (viewModel, _, _) = makeViewModel()
+        XCTAssertEqual(viewModel.authState, .signedOut)
+
+        await viewModel.signIn()
+
+        try await Whistle_waitUntil { viewModel.authState == .signedIn }
+        XCTAssertEqual(viewModel.authState, .signedIn)
+    }
 }
 
 // MARK: - Template editor tests (PRD F5.2/F5.3)

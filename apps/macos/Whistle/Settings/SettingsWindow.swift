@@ -13,6 +13,7 @@
 // settings.setConductorKey then conductor.validateKey).
 
 import AppKit
+import Combine
 import KeyboardShortcuts
 import SwiftUI
 import WhistleCore
@@ -50,6 +51,8 @@ public final class SettingsViewModel: ObservableObject {
     @Published public private(set) var keyReplaceSucceeded: Bool?
 
     @Published public private(set) var loadError: String?
+    @Published public private(set) var authState: AuthState
+    @Published public private(set) var signInErrorMessage: String?
 
     /// The known agent values (PRD F5.2). `model` stays a free-form string
     /// (PRD open question: exact accepted values are undocumented).
@@ -60,11 +63,16 @@ public final class SettingsViewModel: ObservableObject {
     private let convex: any ConvexServiceProtocol
     private let auth: AuthController
     private var projectsTask: Task<Void, Never>?
+    private var authCancellables: Set<AnyCancellable> = []
 
     public init(convex: any ConvexServiceProtocol, auth: AuthController) {
         self.convex = convex
         self.auth = auth
         self.templateEditor = TemplateEditorViewModel(convex: convex)
+        self.authState = auth.state
+        self.signInErrorMessage = auth.lastSignInErrorMessage
+        auth.$state.receive(on: DispatchQueue.main).sink { [weak self] in self?.authState = $0 }.store(in: &authCancellables)
+        auth.$lastSignInErrorMessage.receive(on: DispatchQueue.main).sink { [weak self] in self?.signInErrorMessage = $0 }.store(in: &authCancellables)
     }
 
     deinit {
@@ -169,14 +177,16 @@ public final class SettingsViewModel: ObservableObject {
 
     // MARK: Account
 
-    public var authState: AuthState { auth.state }
-
     /// True when the signed-in session is the local dev fallback (no real
     /// Auth0 tenant configured) — Account status shows "Dev sign-in".
     public var isDevSignIn: Bool { auth.isDevSignIn }
 
     public func signOut() async {
         await auth.signOut()
+    }
+
+    public func signIn() async {
+        await auth.signIn()
     }
 }
 
@@ -312,8 +322,16 @@ struct SettingsView: View {
                     LabeledContent("Status:", value: "Signing in…")
                 case .reauthRequired:
                     LabeledContent("Status:", value: "Session expired — sign in again")
+                    if let signInErrorMessage = viewModel.signInErrorMessage {
+                        Text(signInErrorMessage).foregroundStyle(.red).font(.callout)
+                    }
+                    Button("Sign In Again") { Task { await viewModel.signIn() } }
                 case .signedOut:
                     LabeledContent("Status:", value: "Signed out")
+                    if let signInErrorMessage = viewModel.signInErrorMessage {
+                        Text(signInErrorMessage).foregroundStyle(.red).font(.callout)
+                    }
+                    Button("Sign In") { Task { await viewModel.signIn() } }
                 }
             }
         }

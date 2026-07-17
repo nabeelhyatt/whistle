@@ -1003,6 +1003,46 @@ final class CapturePanelControllerTests: XCTestCase {
     }
 
     @MainActor
+    func testSignedOutSubmitRetainsCaptureRequestsSignInAndQueuesNothing() async throws {
+        let (store, tempDir) = try makeStore()
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+        try store.saveProjectsSnapshot([TestSupport.project1])
+
+        var authState: AuthState = .signedOut
+        var signInRequestCount = 0
+        let controller = CapturePanelController(
+            store: store,
+            micPermissionStatus: { .granted },
+            speechPermissionStatus: { .granted },
+            transcriptionServiceFactory: { FakeTranscriptionService() },
+            authStateProvider: { authState },
+            requestSignIn: { signInRequestCount += 1 }
+        )
+        controller.trigger()
+        try await Whistle_waitUntil { controller.isPanelOpen }
+        controller.currentViewModel?.transcriptText = "keep this capture"
+        controller.currentViewModel?.selectProject(TestSupport.project1.id)
+
+        controller.submitCurrentForTesting()
+
+        XCTAssertTrue(controller.isPanelOpen)
+        XCTAssertEqual(controller.currentViewModel?.transcriptText, "keep this capture")
+        XCTAssertEqual(controller.currentViewModel?.submissionAuthNotice?.actionTitle, "Sign In")
+        XCTAssertTrue(try store.allDrafts().isEmpty)
+
+        controller.requestSignInForTesting()
+        XCTAssertEqual(signInRequestCount, 1)
+        XCTAssertTrue(controller.currentViewModel?.submissionAuthNotice?.isSigningIn == true)
+
+        controller.updateAuthenticationState(.reauthRequired)
+        XCTAssertEqual(controller.currentViewModel?.submissionAuthNotice?.actionTitle, "Sign In Again")
+
+        authState = .signedIn
+        controller.updateAuthenticationState(.signedIn)
+        XCTAssertNil(controller.currentViewModel?.submissionAuthNotice)
+    }
+
+    @MainActor
     func testDuplicateTriggerWhilePanelOpenFocusesExistingPanelWithoutSecondScreenshot() async throws {
         for mode in [CapturePanelMode.nonActivating, CapturePanelMode.activating] {
             let (store, tempDir) = try makeStore()

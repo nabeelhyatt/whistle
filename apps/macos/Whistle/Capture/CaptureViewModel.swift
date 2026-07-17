@@ -56,6 +56,13 @@ public enum CaptureSubmitResult: Equatable {
     case refusedEmpty
 }
 
+/// Actionable authentication state shown without discarding the capture.
+public struct CaptureSubmissionAuthNotice: Equatable {
+    public let message: String
+    public let actionTitle: String
+    public let isSigningIn: Bool
+}
+
 @MainActor
 public final class CaptureViewModel: ObservableObject {
     // MARK: - Published UI state
@@ -80,6 +87,7 @@ public final class CaptureViewModel: ObservableObject {
     @Published public var selectedProjectId: String?
     @Published public private(set) var projects: [Project] = []
     @Published public var focusProjectPicker: Bool = false
+    @Published public private(set) var submissionAuthNotice: CaptureSubmissionAuthNotice?
 
     /// Bumped every time the panel is shown -- fresh open, a resumed draft
     /// (fix #4b/c), or a refocus while already open -- so `CaptureView` can
@@ -512,6 +520,21 @@ public final class CaptureViewModel: ObservableObject {
         !transcriptText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             || !notesText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             || screenshotData != nil
+    }
+
+    /// Authentication failures retain the draft; the user explicitly submits
+    /// again once sign-in succeeds.
+    public func updateSubmissionAuthState(_ state: AuthState, errorMessage: String? = nil) {
+        switch state {
+        case .signedIn:
+            submissionAuthNotice = nil
+        case .signingIn:
+            submissionAuthNotice = .init(message: "Signing in… your capture is still here.", actionTitle: "Signing In…", isSigningIn: true)
+        case .reauthRequired:
+            submissionAuthNotice = .init(message: errorMessage ?? "Your session expired. Sign in again to send this capture.", actionTitle: "Sign In Again", isSigningIn: false)
+        case .signedOut:
+            submissionAuthNotice = .init(message: errorMessage ?? "Sign in to send this capture.", actionTitle: "Sign In", isSigningIn: false)
+        }
     }
 
     // MARK: - Submit

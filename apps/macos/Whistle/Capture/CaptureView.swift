@@ -25,6 +25,7 @@ struct CaptureView: View {
     var onEscape: () -> Void
     var onHistory: () -> Void
     var onSettings: () -> Void
+    var onSignIn: () -> Void
 
     @FocusState private var transcriptFieldFocused: Bool
     @FocusState private var projectPickerFocused: Bool
@@ -40,6 +41,9 @@ struct CaptureView: View {
                     micDeniedBanner
                 } else if viewModel.isSpeechRecognitionDenied {
                     speechRecognitionDeniedBanner
+                }
+                if let notice = viewModel.submissionAuthNotice {
+                    authenticationNotice(notice)
                 }
 
                 inputCard
@@ -157,6 +161,21 @@ struct CaptureView: View {
             }
             .buttonStyle(.plain)
             .foregroundStyle(Color.accentColor)
+        }
+        .font(.caption)
+        .foregroundStyle(PanelTheme.placeholderInk)
+    }
+
+    private func authenticationNotice(_ notice: CaptureSubmissionAuthNotice) -> some View {
+        HStack(spacing: 5) {
+            Image(systemName: "person.crop.circle.badge.exclamationmark").foregroundStyle(.orange)
+            Text(notice.message).foregroundStyle(.secondary)
+            Spacer(minLength: 4)
+            Button(notice.actionTitle, action: onSignIn)
+                .buttonStyle(.plain)
+                .foregroundStyle(Color.accentColor)
+                .disabled(notice.isSigningIn)
+            if notice.isSigningIn { ProgressView().controlSize(.small) }
         }
         .font(.caption)
         .foregroundStyle(PanelTheme.placeholderInk)

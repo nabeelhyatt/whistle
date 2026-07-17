@@ -206,8 +206,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             .store(in: &cancellables)
 
         auth.$state
+            .combineLatest(auth.$lastSignInErrorMessage)
             .receive(on: DispatchQueue.main)
-            .sink { [weak self] state in
+            .sink { [weak self] state, errorMessage in
+                self?.capturePanelController?.updateAuthenticationState(state, errorMessage: errorMessage)
                 // Any state transition (sign-in, sign-out, a fresh
                 // reauthRequired) means the deferral streak that led here,
                 // if any, is no longer relevant -- reset so a brand new
@@ -226,8 +228,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             store: store,
             refreshProjectsIfStale: { [weak projectsSyncCoordinator] in
                 Task { await projectsSyncCoordinator?.refreshIfStale() }
-            }
+            },
+            authStateProvider: { [weak auth] in auth?.state ?? .signedOut },
+            requestSignIn: { [weak auth] in Task { await auth?.signIn() } }
         )
+        capturePanel.updateAuthenticationState(auth.state, errorMessage: auth.lastSignInErrorMessage)
         capturePanel.onHistoryRequested = { [weak self] in self?.showHistory() }
         capturePanel.onSettingsRequested = { [weak self] in self?.showSettings() }
         // Immediate drain on submit -- don't wait for the next network-path-
