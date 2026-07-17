@@ -32,6 +32,7 @@ public actor ProjectsSyncCoordinator {
     private let staleAfter: TimeInterval
 
     private var subscriptionTask: Task<Void, Never>?
+    private var subscriptionGeneration = 0
 
     public init(
         store: CaptureStore,
@@ -52,11 +53,36 @@ public actor ProjectsSyncCoordinator {
     /// app launch and never worry about it again) -- a re-entrant call is a
     /// no-op while the subscription is already running.
     public func start() {
+        setServerUpdatesEnabled(true)
+    }
+
+    /// Owns the authenticated projects subscription across auth changes.
+    /// Signing out cancels and clears it; signing in creates a fresh stream.
+    /// If the stream fails naturally, its slot is cleared so a later auth
+    /// transition can restart it rather than retaining a dead task forever.
+    public func setServerUpdatesEnabled(_ enabled: Bool) {
+        if !enabled {
+            subscriptionGeneration += 1
+            subscriptionTask?.cancel()
+            subscriptionTask = nil
+            return
+        }
+
         guard subscriptionTask == nil else { return }
-        subscriptionTask = Task { [store, convex] in
+        subscriptionGeneration += 1
+        let generation = subscriptionGeneration
+        subscriptionTask = Task { [weak self, store, convex] in
             for await projects in convex.projectsList() {
+                guard !Task.isCancelled else { break }
                 try? store.saveProjectsSnapshot(projects)
             }
+            await self?.subscriptionDidEnd(generation: generation)
+        }
+    }
+
+    private func subscriptionDidEnd(generation: Int) {
+        if subscriptionGeneration == generation {
+            subscriptionTask = nil
         }
     }
 

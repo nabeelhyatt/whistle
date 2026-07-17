@@ -2,6 +2,7 @@ import { convexTest } from "convex-test";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { api, internal } from "../_generated/api";
 import schema from "../schema";
+import liveMessagesFixture from "./fixtures/conductor-messages-live.json";
 import {
   buildWorkspaceName,
   extractMessageText,
@@ -333,6 +334,16 @@ describe("extractMessageText", () => {
   test("array of content blocks", () => {
     expect(extractMessageText([{ text: "a" }, { text: "b" }])).toBe("a\nb");
   });
+  test("live Conductor rawPayload assistant envelope", () => {
+    expect(extractMessageText({
+      rawPayload: {
+        type: "assistant",
+        message: {
+          content: [{ type: "text", text: "from live envelope" }],
+        },
+      },
+    })).toBe("from live envelope");
+  });
   test("unrecognized shape degrades to empty string", () => {
     expect(extractMessageText({ weird: 123 })).toBe("");
   });
@@ -376,6 +387,13 @@ describe("findAgentReplyAfterOurs", () => {
   test("returns undefined when no agent message follows ours", () => {
     const messages = [{ id: "our-id", sessionIndex: 0, type: "user", content: "hi" }];
     expect(findAgentReplyAfterOurs(messages, "our-id")).toBeUndefined();
+  });
+
+  test("correlates lowercase nested live ids and ignores event-only agent records", () => {
+    expect(findAgentReplyAfterOurs(
+      liveMessagesFixture.messages,
+      liveMessagesFixture.clientId,
+    )?.id).toBe("session-id:3:0");
   });
 });
 
@@ -426,6 +444,55 @@ describe("happy path", () => {
     expect(capture?.clarifyingQuestions).toEqual([
       "Dark mode only, or full theming?",
     ]);
+  });
+
+  test("live nested message shape transitions agentWorking to ready", async () => {
+    const t = convexTest(schema, modules);
+    const clientId = "9FA5700C-D530-45CA-A154-CAC4B9599DFE";
+    const normalized = clientId.toLowerCase();
+    const { asUser, captureId } = await setupUserWithCapture(
+      t,
+      "auth0|pipeline-live-shape",
+      { clientId },
+    );
+
+    await tick(t);
+    let capture = await asUser.query(api.captures.get, { captureId });
+    const sessionId = capture!.sessionId!;
+    mock.sessions.get(sessionId)!.status = "idle";
+    mock.messagesBySession.set(sessionId, [
+      {
+        id: `${sessionId}:1:0`,
+        sessionIndex: 0,
+        type: "userMessage",
+        content: { id: normalized, turnId: normalized, type: "userMessage" },
+      },
+      {
+        id: `${sessionId}:3:0`,
+        sessionIndex: 2,
+        type: "agent",
+        content: {
+          userMessageId: normalized,
+          turnId: normalized,
+          rawPayload: {
+            type: "assistant",
+            message: {
+              content: [{
+                type: "text",
+                text: "Live reply summary.\n\n1. Ship the hotfix now?",
+              }],
+            },
+          },
+        },
+      },
+    ]);
+
+    await tick(t, 30_000);
+
+    capture = await asUser.query(api.captures.get, { captureId });
+    expect(capture?.status).toBe("ready");
+    expect(capture?.agentSummary).toBe("Live reply summary.");
+    expect(capture?.clarifyingQuestions).toEqual(["Ship the hotfix now?"]);
   });
 
   test("message queued during init still proceeds to agentWorking", async () => {
@@ -674,6 +741,16 @@ describe("error: send re-run with messageId already present", () => {
 
     await tick(t);
     expect(mock.sendMessageCalls).toHaveLength(1);
+
+    // The live list endpoint uses a generated top-level id and nests the
+    // lowercased client message id in content rather than `messageId`.
+    const sessionId = mock.sendMessageCalls[0].sessionId;
+    mock.messagesBySession.set(sessionId, [{
+      id: `${sessionId}:1:0`,
+      sessionIndex: 0,
+      type: "userMessage",
+      content: { id: "resend-msg-1", turnId: "resend-msg-1" },
+    }]);
 
     // Force capture back to "sending" to simulate a re-run of submit after
     // the message was already recorded (e.g. action died between send and
