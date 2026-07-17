@@ -1027,19 +1027,27 @@ final class CapturePanelControllerTests: XCTestCase {
 
         XCTAssertTrue(controller.isPanelOpen)
         XCTAssertEqual(controller.currentViewModel?.transcriptText, "keep this capture")
-        XCTAssertEqual(controller.currentViewModel?.submissionAuthNotice?.actionTitle, "Sign In")
-        XCTAssertTrue(try store.allDrafts().isEmpty)
-
-        controller.requestSignInForTesting()
         XCTAssertEqual(signInRequestCount, 1)
         XCTAssertTrue(controller.currentViewModel?.submissionAuthNotice?.isSigningIn == true)
+        XCTAssertTrue(try store.allDrafts().isEmpty)
 
         controller.updateAuthenticationState(.reauthRequired)
         XCTAssertEqual(controller.currentViewModel?.submissionAuthNotice?.actionTitle, "Sign In Again")
+        controller.submitCurrentForTesting()
+        XCTAssertEqual(signInRequestCount, 2)
+        XCTAssertTrue(controller.currentViewModel?.submissionAuthNotice?.isSigningIn == true)
 
         authState = .signedIn
         controller.updateAuthenticationState(.signedIn)
         XCTAssertNil(controller.currentViewModel?.submissionAuthNotice)
+
+        controller.submitCurrentForTesting()
+
+        XCTAssertFalse(controller.isPanelOpen)
+        let drafts = try store.allDrafts()
+        XCTAssertEqual(drafts.count, 1)
+        XCTAssertEqual(drafts.first?.transcript, "keep this capture")
+        XCTAssertEqual(drafts.first?.projectId, TestSupport.project1.id)
     }
 
     @MainActor

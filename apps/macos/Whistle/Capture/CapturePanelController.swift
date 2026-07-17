@@ -389,7 +389,14 @@ public final class CapturePanelController: NSObject, NSWindowDelegate {
     private func handleSubmit() {
         let authState = authStateProvider()
         guard authState == .signedIn else {
-            viewModel?.updateSubmissionAuthState(authState)
+            switch authState {
+            case .signedOut, .reauthRequired:
+                handleSignIn()
+            case .signingIn:
+                viewModel?.updateSubmissionAuthState(authState)
+            case .signedIn:
+                break
+            }
             return
         }
         let result = viewModel?.submit()
