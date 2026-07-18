@@ -67,29 +67,78 @@ final class ConvexAuthAttachmentGateTests: XCTestCase {
         XCTAssertEqual(attempts.value, 2)
     }
 
-    // Regression coverage for the sign-out fix: a stale `attached == true`
-    // left over from a previous session used to make `runIfNeeded` skip
-    // re-attaching entirely, so a fresh sign-in (same user or a different
-    // one) could run mutations under the OLD session's already-pinned JWT.
-    func testResetForcesTheNextRunIfNeededToReattemptAttach() async {
+    func testConcurrentCallersShareOneAttachmentAttempt() async {
         let gate = ConvexAuthAttachmentGate()
         let attempts = Counter()
 
-        let first = await gate.runIfNeeded {
+        let results = await withTaskGroup(of: Bool.self, returning: [Bool].self) { group in
+            for _ in 0..<20 {
+                group.addTask {
+                    await gate.runIfNeeded(generation: 7) {
+                        attempts.increment()
+                        try? await Task.sleep(for: .milliseconds(50))
+                        return true
+                    }
+                }
+            }
+            return await group.reduce(into: []) { $0.append($1) }
+        }
+
+        XCTAssertEqual(results.count, 20)
+        XCTAssertTrue(results.allSatisfy { $0 })
+        XCTAssertEqual(attempts.value, 1, "concurrent API calls must not race loginFromCache on one Convex client")
+    }
+
+    func testNewClientGenerationRequiresFreshAttachment() async {
+        let gate = ConvexAuthAttachmentGate()
+        let attempts = Counter()
+
+        let first = await gate.runIfNeeded(generation: 1) {
             attempts.increment()
             return true
         }
+        let second = await gate.runIfNeeded(generation: 2) {
+            attempts.increment()
+            return true
+        }
+
         XCTAssertTrue(first)
-        XCTAssertEqual(attempts.value, 1)
+        XCTAssertTrue(second)
+        XCTAssertEqual(attempts.value, 2)
+    }
+}
 
-        gate.reset()
+// MARK: - ReplaceableClientState
 
-        let second = await gate.runIfNeeded {
-            attempts.increment()
-            return true
+final class ReplaceableClientStateTests: XCTestCase {
+    func testReplaceIfCurrentRotatesOnceAndFencesStaleSnapshots() {
+        let ids = Counter()
+        let state = ReplaceableClientState {
+            DummyClient(id: ids.incrementAndGet())
         }
-        XCTAssertTrue(second, "a re-attempt after reset() must actually re-run attach, not just report the old state")
-        XCTAssertEqual(attempts.value, 2, "reset() must force the next call to re-attempt attach instead of short-circuiting on stale state")
+        let original = state.snapshot()
+
+        XCTAssertTrue(state.replaceIfCurrent(original))
+        XCTAssertFalse(state.replaceIfCurrent(original), "a stale timeout must not replace a newer healthy client")
+
+        let replacement = state.snapshot()
+        XCTAssertEqual(replacement.generation, original.generation + 1)
+        XCTAssertFalse(replacement.client === original.client)
+        XCTAssertTrue(state.isCurrent(replacement))
+    }
+
+    func testRotateAlwaysCreatesANewGeneration() {
+        let ids = Counter()
+        let state = ReplaceableClientState {
+            DummyClient(id: ids.incrementAndGet())
+        }
+        let original = state.snapshot()
+
+        state.rotate()
+
+        let replacement = state.snapshot()
+        XCTAssertEqual(replacement.generation, original.generation + 1)
+        XCTAssertNotEqual(replacement.client.id, original.client.id)
     }
 }
 
@@ -144,6 +193,21 @@ private final class Counter: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         count += 1
+    }
+
+    func incrementAndGet() -> Int {
+        lock.lock()
+        defer { lock.unlock() }
+        count += 1
+        return count
+    }
+}
+
+private final class DummyClient: @unchecked Sendable {
+    let id: Int
+
+    init(id: Int) {
+        self.id = id
     }
 }
 

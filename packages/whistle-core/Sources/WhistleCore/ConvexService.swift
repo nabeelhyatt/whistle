@@ -292,7 +292,9 @@ public struct CaptureCreateInput: Equatable, Sendable {
 /// deals in AsyncStream, matching `CaptureStore`'s idiom.
 #if canImport(ConvexMobile)
     public final class LiveConvexService: ConvexServiceProtocol, @unchecked Sendable {
-        private let client: ConvexClientWithAuth<String>
+        private typealias Client = ConvexClientWithAuth<String>
+
+        private let clients: ReplaceableClientState<Client>
         private let authGate = ConvexAuthAttachmentGate()
         private var cancellables: Set<AnyCancellable> = []
         private let lock = NSLock()
@@ -302,8 +304,10 @@ public struct CaptureCreateInput: Equatable, Sendable {
         ///   - authProvider: WhistleCore's own auth seam. Bridged internally
         ///     into convex-swift's `AuthProvider<String>` shape.
         public init(deploymentUrl: String, authProvider: any WhistleAuthProvider) {
-            let bridge = WhistleToConvexAuthProviderBridge(authProvider: authProvider)
-            self.client = ConvexClientWithAuth(deploymentUrl: deploymentUrl, authProvider: bridge)
+            self.clients = ReplaceableClientState {
+                let bridge = WhistleToConvexAuthProviderBridge(authProvider: authProvider)
+                return ConvexClientWithAuth(deploymentUrl: deploymentUrl, authProvider: bridge)
+            }
         }
 
         // MARK: - Auth attachment
@@ -323,8 +327,9 @@ public struct CaptureCreateInput: Equatable, Sendable {
         // re-attempts on the next call after a failed attach (e.g. token
         // briefly unavailable).
 
-        private func ensureAuthAttached() async throws {
-            let attached = await authGate.runIfNeeded { [client] in
+        private func authenticatedClient() async throws -> ReplaceableClientSnapshot<Client> {
+            let snapshot = clients.snapshot()
+            let attached = await authGate.runIfNeeded(generation: snapshot.generation) { [self] in
                 // `loginFromCache()` is itself a network-touching call with
                 // no internal timeout; a hang here (before `withTimeout` ever
                 // wraps the mutation/action below) would wedge syncing just
@@ -333,21 +338,38 @@ public struct CaptureCreateInput: Equatable, Sendable {
                 // instead of blocking the drain forever.
                 do {
                     let result = try await Self.withTimeout(Self.authedCallTimeout) {
-                        await client.loginFromCache()
+                        await snapshot.client.loginFromCache()
                     }
                     switch result {
                     case .success:
                         return true
                     case let .failure(error):
                         NSLog("Whistle: attaching auth to Convex client failed: %@", String(describing: error))
+                        invalidateClient(snapshot, reason: "auth attachment failed")
                         return false
                     }
                 } catch {
                     NSLog("Whistle: attaching auth to Convex client timed out: %@", String(describing: error))
+                    invalidateClient(snapshot, reason: "auth attachment timed out")
                     return false
                 }
             }
-            guard attached else { throw ConvexServiceError.notAuthenticated }
+            guard attached, clients.isCurrent(snapshot) else {
+                throw ConvexServiceError.notAuthenticated
+            }
+            return snapshot
+        }
+
+        private func invalidateClient(
+            _ snapshot: ReplaceableClientSnapshot<Client>, reason: String
+        ) {
+            guard clients.replaceIfCurrent(snapshot) else { return }
+            NSLog("Whistle: rotated Convex client after %@", reason)
+        }
+
+        private static func isTimeout(_ error: Error) -> Bool {
+            guard case let ConvexServiceError.requestFailed(message) = error else { return false }
+            return message.contains("timed out")
         }
 
         /// Maps convex-swift's stringly server error for backend auth
@@ -378,19 +400,19 @@ public struct CaptureCreateInput: Equatable, Sendable {
 
         /// `client.logout()` (convex-swift's own, not `WhistleAuthProvider`'s)
         /// calls the bridge's `logout()` (a no-op -- WhistleCore never owns
-        /// credential storage), clears convex-swift's internal auth bridge,
-        /// and tears down the websocket's auth callback; it never throws
-        /// (internal errors are swallowed there, not surfaced to us). The
-        /// gate reset is what actually matters for correctness: without it,
-        /// `ensureAuthAttached()`'s `runIfNeeded` would see `attached == true`
-        /// left over from the previous session and skip re-attaching
-        /// entirely, so the very next authenticated call after a fresh
-        /// sign-in would ride on convex-swift's already-torn-down (or,
-        /// worse, still-live) previous-session attachment instead of pulling
-        /// a fresh token via `loginFromCache()`.
+        /// credential storage) and tears down the websocket's auth callback.
+        /// Rotating the whole client also changes its generation, which makes
+        /// the next authenticated call attach a fresh token and prevents a
+        /// long-lived wedged transport from surviving reauthentication.
         public func detachAuth() async {
-            await client.logout()
-            authGate.reset()
+            // Publish the replacement before awaiting the old client's
+            // logout. Nothing starting during this suspension can capture
+            // the stale authenticated transport, and a concurrently attached
+            // replacement cannot be overwritten when logout returns.
+            let snapshot = clients.rotate()
+            _ = try? await Self.withTimeout(Self.authedCallTimeout) {
+                await snapshot.client.logout()
+            }
         }
 
         // MARK: - Authenticated call helpers (attach auth, then call)
@@ -409,12 +431,15 @@ public struct CaptureCreateInput: Equatable, Sendable {
         private func authedMutation<T: Decodable>(
             _ name: String, with args: [String: ConvexEncodable?]? = nil
         ) async throws -> T {
-            try await ensureAuthAttached()
+            let snapshot = try await authenticatedClient()
             do {
                 return try await Self.withTimeout(Self.authedCallTimeout) {
-                    try await self.client.mutation(name, with: args)
+                    try await snapshot.client.mutation(name, with: args)
                 }
             } catch {
+                if Self.isTimeout(error) {
+                    invalidateClient(snapshot, reason: "mutation \(name) timed out")
+                }
                 NSLog("Whistle: Convex mutation %@ failed: %@", name, String(describing: error))
                 throw Self.mapAuthError(error)
             }
@@ -429,12 +454,15 @@ public struct CaptureCreateInput: Equatable, Sendable {
         private func authedAction<T: Decodable>(
             _ name: String, with args: [String: ConvexEncodable?]? = nil
         ) async throws -> T {
-            try await ensureAuthAttached()
+            let snapshot = try await authenticatedClient()
             do {
                 return try await Self.withTimeout(Self.authedCallTimeout) {
-                    try await self.client.action(name, with: args)
+                    try await snapshot.client.action(name, with: args)
                 }
             } catch {
+                if Self.isTimeout(error) {
+                    invalidateClient(snapshot, reason: "action \(name) timed out")
+                }
                 NSLog("Whistle: Convex action %@ failed: %@", name, String(describing: error))
                 throw Self.mapAuthError(error)
             }
@@ -458,12 +486,15 @@ public struct CaptureCreateInput: Equatable, Sendable {
         private func authedQuery<T: Decodable & Sendable>(
             _ name: String, with args: [String: ConvexEncodable?]? = nil
         ) async throws -> T {
-            try await ensureAuthAttached()
+            let snapshot = try await authenticatedClient()
             do {
                 return try await Self.firstValue(
-                    from: client.subscribe(to: name, with: args, yielding: T.self)
+                    from: snapshot.client.subscribe(to: name, with: args, yielding: T.self)
                 )
             } catch {
+                if Self.isTimeout(error) {
+                    invalidateClient(snapshot, reason: "query \(name) timed out")
+                }
                 NSLog("Whistle: Convex query %@ failed: %@", name, String(describing: error))
                 throw Self.mapAuthError(error)
             }
@@ -679,18 +710,18 @@ public struct CaptureCreateInput: Equatable, Sendable {
                         continuation.finish()
                         return
                     }
-                    // Best-effort auth attach BEFORE subscribing, so
-                    // authenticated queries don't land on the websocket
-                    // without a JWT. An unauthenticated subscribe still goes
-                    // through (matching prior behavior for the signed-out
-                    // state); the server then rejects it and the stream
-                    // finishes.
-                    try? await self.ensureAuthAttached()
+                    // Attach auth before subscribing. If attachment fails,
+                    // finish the stream so its supervisor can retry instead
+                    // of creating an unauthenticated server subscription.
+                    guard let snapshot = try? await self.authenticatedClient() else {
+                        continuation.finish()
+                        return
+                    }
                     if Task.isCancelled {
                         continuation.finish()
                         return
                     }
-                    let cancellable = self.client.subscribe(to: name, with: args, yielding: T.self)
+                    let cancellable = snapshot.client.subscribe(to: name, with: args, yielding: T.self)
                         .sink(
                             receiveCompletion: { completion in
                                 if case let .failure(error) = completion {
@@ -858,33 +889,112 @@ public struct CaptureCreateInput: Equatable, Sendable {
         let error: String?
     }
 
-    /// Serializes "attach auth once; re-attempt after failure" semantics for
-    /// `LiveConvexService`. Internal (not private) so the sequencing
-    /// regression can be unit-tested without a live Convex client.
-    final class ConvexAuthAttachmentGate: @unchecked Sendable {
+    struct ReplaceableClientSnapshot<Client: AnyObject>: @unchecked Sendable {
+        let client: Client
+        let generation: UInt64
+    }
+
+    /// Owns a replaceable transport client. Timed-out UniFFI calls do not
+    /// cooperate with Swift task cancellation, so abandoning only the caller
+    /// leaves future retries riding the same wedged Rust client. Rotation lets
+    /// the next attempt start on a fresh websocket while the old call settles
+    /// independently.
+    final class ReplaceableClientState<Client: AnyObject>: @unchecked Sendable {
+        private struct State {
+            var client: Client
+            var generation: UInt64 = 0
+        }
+
         private let lock = NSLock()
-        private var attached = false
+        private let factory: @Sendable () -> Client
+        private var state: State
+
+        init(factory: @escaping @Sendable () -> Client) {
+            self.factory = factory
+            self.state = State(client: factory())
+        }
+
+        func snapshot() -> ReplaceableClientSnapshot<Client> {
+            lock.withLock {
+                ReplaceableClientSnapshot(
+                    client: state.client,
+                    generation: state.generation
+                )
+            }
+        }
+
+        func isCurrent(_ snapshot: ReplaceableClientSnapshot<Client>) -> Bool {
+            lock.withLock {
+                state.generation == snapshot.generation && state.client === snapshot.client
+            }
+        }
+
+        @discardableResult
+        func replaceIfCurrent(_ snapshot: ReplaceableClientSnapshot<Client>) -> Bool {
+            lock.withLock {
+                guard state.generation == snapshot.generation,
+                      state.client === snapshot.client
+                else { return false }
+                state = State(client: factory(), generation: state.generation &+ 1)
+                return true
+            }
+        }
+
+        @discardableResult
+        func rotate() -> ReplaceableClientSnapshot<Client> {
+            lock.withLock {
+                let previous = ReplaceableClientSnapshot(
+                    client: state.client,
+                    generation: state.generation
+                )
+                state = State(client: factory(), generation: state.generation &+ 1)
+                return previous
+            }
+        }
+    }
+
+    /// Serializes "attach auth once; share concurrent attachment; re-attempt
+    /// after failure" semantics for each transport generation. Internal so
+    /// the sequencing regression can be tested without a live Convex client.
+    actor ConvexAuthAttachmentGate {
+        private struct InFlight {
+            let id: UUID
+            let generation: UInt64
+            let task: Task<Bool, Never>
+        }
+
+        private var attachedGeneration: UInt64?
+        private var inFlight: InFlight?
 
         /// Runs `attach` unless a prior attempt already succeeded. Returns
         /// the overall attached state. A failed attempt leaves the gate
         /// open so the next call re-attempts.
-        func runIfNeeded(_ attach: () async -> Bool) async -> Bool {
-            if lock.withLock({ attached }) { return true }
-            let success = await attach()
+        func runIfNeeded(
+            generation: UInt64 = 0,
+            _ attach: @escaping @Sendable () async -> Bool
+        ) async -> Bool {
+            if attachedGeneration == generation { return true }
+
+            let flight: InFlight
+            if let current = inFlight, current.generation == generation {
+                flight = current
+            } else {
+                inFlight?.task.cancel()
+                let task = Task { await attach() }
+                flight = InFlight(id: UUID(), generation: generation, task: task)
+                inFlight = flight
+            }
+
+            let success = await flight.task.value
+            if attachedGeneration == generation { return true }
+            guard inFlight?.id == flight.id else { return false }
+            inFlight = nil
             if success {
-                lock.withLock { attached = true }
+                attachedGeneration = generation
             }
             return success
         }
 
-        /// Forces the next `runIfNeeded` call to re-attempt `attach`, even if
-        /// a prior attempt already succeeded. Called on sign-out (via
-        /// `detachAuth()`) so a later sign-in -- as the same user or a
-        /// different one -- can't short-circuit on the old `attached == true`
-        /// and skip pulling a fresh token.
-        func reset() {
-            lock.withLock { attached = false }
-        }
     }
 
     /// Bridges WhistleCore's pull-based `WhistleAuthProvider.currentIdToken()`
