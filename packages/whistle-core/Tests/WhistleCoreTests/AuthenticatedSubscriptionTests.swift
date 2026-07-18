@@ -126,6 +126,7 @@ final class AuthenticatedSubscriptionTests: XCTestCase {
 
         XCTAssertEqual(received.values, [2])
         subscription.setEnabled(false)
+        await harness.waitForTerminationCount(2)
     }
 
     func testHandlerCanFenceAValueAfterCrossingAnActorBoundary() async {
@@ -146,20 +147,20 @@ final class AuthenticatedSubscriptionTests: XCTestCase {
             }
         )
 
-        subscription.enable()
+        subscription.setEnabled(true)
         await harness.waitForSubscriptionCount(1)
         harness.yield(1, to: 0)
         await fulfillment(of: [oldHandlerStarted], timeout: 1)
 
-        subscription.disable()
-        subscription.enable()
+        subscription.setEnabled(false)
+        subscription.setEnabled(true)
         await harness.waitForSubscriptionCount(2)
         await gate.release()
         harness.yield(2, to: 1)
         await fulfillment(of: [currentValueDelivered], timeout: 1)
 
         XCTAssertEqual(received.values, [2])
-        subscription.disable()
+        subscription.setEnabled(false)
     }
 
     func testDeinitCancelsActiveSubscription() async {

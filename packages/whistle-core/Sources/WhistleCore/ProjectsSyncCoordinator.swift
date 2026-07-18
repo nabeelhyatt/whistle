@@ -1,27 +1,12 @@
 // ProjectsSyncCoordinator.swift
-// Keeps `CaptureStore`'s `projects_snapshot` (TECH-SPEC §4.1 `CaptureStore`
-// row, §7: "projects.list ... client persists the latest yield into GRDB
-// for offline picker use") fresh, app-wide -- not just while Settings
-// happens to be open.
-//
-// The bug this fixes: the capture panel's `ProjectPicker` (via
-// `CaptureViewModel.loadProjects()`) reads `CaptureStore.projectsSnapshot()`
-// -- the GRDB `projects_snapshot` table. Nothing in the app ever called
-// `CaptureStore.saveProjectsSnapshot(_:)` to populate that table.
-// Settings and the capture panel both observe the persisted snapshot. This
-// coordinator is the sole long-lived owner of the server subscription.
-//
-// `ProjectsSyncCoordinator` is the missing piece: a single, app-wide
-// `projects.list` subscription (started once at launch, independent of any
-// window being open) whose every yield is persisted into
-// `CaptureStore.projects_snapshot`, plus the stale-refresh trigger
-// (`conductor.refreshProjects`, TECH-SPEC §7: "called when stale (>1h) or
-// on picker open").
+// Sole auth-gated owner of the app-wide `projects.list` subscription.
+// Settings and the capture picker consume its persisted CaptureStore
+// snapshot, which remains available offline.
 
 import Foundation
 
-/// Actor-isolated so the subscription task and stale-check both serialize
-/// through a single owner, matching `SyncEngine`'s concurrency shape.
+/// Stale-refresh access is actor-isolated. Subscription lifecycle control is
+/// explicitly nonisolated because its supervisor is internally synchronized.
 public actor ProjectsSyncCoordinator {
     private let store: CaptureStore
     private let convex: any ConvexServiceProtocol
@@ -52,15 +37,7 @@ public actor ProjectsSyncCoordinator {
     }
 
     deinit {
-        subscription.disable()
-    }
-
-    /// Subscribes to `projects.list` and persists every yield into
-    /// `CaptureStore.projects_snapshot`. Idempotent (safe to call once at
-    /// app launch and never worry about it again) -- a re-entrant call is a
-    /// no-op while the subscription is already running.
-    public nonisolated func start() {
-        setServerUpdatesEnabled(true)
+        subscription.setEnabled(false)
     }
 
     /// Owns the authenticated projects subscription across auth changes.

@@ -475,8 +475,7 @@ describe("happy path", () => {
 
   test("live nested message shape transitions agentWorking to ready", async () => {
     const t = convexTest(schema, modules);
-    const clientId = "9FA5700C-D530-45CA-A154-CAC4B9599DFE";
-    const normalized = clientId.toLowerCase();
+    const clientId = liveMessagesFixture.clientId;
     const { asUser, captureId } = await setupUserWithCapture(
       t,
       "auth0|pipeline-live-shape",
@@ -487,39 +486,14 @@ describe("happy path", () => {
     let capture = await asUser.query(api.captures.get, { captureId });
     const sessionId = capture!.sessionId!;
     mock.sessions.get(sessionId)!.status = "idle";
-    mock.messagesBySession.set(sessionId, [
-      {
-        id: `${sessionId}:1:0`,
-        sessionIndex: 0,
-        type: "userMessage",
-        content: { id: normalized, turnId: normalized, type: "userMessage" },
-      },
-      {
-        id: `${sessionId}:3:0`,
-        sessionIndex: 2,
-        type: "agent",
-        content: {
-          userMessageId: normalized,
-          turnId: normalized,
-          rawPayload: {
-            type: "assistant",
-            message: {
-              content: [{
-                type: "text",
-                text: "Live reply summary.\n\n1. Ship the hotfix now?",
-              }],
-            },
-          },
-        },
-      },
-    ]);
+    mock.messagesBySession.set(sessionId, liveMessagesFixture.messages);
 
     await tick(t, 30_000);
 
     capture = await asUser.query(api.captures.get, { captureId });
     expect(capture?.status).toBe("ready");
-    expect(capture?.agentSummary).toBe("Live reply summary.");
-    expect(capture?.clarifyingQuestions).toEqual(["Ship the hotfix now?"]);
+    expect(capture?.agentSummary).toBe("Sanitized agent reply.");
+    expect(capture?.clarifyingQuestions).toEqual(["Sanitized question?"]);
   });
 
   test("message queued during init still proceeds to agentWorking", async () => {

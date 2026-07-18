@@ -50,14 +50,13 @@ private final class FakeHistoryConvexService: ConvexServiceProtocol, @unchecked 
     func projectsList() -> AsyncStream<[Project]> {
         AsyncStream { continuation in
             let id = UUID()
-            self.lock.lock()
-            self.projectSubscriptionStarts += 1
-            self.projectContinuations[id] = continuation
-            self.lock.unlock()
+            self.lock.withLock {
+                self.projectSubscriptionStarts += 1
+                self.projectContinuations[id] = continuation
+            }
             continuation.onTermination = { [weak self] _ in
-                self?.lock.lock()
-                self?.projectContinuations.removeValue(forKey: id)
-                self?.lock.unlock()
+                guard let self else { return }
+                self.lock.withLock { self.projectContinuations.removeValue(forKey: id) }
             }
         }
     }
@@ -75,14 +74,13 @@ private final class FakeHistoryConvexService: ConvexServiceProtocol, @unchecked 
     func capturesListRecent(limit: Int) -> AsyncStream<[ServerCaptureRecord]> {
         AsyncStream { continuation in
             let id = UUID()
-            self.lock.lock()
-            self.captureSubscriptionStarts += 1
-            self.continuations[id] = continuation
-            self.lock.unlock()
+            self.lock.withLock {
+                self.captureSubscriptionStarts += 1
+                self.continuations[id] = continuation
+            }
             continuation.onTermination = { [weak self] _ in
-                self?.lock.lock()
-                self?.continuations.removeValue(forKey: id)
-                self?.lock.unlock()
+                guard let self else { return }
+                self.lock.withLock { self.continuations.removeValue(forKey: id) }
             }
         }
     }
@@ -91,17 +89,17 @@ private final class FakeHistoryConvexService: ConvexServiceProtocol, @unchecked 
     func capturesGet(id: String) async throws -> ServerCaptureRecord? { nil }
 
     func capturesRetry(id: String) async throws {
-        lock.lock(); retryCalls.append(id); lock.unlock()
+        lock.withLock { retryCalls.append(id) }
     }
 
     func capturesDeleteScreenshot(id: String) async throws {}
 
     func capturesMarkOpened(id: String) async throws {
-        lock.lock(); markOpenedCalls.append(id); lock.unlock()
+        lock.withLock { markOpenedCalls.append(id) }
     }
 
     func capturesArchive(id: String) async throws {
-        lock.lock(); archiveCalls.append(id); lock.unlock()
+        lock.withLock { archiveCalls.append(id) }
     }
 
     // MARK: test driver
@@ -120,9 +118,7 @@ private final class FakeHistoryConvexService: ConvexServiceProtocol, @unchecked 
     func yield(_ records: [ServerCaptureRecord], timeout: TimeInterval = 2) async {
         let deadline = Date().addingTimeInterval(timeout)
         while true {
-            lock.lock()
-            let hasSubscriber = !continuations.isEmpty
-            lock.unlock()
+            let hasSubscriber = lock.withLock { !continuations.isEmpty }
             if hasSubscriber { break }
             if Date() >= deadline {
                 XCTFail("FakeHistoryConvexService.yield timed out waiting for a subscriber")
@@ -131,9 +127,7 @@ private final class FakeHistoryConvexService: ConvexServiceProtocol, @unchecked 
             try? await Task.sleep(nanoseconds: 2_000_000)
         }
 
-        lock.lock()
-        let subs = Array(continuations.values)
-        lock.unlock()
+        let subs = lock.withLock { Array(continuations.values) }
         for continuation in subs {
             continuation.yield(records)
         }
@@ -144,31 +138,24 @@ private final class FakeHistoryConvexService: ConvexServiceProtocol, @unchecked 
     }
 
     var activeSubscriptionCount: Int {
-        lock.lock(); defer { lock.unlock() }
-        return continuations.count
+        lock.withLock { continuations.count }
     }
 
     var activeProjectSubscriptionCount: Int {
-        lock.lock(); defer { lock.unlock() }
-        return projectContinuations.count
+        lock.withLock { projectContinuations.count }
     }
 
     var subscriptionStartCounts: (captures: Int, projects: Int) {
-        lock.lock(); defer { lock.unlock() }
-        return (captureSubscriptionStarts, projectSubscriptionStarts)
+        lock.withLock { (captureSubscriptionStarts, projectSubscriptionStarts) }
     }
 
     func finishSubscriptions() {
-        lock.lock()
-        let subs = Array(continuations.values)
-        lock.unlock()
+        let subs = lock.withLock { Array(continuations.values) }
         subs.forEach { $0.finish() }
     }
 
     func finishProjectSubscriptions() {
-        lock.lock()
-        let subs = Array(projectContinuations.values)
-        lock.unlock()
+        let subs = lock.withLock { Array(projectContinuations.values) }
         subs.forEach { $0.finish() }
     }
 }

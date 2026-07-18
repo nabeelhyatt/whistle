@@ -14,9 +14,7 @@ public final class AuthenticatedSubscription<Element: Sendable>: @unchecked Send
     private let onValue: ValueHandler
     private let retryDelay: RetryDelay
     private let sleep: Sleeper
-    private let gate = AuthenticatedSubscriptionGate()
-    private let taskLock = NSLock()
-    private var workerTask: Task<Void, Never>?
+    private let state = AuthenticatedSubscriptionState()
 
     public init(
         label: String,
@@ -36,8 +34,7 @@ public final class AuthenticatedSubscription<Element: Sendable>: @unchecked Send
     }
 
     deinit {
-        _ = gate.disable()
-        takeWorkerTask()?.cancel()
+        state.disable().task?.cancel()
     }
 
     /// Idempotently enables or disables the supervised stream.
@@ -49,42 +46,35 @@ public final class AuthenticatedSubscription<Element: Sendable>: @unchecked Send
         }
     }
 
-    public func enable() {
-        guard let generation = gate.enable() else { return }
+    private func enable() {
+        guard let token = state.reserveEnable() else { return }
 
-        let task = Task { [weak self, gate, label, streamFactory, onValue, retryDelay, sleep] in
+        let task = Task { [state, label, streamFactory, onValue, retryDelay, sleep] in
             await Self.run(
-                generation: generation,
-                gate: gate,
+                token: token,
+                state: state,
                 label: label,
                 streamFactory: streamFactory,
                 onValue: onValue,
                 retryDelay: retryDelay,
                 sleep: sleep
             )
-            self?.clearWorkerTask(generation: generation)
+            state.finish(token: token)
         }
-
-        taskLock.withLock {
-            if gate.isCurrent(generation) {
-                workerTask = task
-            } else {
-                task.cancel()
-            }
-        }
+        state.install(task: task, token: token)
     }
 
-    public func disable() {
-        let wasEnabled = gate.disable()
-        takeWorkerTask()?.cancel()
-        if wasEnabled {
+    private func disable() {
+        let result = state.disable()
+        result.task?.cancel()
+        if result.wasEnabled {
             NSLog("Whistle: authenticated subscription %@ disabled", label)
         }
     }
 
     private static func run(
-        generation: Int,
-        gate: AuthenticatedSubscriptionGate,
+        token: AuthenticatedSubscriptionToken,
+        state: AuthenticatedSubscriptionState,
         label: String,
         streamFactory: StreamFactory,
         onValue: ValueHandler,
@@ -92,27 +82,25 @@ public final class AuthenticatedSubscription<Element: Sendable>: @unchecked Send
         sleep: Sleeper
     ) async {
         var retryAttempt = 0
-        var reconnecting = false
 
-        while gate.isCurrent(generation), !Task.isCancelled {
+        while state.isCurrent(token), !Task.isCancelled {
             let stream = streamFactory()
             let context = AuthenticatedSubscriptionContext {
-                gate.isCurrent(generation)
+                state.isCurrent(token)
             }
 
             for await value in stream {
-                guard gate.isCurrent(generation), !Task.isCancelled else { return }
+                guard state.isCurrent(token), !Task.isCancelled else { return }
                 await onValue(value, context)
-                guard gate.isCurrent(generation), !Task.isCancelled else { return }
+                guard state.isCurrent(token), !Task.isCancelled else { return }
 
-                if reconnecting {
+                if retryAttempt > 0 {
                     NSLog("Whistle: authenticated subscription %@ reconnected", label)
-                    reconnecting = false
                 }
                 retryAttempt = 0
             }
 
-            guard gate.isCurrent(generation), !Task.isCancelled else { return }
+            guard state.isCurrent(token), !Task.isCancelled else { return }
 
             let delay = retryDelay(retryAttempt)
             NSLog(
@@ -121,12 +109,10 @@ public final class AuthenticatedSubscription<Element: Sendable>: @unchecked Send
                 retryAttempt + 1,
                 String(describing: delay)
             )
-            reconnecting = true
-
             do {
                 try await sleep(delay)
             } catch {
-                if gate.isCurrent(generation), !Task.isCancelled {
+                if state.isCurrent(token), !Task.isCancelled {
                     NSLog(
                         "Whistle: authenticated subscription %@ retry sleep failed: %@",
                         label,
@@ -137,18 +123,6 @@ public final class AuthenticatedSubscription<Element: Sendable>: @unchecked Send
             }
             retryAttempt += 1
         }
-    }
-
-    private func takeWorkerTask() -> Task<Void, Never>? {
-        taskLock.withLock {
-            defer { workerTask = nil }
-            return workerTask
-        }
-    }
-
-    private func clearWorkerTask(generation: Int) {
-        guard gate.isCurrent(generation) else { return }
-        taskLock.withLock { workerTask = nil }
     }
 }
 
@@ -165,31 +139,53 @@ public struct AuthenticatedSubscriptionContext: @unchecked Sendable {
     public var isCurrent: Bool { checkIsCurrent() }
 }
 
-private final class AuthenticatedSubscriptionGate: @unchecked Sendable {
+private final class AuthenticatedSubscriptionToken: @unchecked Sendable {}
+
+private final class AuthenticatedSubscriptionState: @unchecked Sendable {
     private let lock = NSLock()
     private var enabled = false
-    private var generation = 0
+    private var currentToken: AuthenticatedSubscriptionToken?
+    private var workerTask: Task<Void, Never>?
 
-    func enable() -> Int? {
+    func reserveEnable() -> AuthenticatedSubscriptionToken? {
         lock.withLock {
             guard !enabled else { return nil }
             enabled = true
-            generation += 1
-            return generation
+            let token = AuthenticatedSubscriptionToken()
+            currentToken = token
+            return token
         }
     }
 
-    @discardableResult
-    func disable() -> Bool {
+    func install(task: Task<Void, Never>, token: AuthenticatedSubscriptionToken) {
+        let shouldCancel = lock.withLock {
+            guard enabled, currentToken === token else { return true }
+            workerTask = task
+            return false
+        }
+        if shouldCancel { task.cancel() }
+    }
+
+    func disable() -> (wasEnabled: Bool, task: Task<Void, Never>?) {
         lock.withLock {
             let wasEnabled = enabled
             enabled = false
-            generation += 1
-            return wasEnabled
+            currentToken = nil
+            defer { workerTask = nil }
+            return (wasEnabled, workerTask)
         }
     }
 
-    func isCurrent(_ candidate: Int) -> Bool {
-        lock.withLock { enabled && generation == candidate }
+    func finish(token: AuthenticatedSubscriptionToken) {
+        lock.withLock {
+            guard currentToken === token else { return }
+            enabled = false
+            currentToken = nil
+            workerTask = nil
+        }
+    }
+
+    func isCurrent(_ token: AuthenticatedSubscriptionToken) -> Bool {
+        lock.withLock { enabled && currentToken === token }
     }
 }

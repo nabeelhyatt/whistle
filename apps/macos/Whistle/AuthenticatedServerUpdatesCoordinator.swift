@@ -5,7 +5,7 @@ import WhistleCore
 /// authenticated subscription in one ordered MainActor hop.
 @MainActor
 final class AuthenticatedServerUpdatesCoordinator {
-    private var stateSubscription: AnyCancellable?
+    private let stateSubscription: AnyCancellable
 
     init(
         auth: AuthController,
@@ -13,9 +13,9 @@ final class AuthenticatedServerUpdatesCoordinator {
         projects: ProjectsSyncCoordinator
     ) {
         stateSubscription = auth.$state
+            .map { $0 == .signedIn }
             .removeDuplicates()
-            .sink { state in
-                let enabled = state == .signedIn
+            .sink { enabled in
                 history.setServerUpdatesEnabled(enabled)
                 projects.setServerUpdatesEnabled(enabled)
             }

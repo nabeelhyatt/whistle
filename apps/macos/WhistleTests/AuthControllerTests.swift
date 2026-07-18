@@ -25,10 +25,10 @@ private final class FakeConvexService: ConvexServiceProtocol, @unchecked Sendabl
     var usersEnsureError: Error?
 
     func usersEnsure() async throws -> String {
-        lock.lock()
-        usersEnsureCallCount += 1
-        authCalls.append("ensure")
-        lock.unlock()
+        lock.withLock {
+            usersEnsureCallCount += 1
+            authCalls.append("ensure")
+        }
         if let usersEnsureError { throw usersEnsureError }
         return "user-1"
     }
@@ -37,10 +37,10 @@ private final class FakeConvexService: ConvexServiceProtocol, @unchecked Sendabl
     // signOut()'s wiring is assertable -- see testSignOutDetachesConvexAndLogsOutProvider)
 
     func detachAuth() async {
-        lock.lock()
-        detachAuthCallCount += 1
-        authCalls.append("detach")
-        lock.unlock()
+        lock.withLock {
+            detachAuthCallCount += 1
+            authCalls.append("detach")
+        }
     }
 
     // MARK: settings (unused by AuthController; trivial stubs)

@@ -36,7 +36,7 @@ final class ProjectsSyncCoordinatorTests: XCTestCase {
 
         let convex = FakeConvexService()
         let coordinator = ProjectsSyncCoordinator(store: store, convex: convex)
-        coordinator.start()
+        coordinator.setServerUpdatesEnabled(true)
 
         let projects = [
             Project(id: "proj-1", name: "Project One", gitRemote: "git@example.com:one.git"),
@@ -54,14 +54,14 @@ final class ProjectsSyncCoordinatorTests: XCTestCase {
     // MARK: - Re-entrant start() is idempotent (a single subscription, not
     // one per call).
 
-    func testStartIsIdempotent() async throws {
+    func testEnablingServerUpdatesIsIdempotent() async throws {
         let (store, tempDir) = try TestSupport.makeStore()
         self.tempDir = tempDir
 
         let convex = FakeConvexService()
         let coordinator = ProjectsSyncCoordinator(store: store, convex: convex)
-        coordinator.start()
-        coordinator.start() // second call must be a no-op, not a crash/duplicate subscription
+        coordinator.setServerUpdatesEnabled(true)
+        coordinator.setServerUpdatesEnabled(true) // second call must not duplicate the subscription
 
         let projects = [Project(id: "proj-1", name: "Project One", gitRemote: "git@example.com:one.git")]
         await convex.yieldProjects(projects)

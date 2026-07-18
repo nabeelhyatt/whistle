@@ -174,28 +174,19 @@ export function findAgentReplyAfterOurs(
     (message) => !isAgentMessage(message) && messageMatchesClient(message, clientId),
   );
   const ourIndex = ourMessage?.sessionIndex;
+  let latestReply: ConductorMessage | undefined;
 
-  const agentMessages = messages.filter((message) =>
-    isAgentMessage(message) && extractMessageText(message.content).trim().length > 0,
-  );
-
-  const directlyLinked = agentMessages.filter((message) =>
-    messageMatchesClient(message, clientId),
-  );
-
-  if (ourIndex === undefined) {
-    // A nested userMessageId/turnId is authoritative even if the originating
-    // user event is absent from a partial response. Without either signal,
-    // stay conservative and keep polling rather than accepting unrelated text.
-    return [...directlyLinked]
-      .sort((a, b) => (a.sessionIndex ?? 0) - (b.sessionIndex ?? 0))
-      .pop();
+  for (const message of messages) {
+    if (!isAgentMessage(message) || !messageMatchesClient(message, clientId)) continue;
+    if (ourIndex !== undefined && (message.sessionIndex ?? -1) <= ourIndex) continue;
+    if (extractMessageText(message.content).trim().length === 0) continue;
+    if ((message.sessionIndex ?? 0) < (latestReply?.sessionIndex ?? 0)) continue;
+    latestReply = message;
   }
 
-  return [...directlyLinked]
-    .filter((message) => (message.sessionIndex ?? -1) > ourIndex)
-    .sort((a, b) => (a.sessionIndex ?? 0) - (b.sessionIndex ?? 0))
-    .pop();
+  // A linked id remains authoritative when a partial response omits the
+  // originating user event. Unlinked text is never accepted.
+  return latestReply;
 }
 
 /** Checks whether our own messageId already appears in the session's messages. */

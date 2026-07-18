@@ -68,13 +68,10 @@ final class FakeConvexService: ConvexServiceProtocol, @unchecked Sendable {
     func projectsList() -> AsyncStream<[Project]> {
         AsyncStream { continuation in
             let id = UUID()
-            self.lock.lock()
-            self.projectsContinuations[id] = continuation
-            self.lock.unlock()
+            self.record { self.projectsContinuations[id] = continuation }
             continuation.onTermination = { [weak self] _ in
-                self?.lock.lock()
-                self?.projectsContinuations.removeValue(forKey: id)
-                self?.lock.unlock()
+                guard let self else { return }
+                self.record { self.projectsContinuations.removeValue(forKey: id) }
             }
         }
     }
@@ -83,7 +80,7 @@ final class FakeConvexService: ConvexServiceProtocol, @unchecked Sendable {
     /// actually starts iterating the stream (e.g. once
     /// `ProjectsSyncCoordinator.start()`'s unstructured `Task` gets
     /// scheduled) -- since that's asynchronous, a caller that immediately
-    /// does `coordinator.start(); convex.yieldProjects(...)` synchronously
+    /// enables the coordinator and immediately calls `yieldProjects(...)`
     /// can otherwise race ahead of subscription and drop the yield (no
     /// continuation registered yet to receive it). Bounded-wait for a
     /// subscriber first, mirroring `FakeHistoryConvexService.yield`'s same

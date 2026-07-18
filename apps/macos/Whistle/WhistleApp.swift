@@ -34,12 +34,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var capturePanelController: CapturePanelController?
     private var captureStore: CaptureStore?
     private var convexService: (any ConvexServiceProtocol)?
-    /// App-wide `projects.list` subscription that persists every yield into
-    /// `CaptureStore.projects_snapshot` (fix: the capture panel's
-    /// `ProjectPicker` showed "No projects" while Settings' own separate
-    /// subscription displayed them fine -- nothing was ever writing into
-    /// the snapshot table the picker actually reads). Started once at
-    /// launch, independent of any window being open.
+    /// Sole app-wide `projects.list` owner. Settings and the capture picker
+    /// consume the persisted snapshot rather than creating their own stream.
     private var projectsSyncCoordinator: ProjectsSyncCoordinator?
     /// Drains the local queued/syncFailed capture queue against Convex
     /// (fix: this is the exact engine that was never constructed anywhere

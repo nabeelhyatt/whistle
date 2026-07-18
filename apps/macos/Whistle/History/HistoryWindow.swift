@@ -137,13 +137,12 @@ public final class HistoryViewModel: ObservableObject {
     private let convex: any ConvexServiceProtocol
     private let notificationService: NotificationServiceProtocol
     private let lastSeenStore: LastSeenStatusStore
-    private let listRecentLimit: Int
 
     private var latestServerRecords: [ServerCaptureRecord] = []
     private var latestDrafts: [CaptureDraft] = []
     private var serverSubscription: AuthenticatedSubscription<[ServerCaptureRecord]>!
     private var pendingTask: Task<Void, Never>?
-    private var didStart = false
+    private var serverUpdatesEnabled = false
 
     public init(
         store: CaptureStore,
@@ -156,7 +155,6 @@ public final class HistoryViewModel: ObservableObject {
         self.convex = convex
         self.notificationService = notificationService
         self.lastSeenStore = lastSeenStore
-        self.listRecentLimit = listRecentLimit
         self.serverSubscription = AuthenticatedSubscription(
             label: "captures.listRecent",
             stream: { convex.capturesListRecent(limit: listRecentLimit) },
@@ -167,7 +165,7 @@ public final class HistoryViewModel: ObservableObject {
     }
 
     deinit {
-        serverSubscription.disable()
+        serverSubscription.setEnabled(false)
         pendingTask?.cancel()
     }
 
@@ -176,8 +174,7 @@ public final class HistoryViewModel: ObservableObject {
     /// authenticated server subscription is controlled separately by
     /// `setServerUpdatesEnabled(_:)` as auth state changes.
     public func start(serverUpdatesEnabled: Bool = true) {
-        guard !didStart else { return }
-        didStart = true
+        guard pendingTask == nil else { return }
         pendingTask = Task { [weak self] in
             guard let self else { return }
             for await drafts in self.store.pendingCapturesUpdates() {
@@ -192,14 +189,17 @@ public final class HistoryViewModel: ObservableObject {
     /// subscription. The shared supervisor automatically replaces a stream
     /// that terminates while signed in, without requiring another auth event.
     public func setServerUpdatesEnabled(_ enabled: Bool) {
+        guard enabled != serverUpdatesEnabled else { return }
+        serverUpdatesEnabled = enabled
+
         if !enabled {
-            serverSubscription.disable()
+            serverSubscription.setEnabled(false)
             latestServerRecords = []
             rebuildRows()
             return
         }
 
-        serverSubscription.enable()
+        serverSubscription.setEnabled(true)
     }
 
     // MARK: - Merge + notification-transition detection
@@ -213,6 +213,7 @@ public final class HistoryViewModel: ObservableObject {
     }
 
     private func handleServerRecords(_ records: [ServerCaptureRecord]) {
+        guard records != latestServerRecords else { return }
         latestServerRecords = records
         try? store.cacheHistory(records)
         detectTransitions(records)
@@ -234,9 +235,8 @@ public final class HistoryViewModel: ObservableObject {
     private func detectTransitions(_ records: [ServerCaptureRecord]) {
         for record in records {
             let previous = lastSeenStore.status(for: record.clientId)
-            lastSeenStore.setStatus(record.status, for: record.clientId)
-
             guard previous != record.status else { continue }
+            lastSeenStore.setStatus(record.status, for: record.clientId)
             notify(for: record)
         }
     }
