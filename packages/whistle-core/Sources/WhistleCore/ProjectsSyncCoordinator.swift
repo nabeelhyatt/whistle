@@ -8,12 +8,8 @@
 // `CaptureViewModel.loadProjects()`) reads `CaptureStore.projectsSnapshot()`
 // -- the GRDB `projects_snapshot` table. Nothing in the app ever called
 // `CaptureStore.saveProjectsSnapshot(_:)` to populate that table.
-// `SettingsWindow.swift`'s `SettingsViewModel.subscribeToProjects()`
-// subscribes to `convex.projectsList()` directly into its own `@Published`
-// property and displays projects fine -- but it never round-trips through
-// `CaptureStore` at all, so Settings showing projects gave no indication
-// the snapshot the capture panel depends on was empty. Hence: Settings
-// shows projects, the capture panel's picker says "No projects".
+// Settings and the capture panel both observe the persisted snapshot. This
+// coordinator is the sole long-lived owner of the server subscription.
 //
 // `ProjectsSyncCoordinator` is the missing piece: a single, app-wide
 // `projects.list` subscription (started once at launch, independent of any
@@ -31,8 +27,7 @@ public actor ProjectsSyncCoordinator {
     private let convex: any ConvexServiceProtocol
     private let staleAfter: TimeInterval
 
-    private var subscriptionTask: Task<Void, Never>?
-    private var subscriptionGeneration = 0
+    private let subscription: AuthenticatedSubscription<[Project]>
 
     public init(
         store: CaptureStore,
@@ -42,10 +37,21 @@ public actor ProjectsSyncCoordinator {
         self.store = store
         self.convex = convex
         self.staleAfter = staleAfter
+        self.subscription = AuthenticatedSubscription(
+            label: "projects.list",
+            stream: { convex.projectsList() },
+            onValue: { projects in
+                do {
+                    try store.saveProjectsSnapshot(projects)
+                } catch {
+                    NSLog("Whistle: failed to persist projects snapshot: %@", String(describing: error))
+                }
+            }
+        )
     }
 
     deinit {
-        subscriptionTask?.cancel()
+        subscription.disable()
     }
 
     /// Subscribes to `projects.list` and persists every yield into
@@ -57,33 +63,10 @@ public actor ProjectsSyncCoordinator {
     }
 
     /// Owns the authenticated projects subscription across auth changes.
-    /// Signing out cancels and clears it; signing in creates a fresh stream.
-    /// If the stream fails naturally, its slot is cleared so a later auth
-    /// transition can restart it rather than retaining a dead task forever.
+    /// The shared supervisor automatically replaces a terminated stream
+    /// while enabled and cancels active iteration/backoff when disabled.
     public func setServerUpdatesEnabled(_ enabled: Bool) {
-        if !enabled {
-            subscriptionGeneration += 1
-            subscriptionTask?.cancel()
-            subscriptionTask = nil
-            return
-        }
-
-        guard subscriptionTask == nil else { return }
-        subscriptionGeneration += 1
-        let generation = subscriptionGeneration
-        subscriptionTask = Task { [weak self, store, convex] in
-            for await projects in convex.projectsList() {
-                guard !Task.isCancelled else { break }
-                try? store.saveProjectsSnapshot(projects)
-            }
-            await self?.subscriptionDidEnd(generation: generation)
-        }
-    }
-
-    private func subscriptionDidEnd(generation: Int) {
-        if subscriptionGeneration == generation {
-            subscriptionTask = nil
-        }
+        subscription.setEnabled(enabled)
     }
 
     /// Triggers a server-side `conductor.refreshProjects` if the local

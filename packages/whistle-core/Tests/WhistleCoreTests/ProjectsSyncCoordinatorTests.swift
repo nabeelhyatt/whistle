@@ -102,10 +102,8 @@ final class ProjectsSyncCoordinatorTests: XCTestCase {
         try await Whistle_waitUntil(timeout: 1) {
             convex.activeProjectsSubscriptionCount == 0
         }
-        let restartDeadline = Date().addingTimeInterval(1)
-        while convex.activeProjectsSubscriptionCount == 0, Date() < restartDeadline {
-            await coordinator.setServerUpdatesEnabled(true)
-            try await Task.sleep(nanoseconds: 10_000_000)
+        try await Whistle_waitUntil(timeout: 1) {
+            convex.activeProjectsSubscriptionCount == 1
         }
         XCTAssertEqual(convex.activeProjectsSubscriptionCount, 1)
     }

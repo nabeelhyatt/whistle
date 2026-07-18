@@ -421,8 +421,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func showSettings(section: SettingsSection = .general) {
         if settingsWindowController == nil {
-            guard let auth = authController, let convexService else { return }
-            let viewModel = SettingsViewModel(convex: convexService, auth: auth)
+            guard let auth = authController, let convexService, let captureStore else { return }
+            let viewModel = SettingsViewModel(convex: convexService, auth: auth, store: captureStore)
             settingsWindowController = SettingsWindowController(viewModel: viewModel)
         }
         settingsWindowController?.show(section: section)

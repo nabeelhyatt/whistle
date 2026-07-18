@@ -62,12 +62,14 @@ public final class SettingsViewModel: ObservableObject {
 
     private let convex: any ConvexServiceProtocol
     private let auth: AuthController
+    private let store: CaptureStore
     private var projectsTask: Task<Void, Never>?
     private var authCancellables: Set<AnyCancellable> = []
 
-    public init(convex: any ConvexServiceProtocol, auth: AuthController) {
+    public init(convex: any ConvexServiceProtocol, auth: AuthController, store: CaptureStore) {
         self.convex = convex
         self.auth = auth
+        self.store = store
         self.templateEditor = TemplateEditorViewModel(convex: convex)
         self.authState = auth.state
         self.signInErrorMessage = auth.lastSignInErrorMessage
@@ -80,6 +82,7 @@ public final class SettingsViewModel: ObservableObject {
     }
 
     public func load() async {
+        subscribeToProjects()
         do {
             let snapshot = try await convex.settingsGet()
             agent = snapshot.agent
@@ -92,15 +95,14 @@ public final class SettingsViewModel: ObservableObject {
         } catch {
             loadError = "Couldn't load settings. Check your connection."
         }
-        subscribeToProjects()
     }
 
     private func subscribeToProjects() {
         guard projectsTask == nil else { return }
-        projectsTask = Task { [weak self, convex] in
-            for await list in convex.projectsList() {
+        projectsTask = Task { [weak self, store] in
+            for await list in store.projectsUpdates() {
                 guard let self, !Task.isCancelled else { return }
-                await MainActor.run { self.projects = list }
+                self.projects = list
             }
         }
     }

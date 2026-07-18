@@ -47,6 +47,7 @@ private final class FakeOnboardingConvexService: ConvexServiceProtocol, @uncheck
     private(set) var settingsUpdateCalls: [SettingsPatch] = []
     private(set) var templatesUpdateCalls: [String] = []
     private(set) var templatesResetCallCount = 0
+    private(set) var projectsListCallCount = 0
 
     // MARK: users
 
@@ -83,7 +84,10 @@ private final class FakeOnboardingConvexService: ConvexServiceProtocol, @uncheck
     // MARK: projects
 
     func projectsList() -> AsyncStream<[Project]> {
-        let projects = lock.withGuard { projectsToYield }
+        let projects = lock.withGuard {
+            projectsListCallCount += 1
+            return projectsToYield
+        }
         return AsyncStream { continuation in
             continuation.yield(projects)
             continuation.finish()
@@ -623,14 +627,38 @@ final class OnboardingGatingTests: XCTestCase {
 @MainActor
 final class SettingsViewModelTests: XCTestCase {
     private func makeViewModel(
-        convex: FakeOnboardingConvexService = FakeOnboardingConvexService()
+        convex: FakeOnboardingConvexService = FakeOnboardingConvexService(),
+        store: CaptureStore? = nil
     ) -> (SettingsViewModel, FakeOnboardingConvexService, AuthController) {
+        let resolvedStore = store ?? Self.makeStore()
         let auth = AuthController(
             authProvider: MockAuthProvider(),
             convexService: convex,
             breadcrumbStore: InMemoryAuthBreadcrumbStore()
         )
-        return (SettingsViewModel(convex: convex, auth: auth), convex, auth)
+        return (SettingsViewModel(convex: convex, auth: auth, store: resolvedStore), convex, auth)
+    }
+
+    private static func makeStore() -> CaptureStore {
+        let screenshots = FileManager.default.temporaryDirectory
+            .appendingPathComponent("whistle-settings-tests-\(UUID().uuidString)")
+        return try! CaptureStore(path: nil, screenshotsDirectory: screenshots)
+    }
+
+    func testProjectsUseSharedStoreSnapshotWithoutAConvexSubscription() async throws {
+        let store = Self.makeStore()
+        let cached = [Project(id: "cached", name: "Cached", gitRemote: "")]
+        try store.saveProjectsSnapshot(cached)
+        let (viewModel, convex, _) = makeViewModel(store: store)
+
+        await viewModel.load()
+        try await Whistle_waitUntil { viewModel.projects == cached }
+        XCTAssertEqual(convex.projectsListCallCount, 0)
+
+        let refreshed = [Project(id: "fresh", name: "Fresh", gitRemote: "")]
+        try store.saveProjectsSnapshot(refreshed)
+        try await Whistle_waitUntil { viewModel.projects == refreshed }
+        XCTAssertEqual(convex.projectsListCallCount, 0)
     }
 
     func testAgentModelScreenshotAndDefaultProjectSavesCallSettingsUpdate() async throws {
