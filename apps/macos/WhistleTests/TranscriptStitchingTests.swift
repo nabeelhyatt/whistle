@@ -21,6 +21,7 @@ import XCTest
 /// `SFSpeechRecognitionTask` stops after the first final/error.
 final actor FakeSpeechRecognitionEngineState {
     private var segments: [[SpeechRecognitionTaskOutcome]]
+    private var startTaskWaiters: [(count: Int, continuation: CheckedContinuation<Void, Never>)] = []
     private(set) var startTaskCallCount = 0
     private(set) var appendedBufferCount = 0
     private(set) var endCurrentTaskCallCount = 0
@@ -31,8 +32,20 @@ final actor FakeSpeechRecognitionEngineState {
 
     func nextSegment() -> [SpeechRecognitionTaskOutcome] {
         startTaskCallCount += 1
+        let readyWaiters = startTaskWaiters.filter { startTaskCallCount >= $0.count }
+        startTaskWaiters.removeAll { startTaskCallCount >= $0.count }
+        for waiter in readyWaiters {
+            waiter.continuation.resume()
+        }
         guard !segments.isEmpty else { return [] }
         return segments.removeFirst()
+    }
+
+    func waitForStartTaskCallCount(_ count: Int) async {
+        guard startTaskCallCount < count else { return }
+        await withCheckedContinuation { continuation in
+            startTaskWaiters.append((count, continuation))
+        }
     }
 
     func recordAppend() { appendedBufferCount += 1 }
@@ -286,6 +299,10 @@ final class TranscriptStitchingTests: XCTestCase {
             TranscriptUpdate(committed: "first segment partial before error second segment", live: "")
         )
 
+        // The fourth update is emitted before the fake's asynchronous
+        // `nextSegment()` records the fresh trailing task. Observe that
+        // fake event directly instead of racing its actor task with stop().
+        await fake.state.waitForStartTaskCallCount(4)
         await transcriber.stop()
         let startTaskCallCount = await fake.state.startTaskCallCount
         XCTAssertEqual(startTaskCallCount, 4)
