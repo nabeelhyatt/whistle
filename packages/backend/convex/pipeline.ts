@@ -192,13 +192,8 @@ export function findAgentReplyAfterOurs(
       .pop();
   }
 
-  return [...agentMessages]
-    .filter((message) => {
-      if ((message.sessionIndex ?? -1) <= ourIndex) return false;
-      const content = messageContent(message);
-      const linkedId = normalizedIdentifier(content?.userMessageId ?? content?.turnId);
-      return linkedId === undefined || linkedId === clientId.toLowerCase();
-    })
+  return [...directlyLinked]
+    .filter((message) => (message.sessionIndex ?? -1) > ourIndex)
     .sort((a, b) => (a.sessionIndex ?? 0) - (b.sessionIndex ?? 0))
     .pop();
 }

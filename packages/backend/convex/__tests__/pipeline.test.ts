@@ -378,7 +378,12 @@ describe("findAgentReplyAfterOurs", () => {
   test("finds an agent message after our sessionIndex", () => {
     const messages = [
       { id: "our-id", sessionIndex: 0, type: "user", content: "hi" },
-      { id: "reply-1", sessionIndex: 1, type: "agent", content: "hello" },
+      {
+        id: "reply-1",
+        sessionIndex: 1,
+        type: "agent",
+        content: { userMessageId: "our-id", text: "hello" },
+      },
     ];
     const reply = findAgentReplyAfterOurs(messages, "our-id");
     expect(reply?.id).toBe("reply-1");
@@ -394,6 +399,27 @@ describe("findAgentReplyAfterOurs", () => {
       liveMessagesFixture.messages,
       liveMessagesFixture.clientId,
     )?.id).toBe("session-id:3:0");
+  });
+
+  test("ignores unlinked and differently linked replies after our message", () => {
+    const messages = [
+      { id: "our-id", sessionIndex: 0, type: "user", content: "hi" },
+      { id: "unlinked", sessionIndex: 1, type: "agent", content: "not ours" },
+      {
+        id: "other-reply",
+        sessionIndex: 2,
+        type: "agent",
+        content: { userMessageId: "other-id", text: "also not ours" },
+      },
+      {
+        id: "our-reply",
+        sessionIndex: 3,
+        type: "agent",
+        content: { userMessageId: "OUR-ID", text: "ours" },
+      },
+    ];
+
+    expect(findAgentReplyAfterOurs(messages, "our-id")?.id).toBe("our-reply");
   });
 });
 
@@ -432,6 +458,7 @@ describe("happy path", () => {
       sessionIndex: 1,
       type: "agent",
       content: {
+        userMessageId: "client-001",
         text: "Drafted the plan.\n\nClarifying questions:\n1. Dark mode only, or full theming?",
       },
     });
@@ -863,7 +890,7 @@ describe("edge: pipeline.watch status poll throws", () => {
       id: "agent-reply-throws",
       sessionIndex: 1,
       type: "agent",
-      content: "All done here.",
+      content: { userMessageId: "client-watch-throws", text: "All done here." },
     });
 
     await tick(t, 60_000);
@@ -1179,7 +1206,7 @@ describe("terminal-state invariant", () => {
       id: "agent-reply-invariant",
       sessionIndex: 1,
       type: "agent",
-      content: "All set.",
+      content: { userMessageId: "client-invariant", text: "All set." },
     });
 
     await tick(t, 30_000);
