@@ -111,6 +111,8 @@ public final class AuthenticatedSubscription<Element: Sendable>: @unchecked Send
             )
             do {
                 try await sleep(delay)
+            } catch is CancellationError {
+                return
             } catch {
                 if state.isCurrent(token), !Task.isCancelled {
                     NSLog(
@@ -119,7 +121,12 @@ public final class AuthenticatedSubscription<Element: Sendable>: @unchecked Send
                         String(describing: error)
                     )
                 }
-                return
+                guard state.isCurrent(token), !Task.isCancelled else { return }
+                do {
+                    try await Task.sleep(for: delay)
+                } catch {
+                    return
+                }
             }
             retryAttempt += 1
         }

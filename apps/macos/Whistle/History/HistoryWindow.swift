@@ -142,7 +142,6 @@ public final class HistoryViewModel: ObservableObject {
     private var latestDrafts: [CaptureDraft] = []
     private var serverSubscription: AuthenticatedSubscription<[ServerCaptureRecord]>!
     private var pendingTask: Task<Void, Never>?
-    private var serverUpdatesEnabled = false
 
     public init(
         store: CaptureStore,
@@ -189,17 +188,11 @@ public final class HistoryViewModel: ObservableObject {
     /// subscription. The shared supervisor automatically replaces a stream
     /// that terminates while signed in, without requiring another auth event.
     public func setServerUpdatesEnabled(_ enabled: Bool) {
-        guard enabled != serverUpdatesEnabled else { return }
-        serverUpdatesEnabled = enabled
+        serverSubscription.setEnabled(enabled)
+        guard !enabled, !latestServerRecords.isEmpty else { return }
 
-        if !enabled {
-            serverSubscription.setEnabled(false)
-            latestServerRecords = []
-            rebuildRows()
-            return
-        }
-
-        serverSubscription.setEnabled(true)
+        latestServerRecords = []
+        rebuildRows()
     }
 
     // MARK: - Merge + notification-transition detection

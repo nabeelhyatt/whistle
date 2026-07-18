@@ -421,6 +421,32 @@ describe("findAgentReplyAfterOurs", () => {
 
     expect(findAgentReplyAfterOurs(messages, "our-id")?.id).toBe("our-reply");
   });
+
+  test("ignores correlated live system text after the assistant reply", () => {
+    const messages = [
+      { id: "our-id", sessionIndex: 0, type: "user", content: "hi" },
+      {
+        id: "assistant",
+        sessionIndex: 1,
+        type: "agent",
+        content: {
+          userMessageId: "our-id",
+          rawPayload: { type: "assistant", message: { content: [{ text: "done" }] } },
+        },
+      },
+      {
+        id: "system",
+        sessionIndex: 2,
+        type: "agent",
+        content: {
+          userMessageId: "our-id",
+          rawPayload: { type: "system", message: "status text" },
+        },
+      },
+    ];
+
+    expect(findAgentReplyAfterOurs(messages, "our-id")?.id).toBe("assistant");
+  });
 });
 
 // ─── Full pipeline integration tests (mocked Conductor + fake timers) ─────

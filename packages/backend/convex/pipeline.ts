@@ -158,6 +158,16 @@ function isAgentMessage(message: ConductorMessage): boolean {
   return type !== undefined && type !== "user" && type !== "human" && type !== "usermessage";
 }
 
+function isAssistantReply(message: ConductorMessage): boolean {
+  if (!isAgentMessage(message)) return false;
+  const rawPayload = messageContent(message)?.rawPayload;
+  if (rawPayload === null || typeof rawPayload !== "object" || Array.isArray(rawPayload)) {
+    return true;
+  }
+  const rawType = (rawPayload as Record<string, unknown>).type;
+  return typeof rawType !== "string" || rawType.toLowerCase() === "assistant";
+}
+
 /**
  * Finds the last agent-typed message whose `sessionIndex` is after our own
  * message's index. Live Conductor events lowercase the UUID and place it in
@@ -177,7 +187,7 @@ export function findAgentReplyAfterOurs(
   let latestReply: ConductorMessage | undefined;
 
   for (const message of messages) {
-    if (!isAgentMessage(message) || !messageMatchesClient(message, clientId)) continue;
+    if (!isAssistantReply(message) || !messageMatchesClient(message, clientId)) continue;
     if (ourIndex !== undefined && (message.sessionIndex ?? -1) <= ourIndex) continue;
     if (extractMessageText(message.content).trim().length === 0) continue;
     if ((message.sessionIndex ?? 0) < (latestReply?.sessionIndex ?? 0)) continue;

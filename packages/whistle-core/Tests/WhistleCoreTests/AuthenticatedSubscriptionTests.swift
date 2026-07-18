@@ -101,6 +101,32 @@ final class AuthenticatedSubscriptionTests: XCTestCase {
         XCTAssertEqual(harness.subscriptionCount, 1)
     }
 
+    func testUnexpectedSleeperFailureDoesNotEndEnabledSupervisor() async {
+        struct UnexpectedSleepError: Error {}
+        let harness = SubscriptionStreamHarness<Int>()
+        let failures = LockedValues<Int>()
+        let subscription = AuthenticatedSubscription(
+            label: "test",
+            stream: { harness.makeStream() },
+            onValue: { _, _ in },
+            retryDelay: { _ in .zero },
+            sleep: { _ in
+                if failures.values.isEmpty {
+                    failures.append(1)
+                    throw UnexpectedSleepError()
+                }
+            }
+        )
+
+        subscription.setEnabled(true)
+        await harness.waitForSubscriptionCount(1)
+        harness.finishSubscription(at: 0)
+        await harness.waitForSubscriptionCount(2)
+
+        XCTAssertEqual(harness.subscriptionCount, 2)
+        subscription.setEnabled(false)
+    }
+
     func testDisableAndReenableFencesLateOldValues() async {
         let harness = SubscriptionStreamHarness<Int>()
         let received = LockedValues<Int>()
