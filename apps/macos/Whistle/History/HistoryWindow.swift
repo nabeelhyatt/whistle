@@ -141,9 +141,9 @@ public final class HistoryViewModel: ObservableObject {
 
     private var latestServerRecords: [ServerCaptureRecord] = []
     private var latestDrafts: [CaptureDraft] = []
-    private var serverTask: Task<Void, Never>?
+    private var serverSubscription: AuthenticatedSubscription<[ServerCaptureRecord]>!
     private var pendingTask: Task<Void, Never>?
-    private var serverSubscriptionGeneration = 0
+    private var didStart = false
 
     public init(
         store: CaptureStore,
@@ -157,10 +157,17 @@ public final class HistoryViewModel: ObservableObject {
         self.notificationService = notificationService
         self.lastSeenStore = lastSeenStore
         self.listRecentLimit = listRecentLimit
+        self.serverSubscription = AuthenticatedSubscription(
+            label: "captures.listRecent",
+            stream: { convex.capturesListRecent(limit: listRecentLimit) },
+            onValue: { [weak self] records, context in
+                await self?.applyServerRecords(records, context: context)
+            }
+        )
     }
 
     deinit {
-        serverTask?.cancel()
+        serverSubscription.disable()
         pendingTask?.cancel()
     }
 
@@ -169,48 +176,41 @@ public final class HistoryViewModel: ObservableObject {
     /// authenticated server subscription is controlled separately by
     /// `setServerUpdatesEnabled(_:)` as auth state changes.
     public func start(serverUpdatesEnabled: Bool = true) {
-        if pendingTask == nil {
-            pendingTask = Task { [weak self] in
-                guard let self else { return }
-                for await drafts in self.store.pendingCapturesUpdates() {
-                    self.latestDrafts = drafts
-                    self.rebuildRows()
-                }
+        guard !didStart else { return }
+        didStart = true
+        pendingTask = Task { [weak self] in
+            guard let self else { return }
+            for await drafts in self.store.pendingCapturesUpdates() {
+                self.latestDrafts = drafts
+                self.rebuildRows()
             }
         }
         setServerUpdatesEnabled(serverUpdatesEnabled)
     }
 
     /// Starts or stops the authenticated `captures.listRecent`
-    /// subscription. A completed/failed stream clears its task slot, so a
-    /// later sign-in can always create a fresh subscription; the generation
-    /// guard prevents an older cancelled task from clearing a newer one.
+    /// subscription. The shared supervisor automatically replaces a stream
+    /// that terminates while signed in, without requiring another auth event.
     public func setServerUpdatesEnabled(_ enabled: Bool) {
         if !enabled {
-            serverSubscriptionGeneration += 1
-            serverTask?.cancel()
-            serverTask = nil
+            serverSubscription.disable()
             latestServerRecords = []
             rebuildRows()
             return
         }
 
-        guard serverTask == nil else { return }
-        serverSubscriptionGeneration += 1
-        let generation = serverSubscriptionGeneration
-        serverTask = Task { [weak self] in
-            guard let self else { return }
-            for await records in self.convex.capturesListRecent(limit: self.listRecentLimit) {
-                guard !Task.isCancelled else { break }
-                self.handleServerRecords(records)
-            }
-            if self.serverSubscriptionGeneration == generation {
-                self.serverTask = nil
-            }
-        }
+        serverSubscription.enable()
     }
 
     // MARK: - Merge + notification-transition detection
+
+    private func applyServerRecords(
+        _ records: [ServerCaptureRecord],
+        context: AuthenticatedSubscriptionContext
+    ) {
+        guard context.isCurrent else { return }
+        handleServerRecords(records)
+    }
 
     private func handleServerRecords(_ records: [ServerCaptureRecord]) {
         latestServerRecords = records

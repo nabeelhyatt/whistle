@@ -36,7 +36,7 @@ final class ProjectsSyncCoordinatorTests: XCTestCase {
 
         let convex = FakeConvexService()
         let coordinator = ProjectsSyncCoordinator(store: store, convex: convex)
-        await coordinator.start()
+        coordinator.start()
 
         let projects = [
             Project(id: "proj-1", name: "Project One", gitRemote: "git@example.com:one.git"),
@@ -60,8 +60,8 @@ final class ProjectsSyncCoordinatorTests: XCTestCase {
 
         let convex = FakeConvexService()
         let coordinator = ProjectsSyncCoordinator(store: store, convex: convex)
-        await coordinator.start()
-        await coordinator.start() // second call must be a no-op, not a crash/duplicate subscription
+        coordinator.start()
+        coordinator.start() // second call must be a no-op, not a crash/duplicate subscription
 
         let projects = [Project(id: "proj-1", name: "Project One", gitRemote: "git@example.com:one.git")]
         await convex.yieldProjects(projects)
@@ -79,22 +79,22 @@ final class ProjectsSyncCoordinatorTests: XCTestCase {
         let convex = FakeConvexService()
         let coordinator = ProjectsSyncCoordinator(store: store, convex: convex)
 
-        await coordinator.setServerUpdatesEnabled(false)
+        coordinator.setServerUpdatesEnabled(false)
         XCTAssertEqual(convex.activeProjectsSubscriptionCount, 0)
 
-        await coordinator.setServerUpdatesEnabled(true)
+        coordinator.setServerUpdatesEnabled(true)
         try await Whistle_waitUntil(timeout: 1) {
             convex.activeProjectsSubscriptionCount == 1
         }
-        await coordinator.setServerUpdatesEnabled(true)
+        coordinator.setServerUpdatesEnabled(true)
         XCTAssertEqual(convex.activeProjectsSubscriptionCount, 1)
 
-        await coordinator.setServerUpdatesEnabled(false)
+        coordinator.setServerUpdatesEnabled(false)
         try await Whistle_waitUntil(timeout: 1) {
             convex.activeProjectsSubscriptionCount == 0
         }
 
-        await coordinator.setServerUpdatesEnabled(true)
+        coordinator.setServerUpdatesEnabled(true)
         try await Whistle_waitUntil(timeout: 1) {
             convex.activeProjectsSubscriptionCount == 1
         }

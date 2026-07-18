@@ -30,6 +30,7 @@ struct WhistleApp: App {
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItemController: StatusItemController?
     private var authController: AuthController?
+    private var authenticatedServerUpdatesCoordinator: AuthenticatedServerUpdatesCoordinator?
     private var capturePanelController: CapturePanelController?
     private var captureStore: CaptureStore?
     private var convexService: (any ConvexServiceProtocol)?
@@ -185,6 +186,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         self.historyViewModel = historyViewModel
         historyViewModel.start(serverUpdatesEnabled: false)
 
+        self.authenticatedServerUpdatesCoordinator = AuthenticatedServerUpdatesCoordinator(
+            auth: auth,
+            history: historyViewModel,
+            projects: projectsSyncCoordinator
+        )
+
         // Manual retry for a capture stuck in local `syncFailed` state
         // (`.localRetry` affordance): re-drains SyncEngine rather than
         // calling `captures.retry` server-side (no server record exists
@@ -209,10 +216,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             .receive(on: DispatchQueue.main)
             .sink { [weak self] state, errorMessage in
                 self?.capturePanelController?.updateAuthenticationState(state, errorMessage: errorMessage)
-                self?.historyViewModel?.setServerUpdatesEnabled(state == .signedIn)
-                Task { [weak projectsSyncCoordinator] in
-                    await projectsSyncCoordinator?.setServerUpdatesEnabled(state == .signedIn)
-                }
                 // Any state transition (sign-in, sign-out, a fresh
                 // reauthRequired) means the deferral streak that led here,
                 // if any, is no longer relevant -- reset so a brand new

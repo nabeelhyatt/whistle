@@ -27,7 +27,7 @@ public actor ProjectsSyncCoordinator {
     private let convex: any ConvexServiceProtocol
     private let staleAfter: TimeInterval
 
-    private let subscription: AuthenticatedSubscription<[Project]>
+    nonisolated private let subscription: AuthenticatedSubscription<[Project]>
 
     public init(
         store: CaptureStore,
@@ -40,7 +40,8 @@ public actor ProjectsSyncCoordinator {
         self.subscription = AuthenticatedSubscription(
             label: "projects.list",
             stream: { convex.projectsList() },
-            onValue: { projects in
+            onValue: { projects, context in
+                guard context.isCurrent else { return }
                 do {
                     try store.saveProjectsSnapshot(projects)
                 } catch {
@@ -58,14 +59,14 @@ public actor ProjectsSyncCoordinator {
     /// `CaptureStore.projects_snapshot`. Idempotent (safe to call once at
     /// app launch and never worry about it again) -- a re-entrant call is a
     /// no-op while the subscription is already running.
-    public func start() {
+    public nonisolated func start() {
         setServerUpdatesEnabled(true)
     }
 
     /// Owns the authenticated projects subscription across auth changes.
     /// The shared supervisor automatically replaces a terminated stream
     /// while enabled and cancels active iteration/backoff when disabled.
-    public func setServerUpdatesEnabled(_ enabled: Bool) {
+    public nonisolated func setServerUpdatesEnabled(_ enabled: Bool) {
         subscription.setEnabled(enabled)
     }
 

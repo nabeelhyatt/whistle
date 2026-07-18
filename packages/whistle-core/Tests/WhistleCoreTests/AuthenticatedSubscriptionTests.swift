@@ -13,7 +13,7 @@ final class AuthenticatedSubscriptionTests: XCTestCase {
         let subscription = AuthenticatedSubscription(
             label: "test",
             stream: { harness.makeStream() },
-            onValue: { _ in },
+            onValue: { _, _ in },
             retryDelay: { _ in .zero },
             sleep: { _ in }
         )
@@ -32,7 +32,7 @@ final class AuthenticatedSubscriptionTests: XCTestCase {
         let subscription = AuthenticatedSubscription(
             label: "test",
             stream: { harness.makeStream() },
-            onValue: { _ in }
+            onValue: { _, _ in }
         )
 
         subscription.setEnabled(true)
@@ -51,7 +51,7 @@ final class AuthenticatedSubscriptionTests: XCTestCase {
         let subscription = AuthenticatedSubscription(
             label: "test",
             stream: { harness.makeStream() },
-            onValue: { _ in valueDelivered.fulfill() },
+            onValue: { _, _ in valueDelivered.fulfill() },
             retryDelay: { attempt in .milliseconds(10 * (attempt + 1)) },
             sleep: { delay in delays.append(delay) }
         )
@@ -83,7 +83,7 @@ final class AuthenticatedSubscriptionTests: XCTestCase {
         let subscription = AuthenticatedSubscription(
             label: "test",
             stream: { harness.makeStream() },
-            onValue: { _ in },
+            onValue: { _, _ in },
             retryDelay: { _ in .seconds(60) },
             sleep: { delay in
                 sleepStarted.fulfill()
@@ -108,7 +108,7 @@ final class AuthenticatedSubscriptionTests: XCTestCase {
         let subscription = AuthenticatedSubscription(
             label: "test",
             stream: { harness.makeStream() },
-            onValue: { value in
+            onValue: { value, _ in
                 received.append(value)
                 if value == 2 { currentValueDelivered.fulfill() }
             }
@@ -128,6 +128,40 @@ final class AuthenticatedSubscriptionTests: XCTestCase {
         subscription.setEnabled(false)
     }
 
+    func testHandlerCanFenceAValueAfterCrossingAnActorBoundary() async {
+        let harness = SubscriptionStreamHarness<Int>()
+        let gate = AsyncTestGate()
+        let received = LockedValues<Int>()
+        let oldHandlerStarted = expectation(description: "old handler started")
+        let currentValueDelivered = expectation(description: "current value delivered")
+        let subscription = AuthenticatedSubscription(
+            label: "test",
+            stream: { harness.makeStream() },
+            onValue: { value, context in
+                if value == 1 { oldHandlerStarted.fulfill() }
+                await gate.wait()
+                guard context.isCurrent else { return }
+                received.append(value)
+                if value == 2 { currentValueDelivered.fulfill() }
+            }
+        )
+
+        subscription.enable()
+        await harness.waitForSubscriptionCount(1)
+        harness.yield(1, to: 0)
+        await fulfillment(of: [oldHandlerStarted], timeout: 1)
+
+        subscription.disable()
+        subscription.enable()
+        await harness.waitForSubscriptionCount(2)
+        await gate.release()
+        harness.yield(2, to: 1)
+        await fulfillment(of: [currentValueDelivered], timeout: 1)
+
+        XCTAssertEqual(received.values, [2])
+        subscription.disable()
+    }
+
     func testDeinitCancelsActiveSubscription() async {
         let harness = SubscriptionStreamHarness<Int>()
         weak var weakSubscription: AuthenticatedSubscription<Int>?
@@ -136,7 +170,7 @@ final class AuthenticatedSubscriptionTests: XCTestCase {
             let subscription = AuthenticatedSubscription(
                 label: "test",
                 stream: { harness.makeStream() },
-                onValue: { _ in }
+                onValue: { _, _ in }
             )
             weakSubscription = subscription
             subscription.setEnabled(true)
@@ -145,6 +179,23 @@ final class AuthenticatedSubscriptionTests: XCTestCase {
 
         XCTAssertNil(weakSubscription)
         await harness.waitForTerminationCount(1)
+    }
+}
+
+private actor AsyncTestGate {
+    private var isOpen = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func wait() async {
+        guard !isOpen else { return }
+        await withCheckedContinuation { waiters.append($0) }
+    }
+
+    func release() {
+        isOpen = true
+        let pending = waiters
+        waiters.removeAll()
+        pending.forEach { $0.resume() }
     }
 }
 

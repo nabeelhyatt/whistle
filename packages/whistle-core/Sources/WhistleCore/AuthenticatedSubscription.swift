@@ -5,7 +5,7 @@ import Foundation
 /// recreates an `AsyncStream` after that stream has actually terminated.
 public final class AuthenticatedSubscription<Element: Sendable>: @unchecked Sendable {
     public typealias StreamFactory = @Sendable () -> AsyncStream<Element>
-    public typealias ValueHandler = @Sendable (Element) async -> Void
+    public typealias ValueHandler = @Sendable (Element, AuthenticatedSubscriptionContext) async -> Void
     public typealias RetryDelay = @Sendable (_ attempt: Int) -> Duration
     public typealias Sleeper = @Sendable (_ delay: Duration) async throws -> Void
 
@@ -96,10 +96,13 @@ public final class AuthenticatedSubscription<Element: Sendable>: @unchecked Send
 
         while gate.isCurrent(generation), !Task.isCancelled {
             let stream = streamFactory()
+            let context = AuthenticatedSubscriptionContext {
+                gate.isCurrent(generation)
+            }
 
             for await value in stream {
                 guard gate.isCurrent(generation), !Task.isCancelled else { return }
-                await onValue(value)
+                await onValue(value, context)
                 guard gate.isCurrent(generation), !Task.isCancelled else { return }
 
                 if reconnecting {
@@ -147,6 +150,19 @@ public final class AuthenticatedSubscription<Element: Sendable>: @unchecked Send
         guard gate.isCurrent(generation) else { return }
         taskLock.withLock { workerTask = nil }
     }
+}
+
+/// A generation fence for handlers that cross an actor boundary. Owners
+/// should check this immediately before applying a value so a callback that
+/// was queued before sign-out cannot mutate state after a later sign-in.
+public struct AuthenticatedSubscriptionContext: @unchecked Sendable {
+    private let checkIsCurrent: @Sendable () -> Bool
+
+    fileprivate init(checkIsCurrent: @escaping @Sendable () -> Bool) {
+        self.checkIsCurrent = checkIsCurrent
+    }
+
+    public var isCurrent: Bool { checkIsCurrent() }
 }
 
 private final class AuthenticatedSubscriptionGate: @unchecked Sendable {

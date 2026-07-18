@@ -29,6 +29,9 @@ import XCTest
 private final class FakeHistoryConvexService: ConvexServiceProtocol, @unchecked Sendable {
     private let lock = NSLock()
     private var continuations: [UUID: AsyncStream<[ServerCaptureRecord]>.Continuation] = [:]
+    private var projectContinuations: [UUID: AsyncStream<[Project]>.Continuation] = [:]
+    private var captureSubscriptionStarts = 0
+    private var projectSubscriptionStarts = 0
 
     private(set) var markOpenedCalls: [String] = []
     private(set) var archiveCalls: [String] = []
@@ -44,7 +47,20 @@ private final class FakeHistoryConvexService: ConvexServiceProtocol, @unchecked 
     func settingsSetConductorKey(_ key: String) async throws {}
     func conductorValidateKey(key: String?) async throws -> Bool { true }
     func conductorRefreshProjects() async throws {}
-    func projectsList() -> AsyncStream<[Project]> { AsyncStream { _ in } }
+    func projectsList() -> AsyncStream<[Project]> {
+        AsyncStream { continuation in
+            let id = UUID()
+            self.lock.lock()
+            self.projectSubscriptionStarts += 1
+            self.projectContinuations[id] = continuation
+            self.lock.unlock()
+            continuation.onTermination = { [weak self] _ in
+                self?.lock.lock()
+                self?.projectContinuations.removeValue(forKey: id)
+                self?.lock.unlock()
+            }
+        }
+    }
     func templatesGet() async throws -> TemplateSnapshot {
         TemplateSnapshot(body: "", isCustomized: false, updatedAt: Date(timeIntervalSince1970: 0))
     }
@@ -60,6 +76,7 @@ private final class FakeHistoryConvexService: ConvexServiceProtocol, @unchecked 
         AsyncStream { continuation in
             let id = UUID()
             self.lock.lock()
+            self.captureSubscriptionStarts += 1
             self.continuations[id] = continuation
             self.lock.unlock()
             continuation.onTermination = { [weak self] _ in
@@ -131,9 +148,26 @@ private final class FakeHistoryConvexService: ConvexServiceProtocol, @unchecked 
         return continuations.count
     }
 
+    var activeProjectSubscriptionCount: Int {
+        lock.lock(); defer { lock.unlock() }
+        return projectContinuations.count
+    }
+
+    var subscriptionStartCounts: (captures: Int, projects: Int) {
+        lock.lock(); defer { lock.unlock() }
+        return (captureSubscriptionStarts, projectSubscriptionStarts)
+    }
+
     func finishSubscriptions() {
         lock.lock()
         let subs = Array(continuations.values)
+        lock.unlock()
+        subs.forEach { $0.finish() }
+    }
+
+    func finishProjectSubscriptions() {
+        lock.lock()
+        let subs = Array(projectContinuations.values)
         lock.unlock()
         subs.forEach { $0.finish() }
     }
@@ -245,14 +279,76 @@ final class NotificationRoutingTests: XCTestCase {
 
         viewModel.setServerUpdatesEnabled(true)
         await HistoryTestSupport.waitUntil { convex.activeSubscriptionCount == 1 }
+        let startsBeforeTermination = convex.subscriptionStartCounts.captures
         convex.finishSubscriptions()
-        await HistoryTestSupport.waitUntil { convex.activeSubscriptionCount == 0 }
-        let restartDeadline = Date().addingTimeInterval(1)
-        while convex.activeSubscriptionCount == 0, Date() < restartDeadline {
-            viewModel.setServerUpdatesEnabled(true)
-            try? await Task.sleep(nanoseconds: 10_000_000)
+        await HistoryTestSupport.waitUntil {
+            convex.subscriptionStartCounts.captures > startsBeforeTermination
         }
         XCTAssertEqual(convex.activeSubscriptionCount, 1)
+    }
+
+    func testRepeatedStartDoesNotBypassSignedOutServerGate() async throws {
+        let (store, tempDir) = try HistoryTestSupport.makeStore()
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+        let convex = FakeHistoryConvexService()
+        let viewModel = HistoryViewModel(
+            store: store,
+            convex: convex,
+            notificationService: NotificationService(center: FakeUserNotificationCenter()),
+            lastSeenStore: InMemoryLastSeenStatusStore()
+        )
+
+        viewModel.start(serverUpdatesEnabled: false)
+        viewModel.start()
+        await Task.yield()
+
+        XCTAssertEqual(convex.activeSubscriptionCount, 0)
+    }
+
+    func testAuthPublisherOrdersAllSubscriptionLifecycleTransitions() async throws {
+        let (store, tempDir) = try HistoryTestSupport.makeStore()
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+        let convex = FakeHistoryConvexService()
+        let auth = AuthController(
+            authProvider: MockAuthProvider(fixedToken: "mock-id-token"),
+            convexService: convex
+        )
+        let history = HistoryViewModel(
+            store: store,
+            convex: convex,
+            notificationService: NotificationService(center: FakeUserNotificationCenter()),
+            lastSeenStore: InMemoryLastSeenStatusStore()
+        )
+        history.start(serverUpdatesEnabled: false)
+        let projects = ProjectsSyncCoordinator(store: store, convex: convex)
+        let coordinator = AuthenticatedServerUpdatesCoordinator(
+            auth: auth,
+            history: history,
+            projects: projects
+        )
+
+        await auth.signIn()
+        await HistoryTestSupport.waitUntil {
+            convex.activeSubscriptionCount == 1 && convex.activeProjectSubscriptionCount == 1
+        }
+
+        convex.finishSubscriptions()
+        convex.finishProjectSubscriptions()
+        await HistoryTestSupport.waitUntil {
+            let starts = convex.subscriptionStartCounts
+            return starts.captures >= 2 && starts.projects >= 2
+        }
+
+        auth.handleTokenRefreshFailure()
+        await HistoryTestSupport.waitUntil {
+            convex.activeSubscriptionCount == 0 && convex.activeProjectSubscriptionCount == 0
+        }
+
+        await auth.signIn()
+        await HistoryTestSupport.waitUntil {
+            convex.activeSubscriptionCount == 1 && convex.activeProjectSubscriptionCount == 1
+        }
+        _ = coordinator
     }
 
     // MARK: Happy: ->ready fires notification with question count; click opens deepLink + marks opened
