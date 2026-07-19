@@ -91,6 +91,62 @@ final class ConvexAuthAttachmentGateTests: XCTestCase {
         XCTAssertTrue(second, "a re-attempt after reset() must actually re-run attach, not just report the old state")
         XCTAssertEqual(attempts.value, 2, "reset() must force the next call to re-attempt attach instead of short-circuiting on stale state")
     }
+
+    // Regression coverage for the reauth-wedge bug: `LiveConvexService.detachAuth()`
+    // previously awaited `client.logout()` with no timeout -- the only Convex
+    // call in the file not wrapped in `withTimeout` -- while the reauth path
+    // (`AuthController.signIn()`) awaits `detachAuth()` with `state ==
+    // .signingIn` and re-entry guarded, so a wedged/non-cancellation-aware FFI
+    // logout would permanently strand sign-in until an app relaunch.
+    //
+    // `LiveConvexService` itself can't be driven hermetically (its
+    // `ConvexClientWithAuth` seam is internal to the package, same constraint
+    // noted atop this file / in ConvexOneShotQueryTests / ConvexTimeoutTests),
+    // so this reproduces `detachAuth()`'s exact fixed shape -- a hung logout
+    // bounded by `withTimeout`, with the gate ALWAYS reset afterward
+    // regardless of the timeout outcome -- against the same testable, instance-
+    // state-free primitives (`LiveConvexService.withTimeout`,
+    // `ConvexAuthAttachmentGate`) `detachAuth()` is built from.
+    #if canImport(ConvexMobile)
+        func testDetachAuthPatternReturnsPromptlyOnAHungLogoutAndAlwaysResetsTheGate() async {
+            let gate = ConvexAuthAttachmentGate()
+            let attempts = Counter()
+
+            // Prime the gate as if a previous session had already attached.
+            let primed = await gate.runIfNeeded {
+                attempts.increment()
+                return true
+            }
+            XCTAssertTrue(primed)
+            XCTAssertEqual(attempts.value, 1)
+
+            let start = Date()
+            // Mirrors `detachAuth()`: bound a logout call that neither
+            // completes nor honors cancellation (exactly convex-swift's
+            // non-cancellation-aware FFI behavior) in `withTimeout`, then
+            // ALWAYS reset the gate -- whether or not the call actually
+            // finished.
+            _ = try? await LiveConvexService.withTimeout(.milliseconds(50)) {
+                await withCheckedContinuation { (_: CheckedContinuation<Void, Never>) in }
+            }
+            gate.reset()
+            let elapsed = Date().timeIntervalSince(start)
+            XCTAssertLessThan(
+                elapsed, 2.0,
+                "a hung logout must not prevent detachAuth's pattern from returning promptly (elapsed: \(elapsed)s)"
+            )
+
+            // The gate must actually be reset -- not just "returned promptly"
+            // -- so the next sign-in re-attaches with a fresh token instead of
+            // short-circuiting on stale `attached == true` state.
+            let reattached = await gate.runIfNeeded {
+                attempts.increment()
+                return true
+            }
+            XCTAssertTrue(reattached)
+            XCTAssertEqual(attempts.value, 2, "reset() after a timed-out logout must force the next call to re-attempt attach")
+        }
+    #endif
 }
 
 // MARK: - WhistleToConvexAuthProviderBridge

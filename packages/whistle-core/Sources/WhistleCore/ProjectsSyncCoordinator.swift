@@ -16,11 +16,16 @@
 // shows projects, the capture panel's picker says "No projects".
 //
 // `ProjectsSyncCoordinator` is the missing piece: a single, app-wide
-// `projects.list` subscription (started once at launch, independent of any
-// window being open) whose every yield is persisted into
-// `CaptureStore.projects_snapshot`, plus the stale-refresh trigger
-// (`conductor.refreshProjects`, TECH-SPEC §7: "called when stale (>1h) or
-// on picker open").
+// `projects.list` subscription, independent of any window being open, whose
+// every yield is persisted into `CaptureStore.projects_snapshot`, plus the
+// stale-refresh trigger (`conductor.refreshProjects`, TECH-SPEC §7: "called
+// when stale (>1h) or on picker open"). Production no longer calls `start()`
+// once at launch and forgets about it -- `WhistleApp` drives
+// `setServerUpdatesEnabled(_:)` from auth-state transitions (signed in ->
+// subscribe, signed out -> cancel), the same gated-subscription shape as
+// `HistoryViewModel`'s server subscription. `start()` remains as a thin
+// convenience for tests/direct callers that just want the subscription on
+// unconditionally.
 
 import Foundation
 
@@ -48,10 +53,14 @@ public actor ProjectsSyncCoordinator {
         subscriptionTask?.cancel()
     }
 
-    /// Subscribes to `projects.list` and persists every yield into
-    /// `CaptureStore.projects_snapshot`. Idempotent (safe to call once at
-    /// app launch and never worry about it again) -- a re-entrant call is a
-    /// no-op while the subscription is already running.
+    /// Unconditionally enables the `projects.list` subscription -- equivalent
+    /// to `setServerUpdatesEnabled(true)`. Idempotent (a re-entrant call is a
+    /// no-op while the subscription is already running). Production does NOT
+    /// call this once at launch: `WhistleApp` drives `setServerUpdatesEnabled(_:)`
+    /// directly from auth-state transitions instead, so the subscription
+    /// tracks sign-in/sign-out rather than running unauthenticated. `start()`
+    /// remains for tests and any direct caller that wants the subscription on
+    /// unconditionally, without wiring up auth-state observation.
     public func start() {
         setServerUpdatesEnabled(true)
     }

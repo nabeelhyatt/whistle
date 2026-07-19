@@ -389,7 +389,20 @@ public struct CaptureCreateInput: Equatable, Sendable {
         /// worse, still-live) previous-session attachment instead of pulling
         /// a fresh token via `loginFromCache()`.
         public func detachAuth() async {
-            await client.logout()
+            // `client.logout()` is the one Convex call this file previously
+            // left unwrapped -- a wedged/non-cancellation-aware FFI logout
+            // (the same class of hang `withTimeout` exists to bound; see
+            // below) would await here forever. The reauth path
+            // (`AuthController.signIn()`) calls `detachAuth()` while
+            // `state == .signingIn`, guarded against re-entry, so a hang here
+            // would permanently strand sign-in until an app relaunch. Bound
+            // it like every other Convex call, and ALWAYS reset the gate
+            // afterward regardless of whether logout completed or timed out
+            // -- a stuck logout must not also leave the attach gate latched
+            // to the old session.
+            _ = try? await Self.withTimeout(Self.authedCallTimeout) { [client] in
+                await client.logout()
+            }
             authGate.reset()
         }
 

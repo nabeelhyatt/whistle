@@ -48,8 +48,12 @@ struct ServerCaptureRecordWire: Decodable, @unchecked Sendable {
     var model: String?
     @ConvexFloat var capturedAt: Double
 
-    var status: CaptureServerStatus
-    var errorCode: CaptureErrorCode?
+    /// Decoded as a raw `String`, not `CaptureServerStatus` directly -- see
+    /// `asRecord`'s mapping for why (schema-drift tolerance).
+    var status: String
+    /// Decoded as a raw `String?`, not `CaptureErrorCode?` directly -- see
+    /// `asRecord`'s mapping for why (schema-drift tolerance).
+    var errorCode: String?
     var error: String?
     @ConvexFloat var attempt: Double
     var workspaceId: String?
@@ -79,6 +83,15 @@ struct ServerCaptureRecordWire: Decodable, @unchecked Sendable {
     /// `timeIntervalSinceReferenceDate`, which is seconds-since-2001 and was
     /// the silent-wrong-date half of this bug); `attempt`'s float64 becomes
     /// the model's `Int`.
+    ///
+    /// `status`/`errorCode` are decoded as raw strings (not the closed
+    /// enums directly) and mapped here with a fallback rather than left to
+    /// `Decodable`'s enum-from-rawValue behavior, which throws and kills the
+    /// WHOLE `captures.listRecent` publisher on a single unrecognized value.
+    /// A future backend deploy adding a new status/errorCode before the
+    /// client ships its matching case must degrade one row's chip, not
+    /// re-freeze all of History -- so an unknown string falls back to
+    /// `.queued`/`.unknown` (display-neutral) instead of throwing.
     var asRecord: ServerCaptureRecord {
         ServerCaptureRecord(
             id: id,
@@ -92,10 +105,16 @@ struct ServerCaptureRecordWire: Decodable, @unchecked Sendable {
             agent: agent,
             model: model,
             capturedAt: Date(timeIntervalSince1970: capturedAt / 1000),
-            status: status,
-            errorCode: errorCode,
+            status: CaptureServerStatus(rawValue: status) ?? .queued,
+            errorCode: errorCode.map { CaptureErrorCode(rawValue: $0) ?? .unknown },
             error: error,
-            attempt: Int(attempt),
+            // `attempt` arrives as a Convex float64; a non-finite value
+            // (NaN/inf -- shouldn't happen, but the wire format doesn't rule
+            // it out) would trap `Int(attempt)`. `Int(exactly:)` on the
+            // rounded value returns `nil` for anything that can't losslessly
+            // become an `Int` (non-finite, out-of-range), falling back to 0
+            // rather than crashing the whole decode.
+            attempt: Int(exactly: attempt.rounded()) ?? 0,
             workspaceId: workspaceId,
             workspaceName: workspaceName,
             sessionId: sessionId,

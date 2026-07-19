@@ -167,8 +167,34 @@ public final class HistoryViewModel: ObservableObject {
     /// Starts the local pending queue observation. This is deliberately
     /// auth-independent so offline/signed-out drafts remain visible. The
     /// authenticated server subscription is controlled separately by
-    /// `setServerUpdatesEnabled(_:)` as auth state changes.
-    public func start(serverUpdatesEnabled: Bool = true) {
+    /// `setServerUpdatesEnabled(_:)` as auth state changes. Callers MUST pass
+    /// `serverUpdatesEnabled` explicitly (no default) -- see `ensureStarted()`
+    /// for the auth-agnostic path used by the SwiftUI view's `onAppear`.
+    public func start(serverUpdatesEnabled: Bool) {
+        ensureStarted()
+        setServerUpdatesEnabled(serverUpdatesEnabled)
+    }
+
+    /// Starts ONLY the local pending-drafts observation, never touching the
+    /// authenticated server subscription. Safe to call at any point in the
+    /// auth lifecycle -- including before `AuthController.resolveInitialState()`
+    /// resolves -- because it never calls `setServerUpdatesEnabled(_:)`.
+    ///
+    /// This exists because the SwiftUI view's `.onAppear` used to call
+    /// `start()`, whose default `serverUpdatesEnabled = true` created an
+    /// unauthenticated `captures.listRecent` subscription if History was
+    /// opened before auth resolved. That doomed subscription occupied
+    /// `serverTask`'s slot, so the later `.signedIn` transition's
+    /// `setServerUpdatesEnabled(true)` no-op'd on `guard serverTask == nil`
+    /// -- once the unauthenticated stream died, History stayed frozen at
+    /// "Queued" until the next auth transition. `onAppear` now calls this
+    /// instead, and the app's auth-state driver (`WhistleApp`) is the only
+    /// caller of `setServerUpdatesEnabled(_:)` for the server side.
+    ///
+    /// Idempotent (safe to call from `onAppear` every time the window
+    /// reappears): `pendingTask == nil` guards against starting a second
+    /// observation Task.
+    public func ensureStarted() {
         if pendingTask == nil {
             pendingTask = Task { [weak self] in
                 guard let self else { return }
@@ -178,7 +204,6 @@ public final class HistoryViewModel: ObservableObject {
                 }
             }
         }
-        setServerUpdatesEnabled(serverUpdatesEnabled)
     }
 
     /// Starts or stops the authenticated `captures.listRecent`
@@ -398,7 +423,7 @@ struct HistoryWindow: View {
             }
         }
         .frame(minWidth: 480, minHeight: 420)
-        .onAppear { viewModel.start() }
+        .onAppear { viewModel.ensureStarted() }
     }
 
     private var searchBar: some View {
