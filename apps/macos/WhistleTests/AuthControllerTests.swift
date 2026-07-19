@@ -33,6 +33,10 @@ private final class FakeConvexService: ConvexServiceProtocol, @unchecked Sendabl
         return "user-1"
     }
 
+    func usersMe() async throws -> UserSelfSnapshot {
+        UserSelfSnapshot(email: "fake@example.com", authSubject: "auth0|fake-user-1")
+    }
+
     // MARK: auth lifecycle (overrides the protocol's no-op default so
     // signOut()'s wiring is assertable -- see testSignOutDetachesConvexAndLogsOutProvider)
 

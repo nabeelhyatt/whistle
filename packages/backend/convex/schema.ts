@@ -6,7 +6,16 @@ export default defineSchema({
     authSubject: v.string(), // Auth0 sub
     email: v.optional(v.string()),
     createdAt: v.number(),
-  }).index("by_subject", ["authSubject"]),
+    // Canonical-accounts migration (2026-07-18 plan): set on a "merged
+    // shell" row once its captures/promptTemplates/projectsCache have been
+    // repointed to the surviving user by admin.mergeUserData. Never
+    // deleted — the row (and its untouched settings/API key) stays in
+    // place as an audit trail; users.ensure's split-detection safeguard
+    // skips rows with this set so a merged shell can't re-trigger a warn.
+    mergedInto: v.optional(v.id("users")),
+  })
+    .index("by_subject", ["authSubject"])
+    .index("by_email", ["email"]),
 
   settings: defineTable({
     userId: v.id("users"),

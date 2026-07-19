@@ -54,6 +54,13 @@ public final class SettingsViewModel: ObservableObject {
     @Published public private(set) var authState: AuthState
     @Published public private(set) var signInErrorMessage: String?
 
+    // Account identity display (canonical-accounts plan §4): backend-truth
+    // via `users:me`, never decoded from the JWT client-side. `nil` until
+    // `load()` succeeds (or if `usersMe()` fails / this is a dev sign-in,
+    // where there's no real backend identity to show).
+    @Published public private(set) var signedInEmail: String?
+    @Published public private(set) var signedInAuthSubject: String?
+
     /// The known agent values (PRD F5.2). `model` stays a free-form string
     /// (PRD open question: exact accepted values are undocumented).
     public static let agents = ["claude", "codex", "cursor"]
@@ -92,7 +99,48 @@ public final class SettingsViewModel: ObservableObject {
         } catch {
             loadError = "Couldn't load settings. Check your connection."
         }
+        await loadSignedInIdentity()
         subscribeToProjects()
+    }
+
+    /// Loads `users:me` for the account tab's identity display. Best-effort:
+    /// a failure (network hiccup, or a dev sign-in session with no real
+    /// backend identity) just leaves both fields `nil` rather than
+    /// surfacing another error banner — `loadError` above already covers
+    /// the "can't reach the backend" case for the tab that actually needs
+    /// to block on it (General/API key).
+    private func loadSignedInIdentity() async {
+        guard !isDevSignIn else { return }
+        do {
+            let me = try await convex.usersMe()
+            signedInEmail = me.email
+            signedInAuthSubject = me.authSubject
+        } catch {
+            signedInEmail = nil
+            signedInAuthSubject = nil
+        }
+    }
+
+    /// "Signed in as:" value — the email if the identity carries one,
+    /// otherwise the raw `authSubject` (the GitHub-noreply-email case from
+    /// plan §4).
+    public var signedInDisplayName: String {
+        signedInEmail ?? signedInAuthSubject ?? ""
+    }
+
+    /// "Via:" value — derived from the `authSubject`'s provider prefix
+    /// (`auth0|...`, `github|...`, `google-oauth2|...`), never from
+    /// decoding the JWT. Falls back to the raw prefix for anything else so
+    /// a new/unexpected connection never renders blank.
+    public var signedInConnectionLabel: String {
+        guard let subject = signedInAuthSubject else { return "" }
+        let prefix = subject.split(separator: "|", maxSplits: 1).first.map(String.init) ?? subject
+        switch prefix {
+        case "auth0": return "Email & password"
+        case "github": return "GitHub"
+        case "google-oauth2": return "Google"
+        default: return prefix
+        }
     }
 
     private func subscribeToProjects() {
@@ -315,6 +363,10 @@ struct SettingsView: View {
                 switch viewModel.authState {
                 case .signedIn:
                     LabeledContent("Status:", value: viewModel.isDevSignIn ? "Dev sign-in" : "Signed in")
+                    if !viewModel.isDevSignIn {
+                        LabeledContent("Signed in as:", value: viewModel.signedInDisplayName)
+                        LabeledContent("Via:", value: viewModel.signedInConnectionLabel)
+                    }
                     Button("Sign Out", role: .destructive) {
                         Task { await viewModel.signOut() }
                     }

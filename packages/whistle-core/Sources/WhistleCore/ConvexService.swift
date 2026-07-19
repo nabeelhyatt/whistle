@@ -117,6 +117,12 @@ public protocol ConvexServiceProtocol: Sendable {
     // MARK: users
     func usersEnsure() async throws -> String
 
+    /// Backend-truth identity for Settings' "Signed in as" / "Via" display
+    /// (canonical-accounts plan §4) — never derived from decoding the JWT
+    /// client-side. Mirrors `users:me` (a query, so this goes through
+    /// `authedQuery` in `LiveConvexService`, same as `settingsGet`).
+    func usersMe() async throws -> UserSelfSnapshot
+
     // MARK: auth lifecycle
 
     /// Drops the current websocket auth attachment and resets the internal
@@ -171,6 +177,20 @@ public extension ConvexServiceProtocol {
 }
 
 // MARK: - Supporting request/response shapes
+
+/// The `users:me` response (canonical-accounts plan §4): backend-truth
+/// identity for display, not a decoded JWT. `email` is absent for
+/// identities that never carried one (e.g. a GitHub identity with email
+/// privacy enabled) — callers fall back to `authSubject`.
+public struct UserSelfSnapshot: Codable, Equatable, Sendable {
+    public var email: String?
+    public var authSubject: String
+
+    public init(email: String?, authSubject: String) {
+        self.email = email
+        self.authSubject = authSubject
+    }
+}
 
 public struct SettingsSnapshot: Codable, Equatable, Sendable {
     public var defaultProjectId: String?
@@ -372,6 +392,14 @@ public struct CaptureCreateInput: Equatable, Sendable {
             // credentials) could hang indefinitely on a stuck network call
             // instead of timing out into a retry like every other mutation.
             try await authedMutation("users:ensure")
+        }
+
+        /// `users:me` is a query (backend-truth identity for Settings'
+        /// account tab, canonical-accounts plan §4) — routed through
+        /// `authedQuery` like `settingsGet`, not `authedMutation` like
+        /// `usersEnsure` above.
+        public func usersMe() async throws -> UserSelfSnapshot {
+            try await authedQuery("users:me")
         }
 
         // MARK: auth lifecycle

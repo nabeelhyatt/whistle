@@ -5,7 +5,8 @@ import { requireUser } from "./lib/auth";
 const DEFAULT_AGENT = "claude";
 const DEFAULT_SCREENSHOTS_ENABLED = true;
 
-function maskedKeyFields(conductorApiKey: string | undefined) {
+/** Exported for reuse by admin.ts's `accountReport` (masked lastFour). */
+export function maskedKeyFields(conductorApiKey: string | undefined) {
   return {
     hasKey: conductorApiKey !== undefined && conductorApiKey.length > 0,
     lastFour:
