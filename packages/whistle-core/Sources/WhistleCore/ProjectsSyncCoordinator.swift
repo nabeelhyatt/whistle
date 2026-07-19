@@ -96,15 +96,29 @@ public actor ProjectsSyncCoordinator {
     }
 
     /// Triggers a server-side `conductor.refreshProjects` if the local
-    /// snapshot is missing or older than `staleAfter` (default 1h) --
+    /// snapshot is missing, empty, or older than `staleAfter` (default 1h) --
     /// TECH-SPEC §7: "called when stale (>1h) or on picker open." Callers
     /// (`CaptureViewModel.beginCapture()`/`resumeDraft()`, via
     /// `CapturePanelController`) call this every time the capture panel
-    /// opens; a fresh snapshot is a cheap no-op.
+    /// opens; a fresh, non-empty snapshot is a cheap no-op.
+    ///
+    /// An empty snapshot is always treated as stale regardless of
+    /// `fetchedAt`: the `projects.list` subscription in
+    /// `setServerUpdatesEnabled(true)` persists *every* yield, including a
+    /// legitimate empty first yield for a brand-new account whose server
+    /// `projectsCache` has no row yet. Without this check, that empty yield
+    /// looks "fresh" for the next hour and this method would never call
+    /// `conductor.refreshProjects` -- leaving the capture panel's project
+    /// picker permanently empty and captures submitting with `projectId: ""`.
     public func refreshIfStale(now: Date = Date()) async {
         let fetchedAt = try? store.projectsSnapshotFetchedAt()
-        let isStale = fetchedAt.map { now.timeIntervalSince($0) > staleAfter } ?? true
+        let isEmpty = ((try? store.projectsSnapshot()) ?? []).isEmpty
+        let isStale = isEmpty || (fetchedAt.map { now.timeIntervalSince($0) > staleAfter } ?? true)
         guard isStale else { return }
-        try? await convex.conductorRefreshProjects()
+        do {
+            try await convex.conductorRefreshProjects()
+        } catch {
+            NSLog("Whistle: ProjectsSyncCoordinator conductor.refreshProjects failed: %@", String(describing: error))
+        }
     }
 }
