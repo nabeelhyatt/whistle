@@ -103,7 +103,7 @@ var asRecord: ServerCaptureRecord {
 }
 ```
 
-`@ConvexFloat`/`@OptionalConvexFloat` are property wrappers supplied by convex-swift's `ConvexMobile` module (`.build/checkouts/convex-swift/Sources/ConvexMobile/Decoding.swift:56` and `:83`) that accept either a bare JSON number or the `{"$float": "<base64>"}` boxed form — both paths are exercised directly in the test suite (`ServerCaptureRecordWireTests.swift:269-327`).
+`@ConvexFloat`/`@OptionalConvexFloat` are property wrappers supplied by the convex-swift dependency's `ConvexMobile` module (in the convex-swift 0.8.1 package source, `Sources/ConvexMobile/Decoding.swift` lines 56 and 83 — an SPM checkout fetched at build time, not a file in this repo) that accept either a bare JSON number or the `{"$float": "<base64>"}` boxed form — both paths are exercised directly in the test suite (`ServerCaptureRecordWireTests.swift:269-327`).
 
 Every decode site that previously decoded `ServerCaptureRecord` directly now decodes `ServerCaptureRecordWire` and maps: `capturesListRecent` (the subscription, `ConvexService.swift:654-682`), `capturesList` (`ConvexService.swift:684-689`), and `capturesGet` (`ConvexService.swift:691-703`).
 
