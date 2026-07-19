@@ -1083,7 +1083,13 @@ final class CapturePanelControllerTests: XCTestCase {
             let controller = CapturePanelController(store: store, screenshotService: screenshotService, mode: mode, micPermissionStatus: { .granted }, speechPermissionStatus: { .granted }, transcriptionServiceFactory: { FakeTranscriptionService() })
 
             controller.trigger()
-            try await Task.sleep(nanoseconds: 20_000_000)
+            // Poll rather than a fixed sleep: `trigger()` fires the
+            // screenshot capture on a spawned Task (§4.2, never blocking
+            // panel display), so a fixed delay races that Task under CI's
+            // slower scheduling and can assert before the fake's counter
+            // increments -- mirrors `waitForScreenshotCount` above and the
+            // continuation-based fix in TranscriptStitchingTests.
+            try await waitForScreenshotCount(1, counter: counter)
             XCTAssertEqual(counter.count, 1, "mode \(mode): first trigger captures exactly one screenshot")
 
             controller.currentViewModel?.transcriptText = "unsent draft for \(mode)"
