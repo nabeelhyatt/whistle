@@ -210,3 +210,4 @@ The periodic drain (`runPeriodicDrain`) is intentionally a separate loop from `W
 
 - PR #10 — `fix: wire SyncEngine so captures actually reach the Conductor API` (initial wiring + reentrancy guard)
 - The subsequent commit on the same branch addresses the P1 correctness findings from the code review of PR #10
+- [History window stuck 'Queued' forever — ServerCaptureRecord Convex decode mismatch](../integration-issues/history-window-stuck-queued-convex-decode-mismatch.md) — a *different* root cause behind the same "stuck Queued" symptom (dead decode on the subscription read path vs this doc's hung call on the write path). An engineer debugging one should check the other.
