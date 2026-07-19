@@ -95,10 +95,10 @@ function orphanTag(clientId: string): string {
  * in spec) — parse defensively"). Handles the shapes we can reasonably
  * expect from an agent's outbound message: a plain string, or an object
  * with a `text`/`content`/`message` string field, or an array of such
- * objects/strings (a common "content blocks" shape). Structured so that
- * swapping in the real fixture (docs/CONDUCTOR-API.md unknown #4, still
- * blocked on a working scratch-project run) only requires adjusting this
- * function, not any call site.
+ * objects/strings (a common "content blocks" shape). The live Conductor
+ * event envelope nests assistant output under
+ * `content.rawPayload.message.content[].text`, so `rawPayload` is traversed
+ * explicitly as well.
  */
 export function extractMessageText(content: unknown): string {
   if (typeof content === "string") return content;
@@ -109,7 +109,7 @@ export function extractMessageText(content: unknown): string {
 
   if (content !== null && typeof content === "object") {
     const obj = content as Record<string, unknown>;
-    for (const key of ["text", "content", "message", "body"]) {
+    for (const key of ["text", "content", "message", "body", "rawPayload"]) {
       const val = obj[key];
       if (typeof val === "string") return val;
       if (val !== undefined) {
@@ -122,39 +122,81 @@ export function extractMessageText(content: unknown): string {
   return "";
 }
 
+function normalizedIdentifier(value: unknown): string | undefined {
+  return typeof value === "string" && value.length > 0
+    ? value.toLowerCase()
+    : undefined;
+}
+
+function messageContent(message: ConductorMessage): Record<string, unknown> | undefined {
+  return message.content !== null && typeof message.content === "object" && !Array.isArray(message.content)
+    ? (message.content as Record<string, unknown>)
+    : undefined;
+}
+
+/** All fields the live and legacy message-list shapes use for correlation. */
+function messageIdentifiers(message: ConductorMessage): string[] {
+  const content = messageContent(message);
+  return [
+    message.id,
+    message.messageId,
+    content?.id,
+    content?.messageId,
+    content?.turnId,
+    content?.userMessageId,
+  ]
+    .map(normalizedIdentifier)
+    .filter((value): value is string => value !== undefined);
+}
+
+function messageMatchesClient(message: ConductorMessage, clientId: string): boolean {
+  return messageIdentifiers(message).includes(clientId.toLowerCase());
+}
+
+function isAgentMessage(message: ConductorMessage): boolean {
+  const type = message.type?.toLowerCase();
+  return type !== undefined && type !== "user" && type !== "human" && type !== "usermessage";
+}
+
+function isAssistantReply(message: ConductorMessage): boolean {
+  if (!isAgentMessage(message)) return false;
+  const rawPayload = messageContent(message)?.rawPayload;
+  if (rawPayload === null || typeof rawPayload !== "object" || Array.isArray(rawPayload)) {
+    return true;
+  }
+  const rawType = (rawPayload as Record<string, unknown>).type;
+  return typeof rawType !== "string" || rawType.toLowerCase() === "assistant";
+}
+
 /**
  * Finds the last agent-typed message whose `sessionIndex` is after our own
- * message's index (matched by `id` or `messageId` equal to `clientId`, per
- * docs/CONDUCTOR-API.md's `GET .../messages` shape). "Agent-typed" is
- * anything not typed "user"/"human" — the exact type string for an agent
- * reply is unconfirmed (U4 unknown #4 blocked), so this is deliberately
- * permissive rather than allowlisting a specific type string.
+ * message's index. Live Conductor events lowercase the UUID and place it in
+ * nested content fields (`id`, `turnId`, and `userMessageId`) rather than
+ * top-level `id`/`messageId`, so comparisons are case-insensitive and accept
+ * both shapes. Event-only agent records are ignored: only an event from
+ * which assistant text can actually be extracted counts as a reply.
  */
 export function findAgentReplyAfterOurs(
   messages: ConductorMessage[],
   clientId: string,
 ): ConductorMessage | undefined {
   const ourMessage = messages.find(
-    (m) => m.id === clientId || m.messageId === clientId,
+    (message) => !isAgentMessage(message) && messageMatchesClient(message, clientId),
   );
   const ourIndex = ourMessage?.sessionIndex;
+  let latestReply: ConductorMessage | undefined;
 
-  const agentMessages = messages.filter(
-    (m) => m.type !== undefined && m.type !== "user" && m.type !== "human",
-  );
-
-  if (ourIndex === undefined) {
-    // We can't determine ordering — fall back to "any agent message at all"
-    // rather than mis-declaring readiness on an unrelated older reply. This
-    // is intentionally conservative: pipeline.watch treats "no reply found"
-    // as still-working and reschedules rather than risking a false-ready.
-    return undefined;
+  for (const message of messages) {
+    if (!isAssistantReply(message) || !messageMatchesClient(message, clientId)) continue;
+    if (ourIndex !== undefined && (message.sessionIndex ?? -1) <= ourIndex) continue;
+    if (extractMessageText(message.content).trim().length === 0) continue;
+    if ((message.sessionIndex ?? 0) < (latestReply?.sessionIndex ?? 0)) continue;
+    latestReply = message;
   }
 
-  return [...agentMessages]
-    .filter((m) => (m.sessionIndex ?? -1) > ourIndex)
-    .sort((a, b) => (a.sessionIndex ?? 0) - (b.sessionIndex ?? 0))
-    .pop();
+  // A linked id remains authoritative when a partial response omits the
+  // originating user event. Unlinked text is never accepted.
+  return latestReply;
 }
 
 /** Checks whether our own messageId already appears in the session's messages. */
@@ -162,7 +204,9 @@ function ourMessageAlreadySent(
   messages: ConductorMessage[],
   clientId: string,
 ): boolean {
-  return messages.some((m) => m.id === clientId || m.messageId === clientId);
+  return messages.some(
+    (message) => !isAgentMessage(message) && messageMatchesClient(message, clientId),
+  );
 }
 
 /**

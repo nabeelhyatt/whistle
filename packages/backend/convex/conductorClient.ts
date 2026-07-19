@@ -313,11 +313,9 @@ export async function getSessionStatus(
 /**
  * A message in a session's conversation. `content` is untyped in the
  * Conductor OpenAPI schema (docs/CONDUCTOR-API.md) — parse it defensively.
- * `id`/`messageId` are both accepted since the live API's message-list shape
- * for the client-supplied id is not yet confirmed by a real fixture (U4
- * unknown #4 remains blocked on a working scratch-project agent run); once
- * that fixture exists, only field-name mapping in `extractOurMessageId`
- * below needs to change, not the extraction call sites.
+ * The live API uses generated top-level ids and puts the client-supplied UUID
+ * in the untyped content envelope (`id`/`turnId`/`userMessageId`). Pipeline
+ * helpers therefore inspect both these legacy top-level fields and content.
  */
 export interface ConductorMessage {
   id?: string;
