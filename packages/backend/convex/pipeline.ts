@@ -153,10 +153,27 @@ function messageMatchesClient(message: ConductorMessage, clientId: string): bool
   return messageIdentifiers(message).includes(clientId.toLowerCase());
 }
 
+/** A message is "ours" iff it isn't agent-typed and it's correlated to our clientId. */
+function isOurMessage(message: ConductorMessage, clientId: string): boolean {
+  return !isAgentMessage(message) && messageMatchesClient(message, clientId);
+}
+
 function isAgentMessage(message: ConductorMessage): boolean {
   const type = message.type?.toLowerCase();
   return type !== undefined && type !== "user" && type !== "human" && type !== "usermessage";
 }
+
+/**
+ * Non-reply `rawPayload.type` shapes we know about (Settings only ever
+ * offers Claude/codex/cursor, but every agent shares Conductor's envelope
+ * for lifecycle/system events). Denylist rather than allowlist: allowlisting
+ * only "assistant" (the shape observed in Claude's live fixture) would
+ * silently drift every codex/cursor capture to readyUnverified the moment
+ * their rawPayload.type differs even slightly. Correlation (messageMatchesClient)
+ * and non-empty extracted text remain the real gates below, so accepting an
+ * unrecognized type here is safe.
+ */
+const NON_REPLY_RAW_TYPES = new Set(["system", "result", "user"]);
 
 function isAssistantReply(message: ConductorMessage): boolean {
   if (!isAgentMessage(message)) return false;
@@ -165,7 +182,18 @@ function isAssistantReply(message: ConductorMessage): boolean {
     return true;
   }
   const rawType = (rawPayload as Record<string, unknown>).type;
-  return typeof rawType !== "string" || rawType.toLowerCase() === "assistant";
+  if (typeof rawType !== "string") return true;
+  const normalized = rawType.toLowerCase();
+  if (NON_REPLY_RAW_TYPES.has(normalized)) return false;
+  if (normalized !== "assistant") {
+    // A new/unrecognized agent shape — accept it (correlation + text
+    // extraction are the real gates) but warn so it's visible in the Convex
+    // dashboard logs instead of silently stranding the capture.
+    console.warn(
+      `isAssistantReply: accepting unrecognized rawPayload.type "${rawType}"`,
+    );
+  }
+  return true;
 }
 
 /**
@@ -180,22 +208,22 @@ export function findAgentReplyAfterOurs(
   messages: ConductorMessage[],
   clientId: string,
 ): ConductorMessage | undefined {
-  const ourMessage = messages.find(
-    (message) => !isAgentMessage(message) && messageMatchesClient(message, clientId),
-  );
+  const ourMessage = messages.find((message) => isOurMessage(message, clientId));
   const ourIndex = ourMessage?.sessionIndex;
   let latestReply: ConductorMessage | undefined;
 
   for (const message of messages) {
     if (!isAssistantReply(message) || !messageMatchesClient(message, clientId)) continue;
+    // ourIndex undefined (our own message hasn't been listed yet — e.g.
+    // eventual-consistency delay, or it scrolled out of the page) does NOT
+    // gate here by design: a correlated reply's linked id is authoritative
+    // on its own. Unlinked text is never accepted regardless.
     if (ourIndex !== undefined && (message.sessionIndex ?? -1) <= ourIndex) continue;
     if (extractMessageText(message.content).trim().length === 0) continue;
     if ((message.sessionIndex ?? 0) < (latestReply?.sessionIndex ?? 0)) continue;
     latestReply = message;
   }
 
-  // A linked id remains authoritative when a partial response omits the
-  // originating user event. Unlinked text is never accepted.
   return latestReply;
 }
 
@@ -204,9 +232,7 @@ function ourMessageAlreadySent(
   messages: ConductorMessage[],
   clientId: string,
 ): boolean {
-  return messages.some(
-    (message) => !isAgentMessage(message) && messageMatchesClient(message, clientId),
-  );
+  return messages.some((message) => isOurMessage(message, clientId));
 }
 
 /**
