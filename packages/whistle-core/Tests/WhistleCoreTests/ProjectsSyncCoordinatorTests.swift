@@ -72,6 +72,44 @@ final class ProjectsSyncCoordinatorTests: XCTestCase {
         XCTAssertEqual(try store.projectsSnapshot(), projects)
     }
 
+    func testAuthenticatedLifecycleStopsAndRestartsSubscription() async throws {
+        let (store, tempDir) = try TestSupport.makeStore()
+        self.tempDir = tempDir
+
+        let convex = FakeConvexService()
+        let coordinator = ProjectsSyncCoordinator(store: store, convex: convex)
+
+        await coordinator.setServerUpdatesEnabled(false)
+        XCTAssertEqual(convex.activeProjectsSubscriptionCount, 0)
+
+        await coordinator.setServerUpdatesEnabled(true)
+        try await Whistle_waitUntil(timeout: 1) {
+            convex.activeProjectsSubscriptionCount == 1
+        }
+        await coordinator.setServerUpdatesEnabled(true)
+        XCTAssertEqual(convex.activeProjectsSubscriptionCount, 1)
+
+        await coordinator.setServerUpdatesEnabled(false)
+        try await Whistle_waitUntil(timeout: 1) {
+            convex.activeProjectsSubscriptionCount == 0
+        }
+
+        await coordinator.setServerUpdatesEnabled(true)
+        try await Whistle_waitUntil(timeout: 1) {
+            convex.activeProjectsSubscriptionCount == 1
+        }
+        convex.finishProjectSubscriptions()
+        try await Whistle_waitUntil(timeout: 1) {
+            convex.activeProjectsSubscriptionCount == 0
+        }
+        let restartDeadline = Date().addingTimeInterval(1)
+        while convex.activeProjectsSubscriptionCount == 0, Date() < restartDeadline {
+            await coordinator.setServerUpdatesEnabled(true)
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertEqual(convex.activeProjectsSubscriptionCount, 1)
+    }
+
     // MARK: - Stale-refresh trigger (TECH-SPEC §7)
 
     func testRefreshIfStaleCallsConductorRefreshWhenNoSnapshotExistsYet() async throws {
@@ -86,7 +124,29 @@ final class ProjectsSyncCoordinatorTests: XCTestCase {
         XCTAssertEqual(convex.refreshProjectsCallCount, 1, "a missing snapshot must be treated as stale")
     }
 
-    func testRefreshIfStaleSkipsWhenSnapshotIsFresh() async throws {
+    func testRefreshIfStaleSkipsWhenSnapshotIsFreshAndNonEmpty() async throws {
+        let (store, tempDir) = try TestSupport.makeStore()
+        self.tempDir = tempDir
+        let projects = [Project(id: "proj-1", name: "Project One", gitRemote: "git@example.com:one.git")]
+        try store.saveProjectsSnapshot(projects, fetchedAt: Date())
+
+        let convex = FakeConvexService()
+        let coordinator = ProjectsSyncCoordinator(store: store, convex: convex, staleAfter: 3600)
+
+        await coordinator.refreshIfStale(now: Date())
+
+        XCTAssertEqual(convex.refreshProjectsCallCount, 0, "a non-empty snapshot fetched moments ago must not be re-refreshed")
+    }
+
+    // Regression test for the "new account -> permanently empty project
+    // picker" bug: the `projects.list` subscription persists every yield,
+    // including a legitimate empty first yield for a brand-new account.
+    // That empty-but-fresh snapshot must NOT be treated as "up to date" --
+    // otherwise `refreshIfStale` never calls `conductor.refreshProjects` and
+    // the picker (and capture submission, which needs a real `projectId`)
+    // stays broken for up to an hour, or forever if the panel isn't
+    // reopened after the window elapses.
+    func testRefreshIfStaleCallsConductorRefreshWhenSnapshotIsFreshButEmpty() async throws {
         let (store, tempDir) = try TestSupport.makeStore()
         self.tempDir = tempDir
         try store.saveProjectsSnapshot([], fetchedAt: Date())
@@ -96,21 +156,22 @@ final class ProjectsSyncCoordinatorTests: XCTestCase {
 
         await coordinator.refreshIfStale(now: Date())
 
-        XCTAssertEqual(convex.refreshProjectsCallCount, 0, "a snapshot fetched moments ago must not be re-refreshed")
+        XCTAssertEqual(convex.refreshProjectsCallCount, 1, "an empty snapshot must be treated as stale even when just fetched")
     }
 
     func testRefreshIfStaleTriggersWhenSnapshotIsOlderThanStaleWindow() async throws {
         let (store, tempDir) = try TestSupport.makeStore()
         self.tempDir = tempDir
         let staleFetchedAt = Date().addingTimeInterval(-3700) // just over 1h old
-        try store.saveProjectsSnapshot([], fetchedAt: staleFetchedAt)
+        let projects = [Project(id: "proj-1", name: "Project One", gitRemote: "git@example.com:one.git")]
+        try store.saveProjectsSnapshot(projects, fetchedAt: staleFetchedAt)
 
         let convex = FakeConvexService()
         let coordinator = ProjectsSyncCoordinator(store: store, convex: convex, staleAfter: 3600)
 
         await coordinator.refreshIfStale(now: Date())
 
-        XCTAssertEqual(convex.refreshProjectsCallCount, 1, "a >1h-old snapshot must trigger conductor.refreshProjects")
+        XCTAssertEqual(convex.refreshProjectsCallCount, 1, "a >1h-old snapshot must trigger conductor.refreshProjects even if non-empty")
     }
 }
 

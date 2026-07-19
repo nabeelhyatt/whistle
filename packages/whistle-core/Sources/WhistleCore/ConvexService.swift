@@ -389,7 +389,20 @@ public struct CaptureCreateInput: Equatable, Sendable {
         /// worse, still-live) previous-session attachment instead of pulling
         /// a fresh token via `loginFromCache()`.
         public func detachAuth() async {
-            await client.logout()
+            // `client.logout()` is the one Convex call this file previously
+            // left unwrapped -- a wedged/non-cancellation-aware FFI logout
+            // (the same class of hang `withTimeout` exists to bound; see
+            // below) would await here forever. The reauth path
+            // (`AuthController.signIn()`) calls `detachAuth()` while
+            // `state == .signingIn`, guarded against re-entry, so a hang here
+            // would permanently strand sign-in until an app relaunch. Bound
+            // it like every other Convex call, and ALWAYS reset the gate
+            // afterward regardless of whether logout completed or timed out
+            // -- a stuck logout must not also leave the attach gate latched
+            // to the old session.
+            _ = try? await Self.withTimeout(Self.authedCallTimeout) { [client] in
+                await client.logout()
+            }
             authGate.reset()
         }
 
@@ -549,9 +562,23 @@ public struct CaptureCreateInput: Equatable, Sendable {
             // takes `apiKey`, not `key` — all three had to be fixed together
             // for this call to actually reach and decode correctly.
             let result: ConductorActionResult = try await authedAction(
-                "projects:validateKey", with: ["apiKey": key]
+                "projects:validateKey", with: Self.conductorValidateKeyArgs(key)
             )
             return result.ok
+        }
+
+        /// Builds the `projects:validateKey` argument dict, omitting the
+        /// `apiKey` key entirely when `key` is `nil` rather than including it
+        /// with a `nil` value. The backend validator is `v.optional(v.string())`
+        /// and falls back to the stored key when the arg is absent, but (same
+        /// class of bug as `capturesCreateArgs`/`settingsUpdateArgs` above) a
+        /// nil-valued dict entry always serializes as literal JSON `null`,
+        /// which `v.optional(...)` rejects. Extracted as a pure, `internal`
+        /// static function so this is unit-testable without a live
+        /// `ConvexClient`; see `ConvexArgEncodingTests`.
+        static func conductorValidateKeyArgs(_ key: String?) -> [String: ConvexEncodable?]? {
+            guard let key else { return nil }
+            return ["apiKey": key]
         }
 
         public func conductorRefreshProjects() async throws {
@@ -630,11 +657,35 @@ public struct CaptureCreateInput: Equatable, Sendable {
             // `$integer` (bigint), which Convex rejects with an
             // ArgumentValidationError (observed repeatedly in deployment
             // logs before this was fixed).
-            asyncStream(subscribingTo: "captures:listRecent", args: ["limit": Double(limit)])
+            //
+            // Subscribes yielding the RAW wire shape (`ServerCaptureRecordWire`
+            // — `_id`, ms-epoch float64 dates) rather than `ServerCaptureRecord`
+            // directly: `ServerCaptureRecord`'s synthesized `Codable` expects
+            // `id` and iso8601 dates (a contract `CaptureStore.history_cache`
+            // depends on), so decoding a live Convex document straight into it
+            // threw `keyNotFound` on every payload — the root cause of History
+            // rows getting stuck on "Queued" forever. This wraps the wire
+            // stream in a small mapping `AsyncStream` so callers keep seeing
+            // `[ServerCaptureRecord]`.
+            let wireStream: AsyncStream<[ServerCaptureRecordWire]> = asyncStream(
+                subscribingTo: "captures:listRecent", args: ["limit": Double(limit)]
+            )
+            return AsyncStream { continuation in
+                let mappingTask = Task {
+                    for await wireRecords in wireStream {
+                        continuation.yield(wireRecords.map(\.asRecord))
+                    }
+                    continuation.finish()
+                }
+                continuation.onTermination = { _ in mappingTask.cancel() }
+            }
         }
 
         public func capturesList() async throws -> [ServerCaptureRecord] {
-            try await authedQuery("captures:list")
+            // See `capturesListRecent` above: decodes the raw wire shape,
+            // then maps to the public model.
+            let wireRecords: [ServerCaptureRecordWire] = try await authedQuery("captures:list")
+            return wireRecords.map(\.asRecord)
         }
 
         public func capturesGet(id: String) async throws -> ServerCaptureRecord? {
@@ -642,8 +693,13 @@ public struct CaptureCreateInput: Equatable, Sendable {
             // takes `captureId`, not `id`) — this had to be corrected
             // alongside the call-type fix, since routing this to the right
             // endpoint but with the wrong arg name would still fail with an
-            // ArgumentValidationError.
-            try await authedQuery("captures:get", with: ["captureId": id])
+            // ArgumentValidationError. Also decodes the raw wire shape (see
+            // `capturesListRecent` above) rather than `ServerCaptureRecord`
+            // directly.
+            let wireRecord: ServerCaptureRecordWire? = try await authedQuery(
+                "captures:get", with: ["captureId": id]
+            )
+            return wireRecord?.asRecord
         }
 
         public func capturesRetry(id: String) async throws {

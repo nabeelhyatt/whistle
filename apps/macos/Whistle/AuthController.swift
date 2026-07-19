@@ -167,8 +167,15 @@ public final class AuthController: ObservableObject {
     /// `.signedOut` or `.reauthRequired`.
     public func signIn() async {
         guard state != .signingIn, state != .signedIn else { return }
+        let isReauthentication = state == .reauthRequired
         state = .signingIn
         lastSignInErrorMessage = nil
+        if isReauthentication {
+            // A refresh failure can leave Convex's attachment gate latched
+            // to the expired session. Reset it before the new login so the
+            // next authenticated call must attach the replacement token.
+            await convexService.detachAuth()
+        }
         do {
             try await performInteractiveLogin()
         } catch {

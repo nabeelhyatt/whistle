@@ -28,7 +28,7 @@ import XCTest
 
 private final class FakeHistoryConvexService: ConvexServiceProtocol, @unchecked Sendable {
     private let lock = NSLock()
-    private var continuations: [AsyncStream<[ServerCaptureRecord]>.Continuation] = []
+    private var continuations: [UUID: AsyncStream<[ServerCaptureRecord]>.Continuation] = [:]
 
     private(set) var markOpenedCalls: [String] = []
     private(set) var archiveCalls: [String] = []
@@ -58,9 +58,15 @@ private final class FakeHistoryConvexService: ConvexServiceProtocol, @unchecked 
 
     func capturesListRecent(limit: Int) -> AsyncStream<[ServerCaptureRecord]> {
         AsyncStream { continuation in
+            let id = UUID()
             self.lock.lock()
-            self.continuations.append(continuation)
+            self.continuations[id] = continuation
             self.lock.unlock()
+            continuation.onTermination = { [weak self] _ in
+                self?.lock.lock()
+                self?.continuations.removeValue(forKey: id)
+                self?.lock.unlock()
+            }
         }
     }
 
@@ -109,7 +115,7 @@ private final class FakeHistoryConvexService: ConvexServiceProtocol, @unchecked 
         }
 
         lock.lock()
-        let subs = continuations
+        let subs = Array(continuations.values)
         lock.unlock()
         for continuation in subs {
             continuation.yield(records)
@@ -118,6 +124,18 @@ private final class FakeHistoryConvexService: ConvexServiceProtocol, @unchecked 
         // process this yield before the caller makes assertions.
         await Task.yield()
         try? await Task.sleep(nanoseconds: 2_000_000)
+    }
+
+    var activeSubscriptionCount: Int {
+        lock.lock(); defer { lock.unlock() }
+        return continuations.count
+    }
+
+    func finishSubscriptions() {
+        lock.lock()
+        let subs = Array(continuations.values)
+        lock.unlock()
+        subs.forEach { $0.finish() }
     }
 }
 
@@ -186,6 +204,113 @@ private enum HistoryTestSupport {
 
 @MainActor
 final class NotificationRoutingTests: XCTestCase {
+    func testServerSubscriptionFollowsAuthenticationAndRestartsAfterCompletion() async throws {
+        let (store, tempDir) = try HistoryTestSupport.makeStore()
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let convex = FakeHistoryConvexService()
+        let viewModel = HistoryViewModel(
+            store: store,
+            convex: convex,
+            notificationService: NotificationService(center: FakeUserNotificationCenter()),
+            lastSeenStore: InMemoryLastSeenStatusStore()
+        )
+        try store.saveDraft(CaptureDraft(
+            clientId: "auth-restart",
+            transcript: "queued locally",
+            notes: "",
+            projectId: "proj-1",
+            projectName: "Project One",
+            agent: "claude",
+            localState: .synced
+        ))
+
+        viewModel.start(serverUpdatesEnabled: false)
+        XCTAssertEqual(convex.activeSubscriptionCount, 0)
+
+        viewModel.setServerUpdatesEnabled(true)
+        await HistoryTestSupport.waitUntil { convex.activeSubscriptionCount == 1 }
+        viewModel.setServerUpdatesEnabled(true)
+        XCTAssertEqual(convex.activeSubscriptionCount, 1, "repeated signed-in state must not duplicate subscriptions")
+
+        let ready = HistoryTestSupport.record(clientId: "auth-restart", status: .ready)
+        await convex.yield([ready])
+        await HistoryTestSupport.waitUntil { viewModel.rows.first?.serverRecord?.status == .ready }
+        XCTAssertEqual(viewModel.rows.first?.presentation.chip, "Ready")
+
+        viewModel.setServerUpdatesEnabled(false)
+        await HistoryTestSupport.waitUntil { convex.activeSubscriptionCount == 0 }
+        XCTAssertNil(viewModel.rows.first?.serverRecord)
+        XCTAssertEqual(viewModel.rows.first?.presentation.chip, "Queued")
+
+        viewModel.setServerUpdatesEnabled(true)
+        await HistoryTestSupport.waitUntil { convex.activeSubscriptionCount == 1 }
+        convex.finishSubscriptions()
+        await HistoryTestSupport.waitUntil { convex.activeSubscriptionCount == 0 }
+        let restartDeadline = Date().addingTimeInterval(1)
+        while convex.activeSubscriptionCount == 0, Date() < restartDeadline {
+            viewModel.setServerUpdatesEnabled(true)
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertEqual(convex.activeSubscriptionCount, 1)
+    }
+
+    // Regression coverage for the auth-gate-bypass bug: `HistoryWindow`'s
+    // `.onAppear` used to call `viewModel.start()`, whose default
+    // `serverUpdatesEnabled = true` created an unauthenticated
+    // `captures.listRecent` subscription if History was opened before auth
+    // resolved. That doomed subscription then occupied `serverTask`'s slot,
+    // so the later `.signedIn` transition's `setServerUpdatesEnabled(true)`
+    // no-op'd on `guard serverTask == nil` and History stayed frozen at
+    // "Queued". `ensureStarted()` is the fix: it must start ONLY the local
+    // pending-drafts observation, never the server subscription, and must
+    // never block a subsequent real `setServerUpdatesEnabled(true)`.
+    func testEnsureStartedNeverCreatesAServerSubscriptionAndDoesNotBlockLaterEnable() async throws {
+        let (store, tempDir) = try HistoryTestSupport.makeStore()
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let convex = FakeHistoryConvexService()
+        let viewModel = HistoryViewModel(
+            store: store,
+            convex: convex,
+            notificationService: NotificationService(center: FakeUserNotificationCenter()),
+            lastSeenStore: InMemoryLastSeenStatusStore()
+        )
+        try store.saveDraft(CaptureDraft(
+            clientId: "pre-auth-open",
+            transcript: "queued locally",
+            notes: "",
+            projectId: "proj-1",
+            projectName: "Project One",
+            agent: "claude",
+            localState: .synced
+        ))
+
+        // Simulates opening the History window (onAppear) BEFORE auth has
+        // resolved -- no server subscription should ever be created by this.
+        viewModel.ensureStarted()
+        // A second onAppear (window re-shown) must be a no-op, not a second
+        // pending-drafts Task.
+        viewModel.ensureStarted()
+
+        // Local drafts must still surface -- ensureStarted() is auth-
+        // independent.
+        await HistoryTestSupport.waitUntil { !viewModel.rows.isEmpty }
+        XCTAssertEqual(viewModel.rows.first?.clientId, "pre-auth-open")
+
+        // Give any (incorrect) server subscription a moment to have spun up
+        // before asserting none did.
+        try? await Task.sleep(nanoseconds: 50_000_000)
+        XCTAssertEqual(convex.activeSubscriptionCount, 0, "ensureStarted() must never create an authenticated server subscription")
+
+        // The real auth transition (`.signedIn`) must still be able to
+        // create the server subscription afterward -- proving ensureStarted()
+        // never occupies serverTask's slot.
+        viewModel.setServerUpdatesEnabled(true)
+        await HistoryTestSupport.waitUntil { convex.activeSubscriptionCount == 1 }
+        XCTAssertEqual(convex.activeSubscriptionCount, 1, "a subsequent setServerUpdatesEnabled(true) must not be blocked by ensureStarted()")
+    }
+
     // MARK: Happy: ->ready fires notification with question count; click opens deepLink + marks opened
 
     func testReadyTransitionFiresNotificationWithQuestionCountAndClickOpensDeepLinkAndMarksOpened() async throws {
@@ -202,7 +327,7 @@ final class NotificationRoutingTests: XCTestCase {
         // (so the transition is "observed," not a stale relaunch sighting).
         try store.saveDraft(CaptureDraft(clientId: "client-1", transcript: "t", notes: "", projectId: "proj-1", projectName: "Project One", agent: "claude", localState: .synced))
 
-        viewModel.start()
+        viewModel.start(serverUpdatesEnabled: true)
 
         let readyRecord = HistoryTestSupport.record(
             clientId: "client-1",
@@ -253,7 +378,7 @@ final class NotificationRoutingTests: XCTestCase {
         let viewModel = HistoryViewModel(store: store, convex: convex, notificationService: notificationService, lastSeenStore: InMemoryLastSeenStatusStore())
 
         try store.saveDraft(CaptureDraft(clientId: "client-auth", transcript: "t", notes: "", projectId: "proj-1", projectName: "Project One", agent: "claude", localState: .synced))
-        viewModel.start()
+        viewModel.start(serverUpdatesEnabled: true)
 
         let failedAuthRecord = HistoryTestSupport.record(clientId: "client-auth", status: .failed, errorCode: .auth)
         await convex.yield([failedAuthRecord])
@@ -282,7 +407,7 @@ final class NotificationRoutingTests: XCTestCase {
         let viewModel = HistoryViewModel(store: store, convex: convex, notificationService: notificationService, lastSeenStore: InMemoryLastSeenStatusStore())
 
         try store.saveDraft(CaptureDraft(clientId: "client-fail", transcript: "t", notes: "", projectId: "proj-1", projectName: "Project One", agent: "claude", localState: .synced))
-        viewModel.start()
+        viewModel.start(serverUpdatesEnabled: true)
 
         let failedRecord = HistoryTestSupport.record(clientId: "client-fail", status: .failed, errorCode: .workspaceSetup, error: "workspace could not be created")
         await convex.yield([failedRecord])
@@ -315,7 +440,7 @@ final class NotificationRoutingTests: XCTestCase {
         let viewModel = HistoryViewModel(store: store, convex: convex, notificationService: notificationService, lastSeenStore: InMemoryLastSeenStatusStore())
 
         try store.saveDraft(CaptureDraft(clientId: "client-unverified", transcript: "t", notes: "", projectId: "proj-1", projectName: "Project One", agent: "claude", localState: .synced))
-        viewModel.start()
+        viewModel.start(serverUpdatesEnabled: true)
 
         let record = HistoryTestSupport.record(clientId: "client-unverified", status: .readyUnverified)
         await convex.yield([record])
@@ -343,7 +468,7 @@ final class NotificationRoutingTests: XCTestCase {
         // queue was already drained/cleared).
         let lastSeen = InMemoryLastSeenStatusStore(initial: ["client-relaunch": .ready])
         let viewModel = HistoryViewModel(store: store, convex: convex, notificationService: notificationService, lastSeenStore: lastSeen)
-        viewModel.start()
+        viewModel.start(serverUpdatesEnabled: true)
 
         let record = HistoryTestSupport.record(clientId: "client-relaunch", status: .ready)
         await convex.yield([record])
@@ -368,7 +493,7 @@ final class NotificationRoutingTests: XCTestCase {
         let notificationService = NotificationService(center: fakeCenter)
         let lastSeen = InMemoryLastSeenStatusStore(initial: ["client-progress": .agentWorking])
         let viewModel = HistoryViewModel(store: store, convex: convex, notificationService: notificationService, lastSeenStore: lastSeen)
-        viewModel.start()
+        viewModel.start(serverUpdatesEnabled: true)
 
         let record = HistoryTestSupport.record(clientId: "client-progress", status: .ready)
         await convex.yield([record])
@@ -395,7 +520,7 @@ final class NotificationRoutingTests: XCTestCase {
         let fakeCenter = FakeUserNotificationCenter()
         let notificationService = NotificationService(center: fakeCenter)
         let viewModel = HistoryViewModel(store: store, convex: convex, notificationService: notificationService, lastSeenStore: InMemoryLastSeenStatusStore())
-        viewModel.start()
+        viewModel.start(serverUpdatesEnabled: true)
 
         let record = HistoryTestSupport.record(clientId: "client-brand-new", status: .ready)
         await convex.yield([record])
@@ -416,7 +541,7 @@ final class NotificationRoutingTests: XCTestCase {
 
         try store.saveDraft(CaptureDraft(clientId: "client-syncfail", transcript: "t", notes: "", projectId: "proj-1", projectName: "Project One", agent: "claude", localState: .syncFailed, localError: "network down"))
 
-        viewModel.start()
+        viewModel.start(serverUpdatesEnabled: true)
         await HistoryTestSupport.waitUntil { !viewModel.rows.isEmpty }
 
         let row = try XCTUnwrap(viewModel.rows.first { $0.clientId == "client-syncfail" })
@@ -439,7 +564,7 @@ final class NotificationRoutingTests: XCTestCase {
 
         try store.saveDraft(CaptureDraft(clientId: "client-localretry", transcript: "t", notes: "", projectId: "proj-1", projectName: "Project One", agent: "claude", localState: .syncFailed, localError: "network down"))
 
-        viewModel.start()
+        viewModel.start(serverUpdatesEnabled: true)
         await HistoryTestSupport.waitUntil { !viewModel.rows.isEmpty }
 
         let row = try XCTUnwrap(viewModel.rows.first { $0.clientId == "client-localretry" })
@@ -460,7 +585,7 @@ final class NotificationRoutingTests: XCTestCase {
         let convex = FakeHistoryConvexService()
         let notificationService = NotificationService(center: FakeUserNotificationCenter())
         let viewModel = HistoryViewModel(store: store, convex: convex, notificationService: notificationService, lastSeenStore: InMemoryLastSeenStatusStore())
-        viewModel.start()
+        viewModel.start(serverUpdatesEnabled: true)
 
         let record = HistoryTestSupport.record(clientId: "client-serverfail", status: .failed, errorCode: .workspaceSetup, error: "boom")
         await convex.yield([record])
@@ -481,7 +606,7 @@ final class NotificationRoutingTests: XCTestCase {
         let convex = FakeHistoryConvexService()
         let notificationService = NotificationService(center: FakeUserNotificationCenter())
         let viewModel = HistoryViewModel(store: store, convex: convex, notificationService: notificationService, lastSeenStore: InMemoryLastSeenStatusStore())
-        viewModel.start()
+        viewModel.start(serverUpdatesEnabled: true)
 
         let record = HistoryTestSupport.record(clientId: "client-open", status: .ready)
         await convex.yield([record])
@@ -526,7 +651,7 @@ final class NotificationRoutingTests: XCTestCase {
         let convex = FakeHistoryConvexService()
         let notificationService = NotificationService(center: FakeUserNotificationCenter())
         let viewModel = HistoryViewModel(store: store, convex: convex, notificationService: notificationService, lastSeenStore: InMemoryLastSeenStatusStore())
-        viewModel.start()
+        viewModel.start(serverUpdatesEnabled: true)
 
         let record = HistoryTestSupport.record(clientId: "client-archive", status: .ready)
         await convex.yield([record])
@@ -562,7 +687,7 @@ final class NotificationRoutingTests: XCTestCase {
         let convex = FakeHistoryConvexService()
         let notificationService = NotificationService(center: FakeUserNotificationCenter())
         let viewModel = HistoryViewModel(store: store, convex: convex, notificationService: notificationService, lastSeenStore: InMemoryLastSeenStatusStore())
-        viewModel.start()
+        viewModel.start(serverUpdatesEnabled: true)
 
         let record = HistoryTestSupport.record(clientId: "client-dup", transcript: "original transcript", notes: "original notes", status: .ready)
         await convex.yield([record])
@@ -596,7 +721,7 @@ final class NotificationRoutingTests: XCTestCase {
         let convex = FakeHistoryConvexService()
         let notificationService = NotificationService(center: FakeUserNotificationCenter())
         let viewModel = HistoryViewModel(store: store, convex: convex, notificationService: notificationService, lastSeenStore: InMemoryLastSeenStatusStore())
-        viewModel.start()
+        viewModel.start(serverUpdatesEnabled: true)
 
         // Nothing yet.
         await convex.yield([])
@@ -623,7 +748,7 @@ final class NotificationRoutingTests: XCTestCase {
         let convex = FakeHistoryConvexService()
         let notificationService = NotificationService(center: FakeUserNotificationCenter())
         let viewModel = HistoryViewModel(store: store, convex: convex, notificationService: notificationService, lastSeenStore: InMemoryLastSeenStatusStore())
-        viewModel.start()
+        viewModel.start(serverUpdatesEnabled: true)
 
         let readyOpened = HistoryTestSupport.record(clientId: "client-opened-already", status: .ready, openedAt: Date())
         await convex.yield([readyOpened])
@@ -641,7 +766,7 @@ final class NotificationRoutingTests: XCTestCase {
         let convex = FakeHistoryConvexService()
         let notificationService = NotificationService(center: FakeUserNotificationCenter())
         let viewModel = HistoryViewModel(store: store, convex: convex, notificationService: notificationService, lastSeenStore: InMemoryLastSeenStatusStore())
-        viewModel.start()
+        viewModel.start(serverUpdatesEnabled: true)
 
         let recordA = ServerCaptureRecord(
             id: "rec-a", userId: "user-1", clientId: "client-a",
@@ -681,7 +806,7 @@ final class NotificationRoutingTests: XCTestCase {
         let fakeCenter = FakeUserNotificationCenter()
         let notificationService = NotificationService(center: fakeCenter)
         let viewModel = HistoryViewModel(store: store, convex: convex, notificationService: notificationService, lastSeenStore: InMemoryLastSeenStatusStore())
-        viewModel.start()
+        viewModel.start(serverUpdatesEnabled: true)
 
         let record = HistoryTestSupport.record(
             clientId: "client-usermessage",
@@ -695,4 +820,3 @@ final class NotificationRoutingTests: XCTestCase {
         XCTAssertEqual(fakeCenter.posted[0].body, "Conductor is temporarily unreachable — please retry shortly.")
     }
 }
-

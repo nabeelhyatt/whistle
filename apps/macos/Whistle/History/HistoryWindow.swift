@@ -143,6 +143,7 @@ public final class HistoryViewModel: ObservableObject {
     private var latestDrafts: [CaptureDraft] = []
     private var serverTask: Task<Void, Never>?
     private var pendingTask: Task<Void, Never>?
+    private var serverSubscriptionGeneration = 0
 
     public init(
         store: CaptureStore,
@@ -163,27 +164,73 @@ public final class HistoryViewModel: ObservableObject {
         pendingTask?.cancel()
     }
 
-    /// Starts the two subscriptions (server + local pending queue). Safe to
-    /// call once; re-entrant calls are ignored (idempotent start).
-    public func start() {
-        guard serverTask == nil else { return }
+    /// Starts the local pending queue observation. This is deliberately
+    /// auth-independent so offline/signed-out drafts remain visible. The
+    /// authenticated server subscription is controlled separately by
+    /// `setServerUpdatesEnabled(_:)` as auth state changes. Callers MUST pass
+    /// `serverUpdatesEnabled` explicitly (no default) -- see `ensureStarted()`
+    /// for the auth-agnostic path used by the SwiftUI view's `onAppear`.
+    public func start(serverUpdatesEnabled: Bool) {
+        ensureStarted()
+        setServerUpdatesEnabled(serverUpdatesEnabled)
+    }
 
-        serverTask = Task { [weak self] in
-            guard let self else { return }
-            for await records in self.convex.capturesListRecent(limit: self.listRecentLimit) {
-                await MainActor.run {
-                    self.handleServerRecords(records)
-                }
-            }
-        }
-
-        pendingTask = Task { [weak self] in
-            guard let self else { return }
-            for await drafts in self.store.pendingCapturesUpdates() {
-                await MainActor.run {
+    /// Starts ONLY the local pending-drafts observation, never touching the
+    /// authenticated server subscription. Safe to call at any point in the
+    /// auth lifecycle -- including before `AuthController.resolveInitialState()`
+    /// resolves -- because it never calls `setServerUpdatesEnabled(_:)`.
+    ///
+    /// This exists because the SwiftUI view's `.onAppear` used to call
+    /// `start()`, whose default `serverUpdatesEnabled = true` created an
+    /// unauthenticated `captures.listRecent` subscription if History was
+    /// opened before auth resolved. That doomed subscription occupied
+    /// `serverTask`'s slot, so the later `.signedIn` transition's
+    /// `setServerUpdatesEnabled(true)` no-op'd on `guard serverTask == nil`
+    /// -- once the unauthenticated stream died, History stayed frozen at
+    /// "Queued" until the next auth transition. `onAppear` now calls this
+    /// instead, and the app's auth-state driver (`WhistleApp`) is the only
+    /// caller of `setServerUpdatesEnabled(_:)` for the server side.
+    ///
+    /// Idempotent (safe to call from `onAppear` every time the window
+    /// reappears): `pendingTask == nil` guards against starting a second
+    /// observation Task.
+    public func ensureStarted() {
+        if pendingTask == nil {
+            pendingTask = Task { [weak self] in
+                guard let self else { return }
+                for await drafts in self.store.pendingCapturesUpdates() {
                     self.latestDrafts = drafts
                     self.rebuildRows()
                 }
+            }
+        }
+    }
+
+    /// Starts or stops the authenticated `captures.listRecent`
+    /// subscription. A completed/failed stream clears its task slot, so a
+    /// later sign-in can always create a fresh subscription; the generation
+    /// guard prevents an older cancelled task from clearing a newer one.
+    public func setServerUpdatesEnabled(_ enabled: Bool) {
+        if !enabled {
+            serverSubscriptionGeneration += 1
+            serverTask?.cancel()
+            serverTask = nil
+            latestServerRecords = []
+            rebuildRows()
+            return
+        }
+
+        guard serverTask == nil else { return }
+        serverSubscriptionGeneration += 1
+        let generation = serverSubscriptionGeneration
+        serverTask = Task { [weak self] in
+            guard let self else { return }
+            for await records in self.convex.capturesListRecent(limit: self.listRecentLimit) {
+                guard !Task.isCancelled else { break }
+                self.handleServerRecords(records)
+            }
+            if self.serverSubscriptionGeneration == generation {
+                self.serverTask = nil
             }
         }
     }
@@ -376,7 +423,7 @@ struct HistoryWindow: View {
             }
         }
         .frame(minWidth: 480, minHeight: 420)
-        .onAppear { viewModel.start() }
+        .onAppear { viewModel.ensureStarted() }
     }
 
     private var searchBar: some View {

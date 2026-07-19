@@ -16,11 +16,16 @@
 // shows projects, the capture panel's picker says "No projects".
 //
 // `ProjectsSyncCoordinator` is the missing piece: a single, app-wide
-// `projects.list` subscription (started once at launch, independent of any
-// window being open) whose every yield is persisted into
-// `CaptureStore.projects_snapshot`, plus the stale-refresh trigger
-// (`conductor.refreshProjects`, TECH-SPEC §7: "called when stale (>1h) or
-// on picker open").
+// `projects.list` subscription, independent of any window being open, whose
+// every yield is persisted into `CaptureStore.projects_snapshot`, plus the
+// stale-refresh trigger (`conductor.refreshProjects`, TECH-SPEC §7: "called
+// when stale (>1h) or on picker open"). Production no longer calls `start()`
+// once at launch and forgets about it -- `WhistleApp` drives
+// `setServerUpdatesEnabled(_:)` from auth-state transitions (signed in ->
+// subscribe, signed out -> cancel), the same gated-subscription shape as
+// `HistoryViewModel`'s server subscription. `start()` remains as a thin
+// convenience for tests/direct callers that just want the subscription on
+// unconditionally.
 
 import Foundation
 
@@ -32,6 +37,7 @@ public actor ProjectsSyncCoordinator {
     private let staleAfter: TimeInterval
 
     private var subscriptionTask: Task<Void, Never>?
+    private var subscriptionGeneration = 0
 
     public init(
         store: CaptureStore,
@@ -47,29 +53,72 @@ public actor ProjectsSyncCoordinator {
         subscriptionTask?.cancel()
     }
 
-    /// Subscribes to `projects.list` and persists every yield into
-    /// `CaptureStore.projects_snapshot`. Idempotent (safe to call once at
-    /// app launch and never worry about it again) -- a re-entrant call is a
-    /// no-op while the subscription is already running.
+    /// Unconditionally enables the `projects.list` subscription -- equivalent
+    /// to `setServerUpdatesEnabled(true)`. Idempotent (a re-entrant call is a
+    /// no-op while the subscription is already running). Production does NOT
+    /// call this once at launch: `WhistleApp` drives `setServerUpdatesEnabled(_:)`
+    /// directly from auth-state transitions instead, so the subscription
+    /// tracks sign-in/sign-out rather than running unauthenticated. `start()`
+    /// remains for tests and any direct caller that wants the subscription on
+    /// unconditionally, without wiring up auth-state observation.
     public func start() {
+        setServerUpdatesEnabled(true)
+    }
+
+    /// Owns the authenticated projects subscription across auth changes.
+    /// Signing out cancels and clears it; signing in creates a fresh stream.
+    /// If the stream fails naturally, its slot is cleared so a later auth
+    /// transition can restart it rather than retaining a dead task forever.
+    public func setServerUpdatesEnabled(_ enabled: Bool) {
+        if !enabled {
+            subscriptionGeneration += 1
+            subscriptionTask?.cancel()
+            subscriptionTask = nil
+            return
+        }
+
         guard subscriptionTask == nil else { return }
-        subscriptionTask = Task { [store, convex] in
+        subscriptionGeneration += 1
+        let generation = subscriptionGeneration
+        subscriptionTask = Task { [weak self, store, convex] in
             for await projects in convex.projectsList() {
+                guard !Task.isCancelled else { break }
                 try? store.saveProjectsSnapshot(projects)
             }
+            await self?.subscriptionDidEnd(generation: generation)
+        }
+    }
+
+    private func subscriptionDidEnd(generation: Int) {
+        if subscriptionGeneration == generation {
+            subscriptionTask = nil
         }
     }
 
     /// Triggers a server-side `conductor.refreshProjects` if the local
-    /// snapshot is missing or older than `staleAfter` (default 1h) --
+    /// snapshot is missing, empty, or older than `staleAfter` (default 1h) --
     /// TECH-SPEC §7: "called when stale (>1h) or on picker open." Callers
     /// (`CaptureViewModel.beginCapture()`/`resumeDraft()`, via
     /// `CapturePanelController`) call this every time the capture panel
-    /// opens; a fresh snapshot is a cheap no-op.
+    /// opens; a fresh, non-empty snapshot is a cheap no-op.
+    ///
+    /// An empty snapshot is always treated as stale regardless of
+    /// `fetchedAt`: the `projects.list` subscription in
+    /// `setServerUpdatesEnabled(true)` persists *every* yield, including a
+    /// legitimate empty first yield for a brand-new account whose server
+    /// `projectsCache` has no row yet. Without this check, that empty yield
+    /// looks "fresh" for the next hour and this method would never call
+    /// `conductor.refreshProjects` -- leaving the capture panel's project
+    /// picker permanently empty and captures submitting with `projectId: ""`.
     public func refreshIfStale(now: Date = Date()) async {
         let fetchedAt = try? store.projectsSnapshotFetchedAt()
-        let isStale = fetchedAt.map { now.timeIntervalSince($0) > staleAfter } ?? true
+        let isEmpty = ((try? store.projectsSnapshot()) ?? []).isEmpty
+        let isStale = isEmpty || (fetchedAt.map { now.timeIntervalSince($0) > staleAfter } ?? true)
         guard isStale else { return }
-        try? await convex.conductorRefreshProjects()
+        do {
+            try await convex.conductorRefreshProjects()
+        } catch {
+            NSLog("Whistle: ProjectsSyncCoordinator conductor.refreshProjects failed: %@", String(describing: error))
+        }
     }
 }

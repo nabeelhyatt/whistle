@@ -21,10 +21,14 @@ private final class FakeConvexService: ConvexServiceProtocol, @unchecked Sendabl
     private let lock = NSLock()
     private(set) var usersEnsureCallCount = 0
     private(set) var detachAuthCallCount = 0
+    private(set) var authCalls: [String] = []
     var usersEnsureError: Error?
 
     func usersEnsure() async throws -> String {
-        lock.lock(); usersEnsureCallCount += 1; lock.unlock()
+        lock.withLock {
+            usersEnsureCallCount += 1
+            authCalls.append("ensure")
+        }
         if let usersEnsureError { throw usersEnsureError }
         return "user-1"
     }
@@ -33,7 +37,10 @@ private final class FakeConvexService: ConvexServiceProtocol, @unchecked Sendabl
     // signOut()'s wiring is assertable -- see testSignOutDetachesConvexAndLogsOutProvider)
 
     func detachAuth() async {
-        lock.lock(); detachAuthCallCount += 1; lock.unlock()
+        lock.withLock {
+            detachAuthCallCount += 1
+            authCalls.append("detach")
+        }
     }
 
     // MARK: settings (unused by AuthController; trivial stubs)
@@ -128,6 +135,7 @@ final class AuthControllerTests: XCTestCase {
         XCTAssertEqual(controller.state, .signedIn)
         XCTAssertEqual(controller.usersEnsureCallCount, 1)
         XCTAssertEqual(convex.usersEnsureCallCount, 1)
+        XCTAssertEqual(convex.detachAuthCallCount, 0, "an initial sign-in has no stale attachment to reset")
         XCTAssertTrue(breadcrumb.hasSignedInBefore())
     }
 
@@ -167,6 +175,20 @@ final class AuthControllerTests: XCTestCase {
         controller.handleTokenRefreshFailure()
 
         XCTAssertEqual(controller.state, .reauthRequired)
+    }
+
+    func testReauthenticationDetachesStaleConvexAuthBeforeEnsuringUser() async {
+        let mockAuth = MockAuthProvider(fixedToken: "mock-id-token")
+        let convex = FakeConvexService()
+        let controller = AuthController(authProvider: mockAuth, convexService: convex)
+
+        await controller.signIn()
+        controller.handleTokenRefreshFailure()
+        await controller.signIn()
+
+        XCTAssertEqual(controller.state, .signedIn)
+        XCTAssertEqual(convex.detachAuthCallCount, 1)
+        XCTAssertEqual(convex.authCalls, ["ensure", "detach", "ensure"])
     }
 
     func testResolveInitialStateWithNoTokenAndNoPriorSignInIsSignedOut() async {
