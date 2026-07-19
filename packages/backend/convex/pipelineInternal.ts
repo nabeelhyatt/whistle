@@ -7,6 +7,7 @@
 import { v } from "convex/values";
 import { internalMutation, internalQuery } from "./_generated/server";
 import type { Id } from "./_generated/dataModel";
+import { defaultTemplate } from "./defaultTemplate";
 
 export const getCaptureInternal = internalQuery({
   args: { captureId: v.id("captures") },
@@ -34,7 +35,9 @@ export const getTemplateInternal = internalQuery({
       .unique();
     if (row !== null) return row.body;
     // Mirrors templates.get's lazy-seeding behavior (no row yet -> default).
-    const { defaultTemplate } = await import("./defaultTemplate");
+    // Must be a static import: Convex's production runtime does not support
+    // dynamic module imports, unlike the vitest environment (see regression
+    // test in __tests__/pipelineInternal.test.ts).
     return defaultTemplate;
   },
 });
