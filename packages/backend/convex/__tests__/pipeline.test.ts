@@ -171,7 +171,18 @@ class MockConductor {
         if (r) return json(r.status, r.body);
       }
       const existing = this.messagesBySession.get(sessionId) ?? [];
-      const alreadyPresent = existing.some((mm) => mm.id === body.messageId);
+      const lowerClientId = String(body.messageId).toLowerCase();
+      // Default behavior mirrors the LIVE message-list shape (see
+      // fixtures/conductor-messages-live.json), not the legacy invented one
+      // — a generated top-level id distinct from clientId, `type:
+      // "userMessage"`, with the correlation id nested (and lowercased)
+      // under `content`. This is what every integration test exercises
+      // unless it explicitly overrides messagesBySession for a legacy-shape
+      // scenario.
+      const alreadyPresent = existing.some((mm) => {
+        const c = mm.content as Record<string, unknown> | undefined;
+        return typeof c?.id === "string" && c.id === lowerClientId;
+      });
       if (alreadyPresent) {
         // Default behavior mirrors the live API (U4 unknown #6): duplicate
         // messageId send hard-fails with a 500 Postgres unique-violation.
@@ -182,10 +193,14 @@ class MockConductor {
         });
       }
       existing.push({
-        id: body.messageId,
+        id: `${sessionId}:${existing.length + 1}:0`,
         sessionIndex: existing.length,
-        type: "user",
-        content: body.message,
+        type: "userMessage",
+        content: {
+          id: lowerClientId,
+          turnId: lowerClientId,
+          text: body.message,
+        },
       });
       this.messagesBySession.set(sessionId, existing);
       return json(201, { messageId: body.messageId, state: "sent" });
@@ -446,6 +461,77 @@ describe("findAgentReplyAfterOurs", () => {
     ];
 
     expect(findAgentReplyAfterOurs(messages, "our-id")?.id).toBe("assistant");
+  });
+
+  test("accepts an unrecognized rawPayload.type (e.g. a non-Claude agent shape) with real text, and warns", () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const messages = [
+      { id: "our-id", sessionIndex: 0, type: "user", content: "hi" },
+      {
+        id: "codex-reply",
+        sessionIndex: 1,
+        type: "agent",
+        content: {
+          userMessageId: "our-id",
+          rawPayload: { type: "codex_message", text: "codex says hi" },
+        },
+      },
+    ];
+
+    expect(findAgentReplyAfterOurs(messages, "our-id")?.id).toBe("codex-reply");
+    expect(warnSpy).toHaveBeenCalledTimes(1);
+    expect(String(warnSpy.mock.calls[0][0])).toContain("codex_message");
+    warnSpy.mockRestore();
+  });
+
+  test('rejects rawPayload.type "result" the same as "system"', () => {
+    const messages = [
+      { id: "our-id", sessionIndex: 0, type: "user", content: "hi" },
+      {
+        id: "result-msg",
+        sessionIndex: 1,
+        type: "agent",
+        content: {
+          userMessageId: "our-id",
+          rawPayload: { type: "result", text: "final result summary" },
+        },
+      },
+    ];
+
+    expect(findAgentReplyAfterOurs(messages, "our-id")).toBeUndefined();
+  });
+
+  test('rejects rawPayload.type "user" (an echoed user event nested in an agent-typed wrapper)', () => {
+    const messages = [
+      { id: "our-id", sessionIndex: 0, type: "user", content: "hi" },
+      {
+        id: "echoed-user",
+        sessionIndex: 1,
+        type: "agent",
+        content: {
+          userMessageId: "our-id",
+          rawPayload: { type: "user", text: "hi" },
+        },
+      },
+    ];
+
+    expect(findAgentReplyAfterOurs(messages, "our-id")).toBeUndefined();
+  });
+
+  test("accepts a correlated reply even when our own message is absent from the list (pipeline.ts:191)", () => {
+    // Only the correlated assistant reply is present — the originating user
+    // event was never listed (e.g. eventual consistency delay). The linked
+    // id must remain authoritative on its own.
+    const messages = [
+      {
+        id: "lone-reply",
+        sessionIndex: 5,
+        type: "agent",
+        content: { userMessageId: "our-id", text: "reply with no listed user event" },
+      },
+    ];
+
+    expect(findAgentReplyAfterOurs(messages, "our-id")?.id).toBe("lone-reply");
   });
 });
 
@@ -1172,6 +1258,87 @@ describe("finding 3: queued-send-then-empty-message-list -> no duplicate send af
     await t.run(async (ctx) => ctx.db.patch(captureId, { status: "sending" }));
     await t.action(internal.pipeline.submit, { captureId });
 
+    capture = await asUser.query(api.captures.get, { captureId });
+    expect(capture?.status).toBe("agentWorking");
+  });
+});
+
+describe("finding 3 (pipeline.ts:191): correlated reply accepted with no listed originating user event", () => {
+  test("messages list containing only the correlated assistant reply is still accepted -> ready", async () => {
+    const t = convexTest(schema, modules);
+    const clientId = "Client-OnlyReply-ABC123";
+    const { asUser, captureId } = await setupUserWithCapture(
+      t,
+      "auth0|pipeline-onlyreply",
+      { clientId },
+    );
+
+    await tick(t);
+    let capture = await asUser.query(api.captures.get, { captureId });
+    const sessionId = capture!.sessionId!;
+    mock.sessions.get(sessionId)!.status = "idle";
+
+    // Simulate eventual consistency: our own outbound message never appears
+    // in the list (it may still be in flight server-side), but the
+    // correlated agent reply is already listed. The linked id (lowercased,
+    // per the live shape) is authoritative on its own — see the comment on
+    // pipeline.ts's findAgentReplyAfterOurs.
+    mock.messagesBySession.set(sessionId, [
+      {
+        id: "session-id:2:0",
+        sessionIndex: 5,
+        type: "agent",
+        content: {
+          userMessageId: clientId.toLowerCase(),
+          text: "Reply with no listed originating user event.",
+        },
+      },
+    ]);
+
+    await tick(t, 30_000);
+
+    capture = await asUser.query(api.captures.get, { captureId });
+    expect(capture?.status).toBe("ready");
+    expect(capture?.agentSummary).toBe(
+      "Reply with no listed originating user event.",
+    );
+  });
+});
+
+describe("legacy message shape (pre-PR14 invented shape) is still supported", () => {
+  test("top-level id + plain string content is still recognized by the dedupe guard", async () => {
+    const t = convexTest(schema, modules);
+    const { asUser, captureId } = await setupUserWithCapture(
+      t,
+      "auth0|pipeline-legacy-shape",
+      { clientId: "client-legacy" },
+    );
+
+    await tick(t);
+    let capture = await asUser.query(api.captures.get, { captureId });
+    expect(capture?.status).toBe("agentWorking");
+    expect(mock.sendMessageCalls).toHaveLength(1);
+
+    const sessionId = capture!.sessionId!;
+    // Simulate a pre-PR14 (legacy) list response: our own message recorded
+    // with a top-level `id` equal to the clientId and `content` as a plain
+    // string, rather than the live nested-id shape. The parser must
+    // continue to support this for backward compatibility.
+    mock.messagesBySession.set(sessionId, [
+      {
+        id: "client-legacy",
+        sessionIndex: 0,
+        type: "user",
+        content: "add dark mode toggle",
+      },
+    ]);
+
+    await t.run(async (ctx) => ctx.db.patch(captureId, { status: "sending" }));
+    await t.action(internal.pipeline.submit, { captureId });
+
+    // Dedupe guard recognized the legacy-shaped message via top-level id ->
+    // no second send attempted.
+    expect(mock.sendMessageCalls).toHaveLength(1);
     capture = await asUser.query(api.captures.get, { captureId });
     expect(capture?.status).toBe("agentWorking");
   });
