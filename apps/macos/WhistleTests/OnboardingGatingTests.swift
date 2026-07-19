@@ -52,6 +52,13 @@ private final class FakeOnboardingConvexService: ConvexServiceProtocol, @uncheck
 
     func usersEnsure() async throws -> String { "user-1" }
 
+    var usersMeResult = UserSelfSnapshot(email: "nabeel@sparkcapital.com", authSubject: "auth0|july9")
+    private(set) var usersMeCallCount = 0
+    func usersMe() async throws -> UserSelfSnapshot {
+        lock.lock(); usersMeCallCount += 1; lock.unlock()
+        return usersMeResult
+    }
+
     // MARK: settings
 
     func settingsGet() async throws -> SettingsSnapshot {
@@ -713,6 +720,63 @@ final class SettingsViewModelTests: XCTestCase {
 
         try await Whistle_waitUntil { viewModel.authState == .signedIn }
         XCTAssertEqual(viewModel.authState, .signedIn)
+    }
+
+    // MARK: Account identity display (canonical-accounts plan §4)
+
+    func testSignedInIdentityShowsEmailAndConnectionLabelFromUsersMe() async throws {
+        let convex = FakeOnboardingConvexService()
+        convex.usersMeResult = UserSelfSnapshot(email: "nabeel@sparkcapital.com", authSubject: "auth0|july9")
+        let (viewModel, _, auth) = makeViewModel(convex: convex)
+        await auth.signIn()
+        await viewModel.load()
+
+        XCTAssertEqual(viewModel.signedInDisplayName, "nabeel@sparkcapital.com")
+        XCTAssertEqual(viewModel.signedInConnectionLabel, "Email & password")
+        XCTAssertEqual(convex.usersMeCallCount, 1)
+    }
+
+    func testSignedInIdentityFallsBackToAuthSubjectWhenEmailAbsent() async throws {
+        let convex = FakeOnboardingConvexService()
+        convex.usersMeResult = UserSelfSnapshot(
+            email: nil, authSubject: "github|12345678"
+        )
+        let (viewModel, _, auth) = makeViewModel(convex: convex)
+        await auth.signIn()
+        await viewModel.load()
+
+        XCTAssertEqual(viewModel.signedInDisplayName, "github|12345678")
+        XCTAssertEqual(viewModel.signedInConnectionLabel, "GitHub")
+    }
+
+    func testConnectionLabelMapsKnownPrefixesAndFallsBackToRawPrefix() async throws {
+        let convex = FakeOnboardingConvexService()
+        let (viewModel, _, auth) = makeViewModel(convex: convex)
+        await auth.signIn()
+
+        convex.usersMeResult = UserSelfSnapshot(email: "a@b.com", authSubject: "google-oauth2|999")
+        await viewModel.load()
+        XCTAssertEqual(viewModel.signedInConnectionLabel, "Google")
+
+        convex.usersMeResult = UserSelfSnapshot(email: "a@b.com", authSubject: "some-other-idp|999")
+        await viewModel.load()
+        XCTAssertEqual(viewModel.signedInConnectionLabel, "some-other-idp")
+    }
+
+    func testDevSignInSkipsIdentityLookupAndLeavesFieldsEmpty() async throws {
+        let convex = FakeOnboardingConvexService()
+        let auth = AuthController(
+            authProvider: MockAuthProvider(),
+            convexService: convex,
+            breadcrumbStore: InMemoryAuthBreadcrumbStore(),
+            isDevSignIn: true
+        )
+        let viewModel = SettingsViewModel(convex: convex, auth: auth)
+        await auth.signIn()
+        await viewModel.load()
+
+        XCTAssertEqual(convex.usersMeCallCount, 0, "dev sign-in never calls users:me")
+        XCTAssertEqual(viewModel.signedInDisplayName, "")
     }
 }
 

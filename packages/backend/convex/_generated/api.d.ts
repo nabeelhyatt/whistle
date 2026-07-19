@@ -8,6 +8,7 @@
  * @module
  */
 
+import type * as admin from "../admin.js";
 import type * as captures from "../captures.js";
 import type * as conductorClient from "../conductorClient.js";
 import type * as defaultTemplate from "../defaultTemplate.js";
@@ -28,6 +29,7 @@ import type {
 } from "convex/server";
 
 declare const fullApi: ApiFromModules<{
+  admin: typeof admin;
   captures: typeof captures;
   conductorClient: typeof conductorClient;
   defaultTemplate: typeof defaultTemplate;

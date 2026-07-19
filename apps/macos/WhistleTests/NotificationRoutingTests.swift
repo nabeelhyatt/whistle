@@ -37,6 +37,9 @@ private final class FakeHistoryConvexService: ConvexServiceProtocol, @unchecked 
     // MARK: users / settings / conductor / templates / files (unused stubs)
 
     func usersEnsure() async throws -> String { "user-1" }
+    func usersMe() async throws -> UserSelfSnapshot {
+        UserSelfSnapshot(email: "fake@example.com", authSubject: "auth0|fake-user-1")
+    }
     func settingsGet() async throws -> SettingsSnapshot {
         SettingsSnapshot(defaultProjectId: nil, agent: "claude", model: nil, screenshotsEnabled: true, hasKey: false, lastFour: nil)
     }

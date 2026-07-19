@@ -42,6 +42,9 @@ final class FakeConvexService: ConvexServiceProtocol, @unchecked Sendable {
 
     func usersEnsure() async throws -> String { "user-1" }
 
+    var usersMeResult = UserSelfSnapshot(email: "fake@example.com", authSubject: "auth0|fake-user-1")
+    func usersMe() async throws -> UserSelfSnapshot { usersMeResult }
+
     // MARK: settings
 
     var settingsSnapshot = SettingsSnapshot(
