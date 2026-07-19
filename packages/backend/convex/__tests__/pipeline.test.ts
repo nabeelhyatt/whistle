@@ -2,6 +2,7 @@ import { convexTest } from "convex-test";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { api, internal } from "../_generated/api";
 import schema from "../schema";
+import liveMessagesFixture from "./fixtures/conductor-messages-live.json";
 import {
   buildWorkspaceName,
   extractMessageText,
@@ -333,6 +334,16 @@ describe("extractMessageText", () => {
   test("array of content blocks", () => {
     expect(extractMessageText([{ text: "a" }, { text: "b" }])).toBe("a\nb");
   });
+  test("live Conductor rawPayload assistant envelope", () => {
+    expect(extractMessageText({
+      rawPayload: {
+        type: "assistant",
+        message: {
+          content: [{ type: "text", text: "from live envelope" }],
+        },
+      },
+    })).toBe("from live envelope");
+  });
   test("unrecognized shape degrades to empty string", () => {
     expect(extractMessageText({ weird: 123 })).toBe("");
   });
@@ -367,7 +378,12 @@ describe("findAgentReplyAfterOurs", () => {
   test("finds an agent message after our sessionIndex", () => {
     const messages = [
       { id: "our-id", sessionIndex: 0, type: "user", content: "hi" },
-      { id: "reply-1", sessionIndex: 1, type: "agent", content: "hello" },
+      {
+        id: "reply-1",
+        sessionIndex: 1,
+        type: "agent",
+        content: { userMessageId: "our-id", text: "hello" },
+      },
     ];
     const reply = findAgentReplyAfterOurs(messages, "our-id");
     expect(reply?.id).toBe("reply-1");
@@ -376,6 +392,60 @@ describe("findAgentReplyAfterOurs", () => {
   test("returns undefined when no agent message follows ours", () => {
     const messages = [{ id: "our-id", sessionIndex: 0, type: "user", content: "hi" }];
     expect(findAgentReplyAfterOurs(messages, "our-id")).toBeUndefined();
+  });
+
+  test("correlates lowercase nested live ids and ignores event-only agent records", () => {
+    expect(findAgentReplyAfterOurs(
+      liveMessagesFixture.messages,
+      liveMessagesFixture.clientId,
+    )?.id).toBe("session-id:3:0");
+  });
+
+  test("ignores unlinked and differently linked replies after our message", () => {
+    const messages = [
+      { id: "our-id", sessionIndex: 0, type: "user", content: "hi" },
+      { id: "unlinked", sessionIndex: 1, type: "agent", content: "not ours" },
+      {
+        id: "other-reply",
+        sessionIndex: 2,
+        type: "agent",
+        content: { userMessageId: "other-id", text: "also not ours" },
+      },
+      {
+        id: "our-reply",
+        sessionIndex: 3,
+        type: "agent",
+        content: { userMessageId: "OUR-ID", text: "ours" },
+      },
+    ];
+
+    expect(findAgentReplyAfterOurs(messages, "our-id")?.id).toBe("our-reply");
+  });
+
+  test("ignores correlated live system text after the assistant reply", () => {
+    const messages = [
+      { id: "our-id", sessionIndex: 0, type: "user", content: "hi" },
+      {
+        id: "assistant",
+        sessionIndex: 1,
+        type: "agent",
+        content: {
+          userMessageId: "our-id",
+          rawPayload: { type: "assistant", message: { content: [{ text: "done" }] } },
+        },
+      },
+      {
+        id: "system",
+        sessionIndex: 2,
+        type: "agent",
+        content: {
+          userMessageId: "our-id",
+          rawPayload: { type: "system", message: "status text" },
+        },
+      },
+    ];
+
+    expect(findAgentReplyAfterOurs(messages, "our-id")?.id).toBe("assistant");
   });
 });
 
@@ -414,6 +484,7 @@ describe("happy path", () => {
       sessionIndex: 1,
       type: "agent",
       content: {
+        userMessageId: "client-001",
         text: "Drafted the plan.\n\nClarifying questions:\n1. Dark mode only, or full theming?",
       },
     });
@@ -426,6 +497,29 @@ describe("happy path", () => {
     expect(capture?.clarifyingQuestions).toEqual([
       "Dark mode only, or full theming?",
     ]);
+  });
+
+  test("live nested message shape transitions agentWorking to ready", async () => {
+    const t = convexTest(schema, modules);
+    const clientId = liveMessagesFixture.clientId;
+    const { asUser, captureId } = await setupUserWithCapture(
+      t,
+      "auth0|pipeline-live-shape",
+      { clientId },
+    );
+
+    await tick(t);
+    let capture = await asUser.query(api.captures.get, { captureId });
+    const sessionId = capture!.sessionId!;
+    mock.sessions.get(sessionId)!.status = "idle";
+    mock.messagesBySession.set(sessionId, liveMessagesFixture.messages);
+
+    await tick(t, 30_000);
+
+    capture = await asUser.query(api.captures.get, { captureId });
+    expect(capture?.status).toBe("ready");
+    expect(capture?.agentSummary).toBe("Sanitized agent reply.");
+    expect(capture?.clarifyingQuestions).toEqual(["Sanitized question?"]);
   });
 
   test("message queued during init still proceeds to agentWorking", async () => {
@@ -675,6 +769,16 @@ describe("error: send re-run with messageId already present", () => {
     await tick(t);
     expect(mock.sendMessageCalls).toHaveLength(1);
 
+    // The live list endpoint uses a generated top-level id and nests the
+    // lowercased client message id in content rather than `messageId`.
+    const sessionId = mock.sendMessageCalls[0].sessionId;
+    mock.messagesBySession.set(sessionId, [{
+      id: `${sessionId}:1:0`,
+      sessionIndex: 0,
+      type: "userMessage",
+      content: { id: "resend-msg-1", turnId: "resend-msg-1" },
+    }]);
+
     // Force capture back to "sending" to simulate a re-run of submit after
     // the message was already recorded (e.g. action died between send and
     // the agentWorking patch).
@@ -786,7 +890,7 @@ describe("edge: pipeline.watch status poll throws", () => {
       id: "agent-reply-throws",
       sessionIndex: 1,
       type: "agent",
-      content: "All done here.",
+      content: { userMessageId: "client-watch-throws", text: "All done here." },
     });
 
     await tick(t, 60_000);
@@ -1102,7 +1206,7 @@ describe("terminal-state invariant", () => {
       id: "agent-reply-invariant",
       sessionIndex: 1,
       type: "agent",
-      content: "All set.",
+      content: { userMessageId: "client-invariant", text: "All set." },
     });
 
     await tick(t, 30_000);

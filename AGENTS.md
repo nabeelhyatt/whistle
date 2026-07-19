@@ -13,3 +13,5 @@ Bump `MARKETING_VERSION` in `apps/macos/project.yml` by one patch increment (e.g
 `docs/solutions/` — documented solutions to past problems (runtime errors, best practices, workflow patterns), organized by category with YAML frontmatter (`module`, `tags`, `problem_type`). Relevant when implementing or debugging in documented areas.
 
 `CONCEPTS.md` — shared domain vocabulary (entities, named processes, status concepts) — relevant when orienting to the codebase or discussing domain concepts.
+
+`docs/BACKLOG.md` — deferred follow-up work items with context. Check when planning new work (an item may already be scoped); add to it when explicitly deferring something.

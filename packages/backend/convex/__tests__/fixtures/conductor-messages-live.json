@@ -1,0 +1,48 @@
+{
+  "clientId": "9FA5700C-D530-45CA-A154-CAC4B9599DFE",
+  "messages": [
+    {
+      "id": "session-id:1:0",
+      "sessionIndex": 0,
+      "type": "userMessage",
+      "content": {
+        "id": "9fa5700c-d530-45ca-a154-cac4b9599dfe",
+        "turnId": "9fa5700c-d530-45ca-a154-cac4b9599dfe",
+        "type": "userMessage"
+      }
+    },
+    {
+      "id": "session-id:2:0",
+      "sessionIndex": 1,
+      "type": "agent",
+      "content": {
+        "userMessageId": "9fa5700c-d530-45ca-a154-cac4b9599dfe",
+        "turnId": "9fa5700c-d530-45ca-a154-cac4b9599dfe",
+        "rawPayload": {
+          "type": "system",
+          "subtype": "init"
+        }
+      }
+    },
+    {
+      "id": "session-id:3:0",
+      "sessionIndex": 2,
+      "type": "agent",
+      "content": {
+        "userMessageId": "9fa5700c-d530-45ca-a154-cac4b9599dfe",
+        "turnId": "9fa5700c-d530-45ca-a154-cac4b9599dfe",
+        "rawPayload": {
+          "type": "assistant",
+          "message": {
+            "content": [
+              {
+                "type": "text",
+                "text": "Sanitized agent reply.\n\n1. Sanitized question?"
+              }
+            ]
+          }
+        }
+      }
+    }
+  ]
+}
