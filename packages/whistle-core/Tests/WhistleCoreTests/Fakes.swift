@@ -64,10 +64,18 @@ final class FakeConvexService: ConvexServiceProtocol, @unchecked Sendable {
 
     // MARK: projects
 
-    private var projectsContinuation: AsyncStream<[Project]>.Continuation?
+    private var projectsContinuations: [UUID: AsyncStream<[Project]>.Continuation] = [:]
     func projectsList() -> AsyncStream<[Project]> {
         AsyncStream { continuation in
-            self.projectsContinuation = continuation
+            let id = UUID()
+            self.lock.lock()
+            self.projectsContinuations[id] = continuation
+            self.lock.unlock()
+            continuation.onTermination = { [weak self] _ in
+                self?.lock.lock()
+                self?.projectsContinuations.removeValue(forKey: id)
+                self?.lock.unlock()
+            }
         }
     }
 
@@ -82,14 +90,24 @@ final class FakeConvexService: ConvexServiceProtocol, @unchecked Sendable {
     /// fix for the identical race on `capturesListRecent`.
     func yieldProjects(_ projects: [Project], timeout: TimeInterval = 2) async {
         let deadline = Date().addingTimeInterval(timeout)
-        while projectsContinuation == nil {
+        while activeProjectsSubscriptionCount == 0 {
             if Date() >= deadline {
                 XCTFail("FakeConvexService.yieldProjects timed out waiting for a subscriber")
                 return
             }
             try? await Task.sleep(nanoseconds: 2_000_000)
         }
-        projectsContinuation?.yield(projects)
+        let continuations = record { Array(projectsContinuations.values) }
+        continuations.forEach { $0.yield(projects) }
+    }
+
+    var activeProjectsSubscriptionCount: Int {
+        record { projectsContinuations.count }
+    }
+
+    func finishProjectSubscriptions() {
+        let continuations = record { Array(projectsContinuations.values) }
+        continuations.forEach { $0.finish() }
     }
 
     // MARK: templates

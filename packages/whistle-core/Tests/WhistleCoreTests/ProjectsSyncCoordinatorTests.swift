@@ -72,6 +72,44 @@ final class ProjectsSyncCoordinatorTests: XCTestCase {
         XCTAssertEqual(try store.projectsSnapshot(), projects)
     }
 
+    func testAuthenticatedLifecycleStopsAndRestartsSubscription() async throws {
+        let (store, tempDir) = try TestSupport.makeStore()
+        self.tempDir = tempDir
+
+        let convex = FakeConvexService()
+        let coordinator = ProjectsSyncCoordinator(store: store, convex: convex)
+
+        await coordinator.setServerUpdatesEnabled(false)
+        XCTAssertEqual(convex.activeProjectsSubscriptionCount, 0)
+
+        await coordinator.setServerUpdatesEnabled(true)
+        try await Whistle_waitUntil(timeout: 1) {
+            convex.activeProjectsSubscriptionCount == 1
+        }
+        await coordinator.setServerUpdatesEnabled(true)
+        XCTAssertEqual(convex.activeProjectsSubscriptionCount, 1)
+
+        await coordinator.setServerUpdatesEnabled(false)
+        try await Whistle_waitUntil(timeout: 1) {
+            convex.activeProjectsSubscriptionCount == 0
+        }
+
+        await coordinator.setServerUpdatesEnabled(true)
+        try await Whistle_waitUntil(timeout: 1) {
+            convex.activeProjectsSubscriptionCount == 1
+        }
+        convex.finishProjectSubscriptions()
+        try await Whistle_waitUntil(timeout: 1) {
+            convex.activeProjectsSubscriptionCount == 0
+        }
+        let restartDeadline = Date().addingTimeInterval(1)
+        while convex.activeProjectsSubscriptionCount == 0, Date() < restartDeadline {
+            await coordinator.setServerUpdatesEnabled(true)
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertEqual(convex.activeProjectsSubscriptionCount, 1)
+    }
+
     // MARK: - Stale-refresh trigger (TECH-SPEC §7)
 
     func testRefreshIfStaleCallsConductorRefreshWhenNoSnapshotExistsYet() async throws {

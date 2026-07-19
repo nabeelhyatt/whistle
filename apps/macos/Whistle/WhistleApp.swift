@@ -120,7 +120,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // `projectsSyncCoordinator`'s declaration comment above).
         let projectsSyncCoordinator = ProjectsSyncCoordinator(store: store, convex: convexService)
         self.projectsSyncCoordinator = projectsSyncCoordinator
-        Task { await projectsSyncCoordinator.start() }
 
         // Core fix: SyncEngine was implemented and tested (WhistleCore) but
         // never constructed anywhere in the app target, so submitted
@@ -184,7 +183,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             lastSeenStore: Self.makeLastSeenStatusStore()
         )
         self.historyViewModel = historyViewModel
-        historyViewModel.start()
+        historyViewModel.start(serverUpdatesEnabled: false)
 
         // Manual retry for a capture stuck in local `syncFailed` state
         // (`.localRetry` affordance): re-drains SyncEngine rather than
@@ -210,6 +209,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             .receive(on: DispatchQueue.main)
             .sink { [weak self] state, errorMessage in
                 self?.capturePanelController?.updateAuthenticationState(state, errorMessage: errorMessage)
+                self?.historyViewModel?.setServerUpdatesEnabled(state == .signedIn)
+                Task { [weak projectsSyncCoordinator] in
+                    await projectsSyncCoordinator?.setServerUpdatesEnabled(state == .signedIn)
+                }
                 // Any state transition (sign-in, sign-out, a fresh
                 // reauthRequired) means the deferral streak that led here,
                 // if any, is no longer relevant -- reset so a brand new

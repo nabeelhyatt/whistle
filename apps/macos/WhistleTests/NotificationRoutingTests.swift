@@ -28,7 +28,7 @@ import XCTest
 
 private final class FakeHistoryConvexService: ConvexServiceProtocol, @unchecked Sendable {
     private let lock = NSLock()
-    private var continuations: [AsyncStream<[ServerCaptureRecord]>.Continuation] = []
+    private var continuations: [UUID: AsyncStream<[ServerCaptureRecord]>.Continuation] = [:]
 
     private(set) var markOpenedCalls: [String] = []
     private(set) var archiveCalls: [String] = []
@@ -58,9 +58,15 @@ private final class FakeHistoryConvexService: ConvexServiceProtocol, @unchecked 
 
     func capturesListRecent(limit: Int) -> AsyncStream<[ServerCaptureRecord]> {
         AsyncStream { continuation in
+            let id = UUID()
             self.lock.lock()
-            self.continuations.append(continuation)
+            self.continuations[id] = continuation
             self.lock.unlock()
+            continuation.onTermination = { [weak self] _ in
+                self?.lock.lock()
+                self?.continuations.removeValue(forKey: id)
+                self?.lock.unlock()
+            }
         }
     }
 
@@ -109,7 +115,7 @@ private final class FakeHistoryConvexService: ConvexServiceProtocol, @unchecked 
         }
 
         lock.lock()
-        let subs = continuations
+        let subs = Array(continuations.values)
         lock.unlock()
         for continuation in subs {
             continuation.yield(records)
@@ -118,6 +124,18 @@ private final class FakeHistoryConvexService: ConvexServiceProtocol, @unchecked 
         // process this yield before the caller makes assertions.
         await Task.yield()
         try? await Task.sleep(nanoseconds: 2_000_000)
+    }
+
+    var activeSubscriptionCount: Int {
+        lock.lock(); defer { lock.unlock() }
+        return continuations.count
+    }
+
+    func finishSubscriptions() {
+        lock.lock()
+        let subs = Array(continuations.values)
+        lock.unlock()
+        subs.forEach { $0.finish() }
     }
 }
 
@@ -186,6 +204,57 @@ private enum HistoryTestSupport {
 
 @MainActor
 final class NotificationRoutingTests: XCTestCase {
+    func testServerSubscriptionFollowsAuthenticationAndRestartsAfterCompletion() async throws {
+        let (store, tempDir) = try HistoryTestSupport.makeStore()
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let convex = FakeHistoryConvexService()
+        let viewModel = HistoryViewModel(
+            store: store,
+            convex: convex,
+            notificationService: NotificationService(center: FakeUserNotificationCenter()),
+            lastSeenStore: InMemoryLastSeenStatusStore()
+        )
+        try store.saveDraft(CaptureDraft(
+            clientId: "auth-restart",
+            transcript: "queued locally",
+            notes: "",
+            projectId: "proj-1",
+            projectName: "Project One",
+            agent: "claude",
+            localState: .synced
+        ))
+
+        viewModel.start(serverUpdatesEnabled: false)
+        XCTAssertEqual(convex.activeSubscriptionCount, 0)
+
+        viewModel.setServerUpdatesEnabled(true)
+        await HistoryTestSupport.waitUntil { convex.activeSubscriptionCount == 1 }
+        viewModel.setServerUpdatesEnabled(true)
+        XCTAssertEqual(convex.activeSubscriptionCount, 1, "repeated signed-in state must not duplicate subscriptions")
+
+        let ready = HistoryTestSupport.record(clientId: "auth-restart", status: .ready)
+        await convex.yield([ready])
+        await HistoryTestSupport.waitUntil { viewModel.rows.first?.serverRecord?.status == .ready }
+        XCTAssertEqual(viewModel.rows.first?.presentation.chip, "Ready")
+
+        viewModel.setServerUpdatesEnabled(false)
+        await HistoryTestSupport.waitUntil { convex.activeSubscriptionCount == 0 }
+        XCTAssertNil(viewModel.rows.first?.serverRecord)
+        XCTAssertEqual(viewModel.rows.first?.presentation.chip, "Queued")
+
+        viewModel.setServerUpdatesEnabled(true)
+        await HistoryTestSupport.waitUntil { convex.activeSubscriptionCount == 1 }
+        convex.finishSubscriptions()
+        await HistoryTestSupport.waitUntil { convex.activeSubscriptionCount == 0 }
+        let restartDeadline = Date().addingTimeInterval(1)
+        while convex.activeSubscriptionCount == 0, Date() < restartDeadline {
+            viewModel.setServerUpdatesEnabled(true)
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertEqual(convex.activeSubscriptionCount, 1)
+    }
+
     // MARK: Happy: ->ready fires notification with question count; click opens deepLink + marks opened
 
     func testReadyTransitionFiresNotificationWithQuestionCountAndClickOpensDeepLinkAndMarksOpened() async throws {
@@ -695,4 +764,3 @@ final class NotificationRoutingTests: XCTestCase {
         XCTAssertEqual(fakeCenter.posted[0].body, "Conductor is temporarily unreachable — please retry shortly.")
     }
 }
-
