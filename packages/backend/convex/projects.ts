@@ -39,6 +39,34 @@ export const getSettingsForUserInternal = internalQuery({
   },
 });
 
+export const getProjectsCacheForUserInternal = internalQuery({
+  args: { userId: v.id("users") },
+  handler: async (ctx, args) => {
+    return await ctx.db
+      .query("projectsCache")
+      .withIndex("by_user", (q) => q.eq("userId", args.userId))
+      .unique();
+  },
+});
+
+/**
+ * True when a previously-cached project set exists AND its project ids differ
+ * from the newly-fetched set — i.e. this key can see a different set of
+ * Conductor projects than the last key did. Order-independent. Returns false
+ * when there is no prior cache (first key, nothing to compare against), so
+ * onboarding never shows a spurious "changed" warning.
+ */
+function projectSetChanged(
+  previous: { id: string }[] | undefined,
+  next: { id: string }[],
+): boolean {
+  if (previous === undefined || previous.length === 0) return false;
+  const prevIds = [...new Set(previous.map((p) => p.id))].sort();
+  const nextIds = [...new Set(next.map((p) => p.id))].sort();
+  if (prevIds.length !== nextIds.length) return true;
+  return prevIds.some((id, i) => id !== nextIds[i]);
+}
+
 export const writeProjectsCacheInternal = internalMutation({
   args: {
     userId: v.id("users"),
@@ -73,7 +101,10 @@ export const writeProjectsCacheInternal = internalMutation({
  */
 export const validateKey = action({
   args: { apiKey: v.optional(v.string()) },
-  handler: async (ctx, args): Promise<{ ok: boolean; error?: string }> => {
+  handler: async (
+    ctx,
+    args,
+  ): Promise<{ ok: boolean; error?: string; changedFromPrevious?: boolean }> => {
     const user = await ctx.runQuery(internal.users.getSelfInternal, {});
     if (user === null) {
       return { ok: false, error: "Not authenticated" };
@@ -92,12 +123,24 @@ export const validateKey = action({
     }
 
     try {
+      // Capture the prior project set before overwriting the cache, so we can
+      // tell the client whether this key sees a different set of Conductor
+      // projects than the last one — a cheap proxy (there is no whoami
+      // endpoint) for "this key may belong to a different Conductor account."
+      const previous = await ctx.runQuery(
+        internal.projects.getProjectsCacheForUserInternal,
+        { userId: user._id },
+      );
       const result = await listProjects(apiKey, { limit: 50 });
+      const changedFromPrevious = projectSetChanged(
+        previous?.projects,
+        result.data,
+      );
       await ctx.runMutation(internal.projects.writeProjectsCacheInternal, {
         userId: user._id,
         projects: result.data,
       });
-      return { ok: true };
+      return { ok: true, changedFromPrevious };
     } catch (err) {
       if (err instanceof ConductorApiError) {
         return { ok: false, error: err.userMessage };

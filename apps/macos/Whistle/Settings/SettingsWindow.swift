@@ -49,6 +49,10 @@ public final class SettingsViewModel: ObservableObject {
     @Published public private(set) var isReplacingKey = false
     @Published public private(set) var keyStatusMessage: String?
     @Published public private(set) var keyReplaceSucceeded: Bool?
+    /// Set after a successful Save & Validate when the new key lists a
+    /// different set of Conductor projects than the previous key — a heads-up
+    /// that it may belong to a different Conductor account (canonical-accounts).
+    @Published public private(set) var keyProjectsChanged = false
 
     @Published public private(set) var loadError: String?
     @Published public private(set) var authState: AuthState
@@ -203,10 +207,11 @@ public final class SettingsViewModel: ObservableObject {
 
         do {
             try await convex.settingsSetConductorKey(key)
-            let valid = try await convex.conductorValidateKey(key: nil)
-            if valid {
+            let result = try await convex.conductorValidateKeyDetailed(key: nil)
+            if result.ok {
                 keyStatusMessage = "Key saved and validated."
                 keyReplaceSucceeded = true
+                keyProjectsChanged = result.projectsChanged
                 newKeyInput = ""
                 // Refresh masked display (hasKey / last-4).
                 if let snapshot = try? await convex.settingsGet() {
@@ -216,10 +221,12 @@ public final class SettingsViewModel: ObservableObject {
             } else {
                 keyStatusMessage = "Key saved, but Conductor rejected it. Double-check it at app.conductor.build/users/api-keys."
                 keyReplaceSucceeded = false
+                keyProjectsChanged = false
             }
         } catch {
             keyStatusMessage = "Couldn't save/validate the key (network or server error)."
             keyReplaceSucceeded = false
+            keyProjectsChanged = false
         }
     }
 
@@ -343,6 +350,27 @@ struct SettingsView: View {
                     )
                     .foregroundStyle(viewModel.keyReplaceSucceeded == true ? Color.secondary : .orange)
                     .font(.callout)
+                }
+
+                if viewModel.keyProjectsChanged {
+                    Label(
+                        "This key can see a different set of Conductor projects than your previous key. If that's unexpected, it may belong to a different Conductor account than the one you use in the Conductor app.",
+                        systemImage: "exclamationmark.triangle"
+                    )
+                    .foregroundStyle(.orange)
+                    .font(.callout)
+                }
+            }
+
+            // Which Conductor account is this key on? There's no Conductor
+            // whoami endpoint, so we show the projects the key can reach as an
+            // identity proxy — a mismatch with what the user expects is the
+            // tell that captures will land in the wrong account.
+            if viewModel.hasKey && !viewModel.projects.isEmpty {
+                Section("Projects this key can access") {
+                    ForEach(viewModel.projects) { project in
+                        Text(project.name)
+                    }
                 }
             }
         }
