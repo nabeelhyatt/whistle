@@ -20,8 +20,16 @@ beforeEach(() => {
     vi.fn(async (url: string) => {
       const path = url.replace("https://api.conductor.build", "");
       if (path === "/v0/projects" || path.startsWith("/v0/projects?")) {
+        const parsed = new URL(url);
+        const offset = Number(parsed.searchParams.get("offset") ?? "0");
+        const limit = Number(parsed.searchParams.get("limit") ?? String(projects.length));
+        const data = projects.slice(offset, offset + limit);
         return new Response(
-          JSON.stringify({ data: projects, offset: 0, hasMore: false }),
+          JSON.stringify({
+            data,
+            offset,
+            hasMore: offset + data.length < projects.length,
+          }),
           { status: 200, headers: { "content-type": "application/json" } },
         );
       }
@@ -69,5 +77,35 @@ describe("projects.validateKey — changedFromPrevious (canonical-accounts)", ()
     const r = await asUser.action(api.projects.validateKey, { apiKey: "k2" });
     expect(r.ok).toBe(true);
     expect(r.changedFromPrevious).toBe(true);
+  });
+
+  test("previously empty project set reports a change when the next key sees projects", async () => {
+    const t = convexTest(schema, modules);
+    const asUser = t.withIdentity({ subject: "auth0|vk-empty-to-projects" });
+    await asUser.mutation(api.users.ensure, {});
+
+    projects = [];
+    await asUser.action(api.projects.validateKey, { apiKey: "k1" });
+
+    projects = [{ id: "p9", name: "Zeta", gitRemote: "https://github.com/org/zeta.git" }];
+    const r = await asUser.action(api.projects.validateKey, { apiKey: "k2" });
+    expect(r.ok).toBe(true);
+    expect(r.changedFromPrevious).toBe(true);
+  });
+
+  test("validation caches projects from every response page", async () => {
+    const t = convexTest(schema, modules);
+    const asUser = t.withIdentity({ subject: "auth0|vk-pages" });
+    await asUser.mutation(api.users.ensure, {});
+
+    projects = Array.from({ length: 51 }, (_, i) => ({
+      id: `p${i + 1}`,
+      name: `Project ${i + 1}`,
+      gitRemote: `https://github.com/org/project-${i + 1}.git`,
+    }));
+
+    const r = await asUser.action(api.projects.validateKey, { apiKey: "k1" });
+    expect(r.ok).toBe(true);
+    await expect(asUser.query(api.projects.list, {})).resolves.toHaveLength(51);
   });
 });

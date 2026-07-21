@@ -160,7 +160,15 @@ class MockConductor {
 
     // GET /v0/projects (project-visibility guard + key validation)
     if (method === "GET" && (path === "/v0/projects" || path.startsWith("/v0/projects?"))) {
-      return json(200, { data: this.projects, offset: 0, hasMore: false });
+      const parsed = new URL(url);
+      const offset = Number(parsed.searchParams.get("offset") ?? "0");
+      const limit = Number(parsed.searchParams.get("limit") ?? String(this.projects.length));
+      const data = this.projects.slice(offset, offset + limit);
+      return json(200, {
+        data,
+        offset,
+        hasMore: offset + data.length < this.projects.length,
+      });
     }
 
     // GET /v0/projects/{id}/workspaces (orphan adoption search)
@@ -700,6 +708,26 @@ describe("project-visibility guard (canonical-accounts)", () => {
     const { asUser, captureId } = await setupUserWithCapture(t, "auth0|proj-guard-ok", {
       clientId: "client-proj-guard-ok",
       projectId: "proj-1",
+    });
+
+    await tick(t);
+
+    const capture = await asUser.query(api.captures.get, { captureId });
+    expect(capture?.status).toBe("agentWorking");
+    expect(mock.createWorkspaceCount).toBe(1);
+  });
+
+  test("capture's project visible on a later projects page -> proceeds to create", async () => {
+    const t = convexTest(schema, modules);
+    mock.projects = Array.from({ length: 51 }, (_, i) => ({
+      id: `proj-${i + 1}`,
+      name: `Project ${i + 1}`,
+      gitRemote: `https://github.com/org/project-${i + 1}.git`,
+    }));
+    const { asUser, captureId } = await setupUserWithCapture(t, "auth0|proj-guard-page", {
+      clientId: "client-proj-guard-page",
+      projectId: "proj-51",
+      projectName: "Project 51",
     });
 
     await tick(t);

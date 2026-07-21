@@ -22,8 +22,8 @@ import {
   createWorkspace,
   getSessionStatus,
   getWorkspaceStatus,
+  listAllProjects,
   listMessages,
-  listProjects,
   listProjectWorkspaces,
   listWorkspaceSessions,
   sendMessage,
@@ -86,6 +86,11 @@ export function buildWorkspaceName(args: {
 /** Returns the `#<clientId prefix>` tag used for orphan-workspace adoption. */
 function orphanTag(clientId: string): string {
   return `#${clientId.slice(0, 6)}`;
+}
+
+async function projectVisibleToKey(apiKey: string, projectId: string): Promise<boolean> {
+  const visibleProjects = await listAllProjects(apiKey, { limit: 50 });
+  return visibleProjects.some((p) => p.id === projectId);
 }
 
 // ─── Clarifying-questions / summary extraction (dumb, safe heuristics) ──
@@ -411,11 +416,7 @@ async function runSubmit(
     // working" pointing at a workspace the user can't open. Fail fast with a
     // Settings-routing message instead. Runs only on a fresh submit (no
     // workspaceId yet); adopted/created captures skip it on later passes.
-    const visibleProjects = await listProjects(apiKey);
-    const projectVisible = visibleProjects.data.some(
-      (p) => p.id === capture.projectId,
-    );
-    if (!projectVisible) {
+    if (!(await projectVisibleToKey(apiKey, capture.projectId))) {
       await patchCapture(ctx, captureId, {
         status: "failed",
         errorCode: "auth",

@@ -9,7 +9,7 @@ import { action, query } from "./_generated/server";
 import { internal } from "./_generated/api";
 import { internalMutation, internalQuery } from "./_generated/server";
 import { requireUser } from "./lib/auth";
-import { listProjects, ConductorApiError } from "./conductorClient";
+import { listAllProjects, ConductorApiError } from "./conductorClient";
 
 /** Both actions below resolve the caller via `users.getSelfInternal` since
  * actions don't have direct `ctx.db` access and `requireUser` is a
@@ -60,7 +60,7 @@ function projectSetChanged(
   previous: { id: string }[] | undefined,
   next: { id: string }[],
 ): boolean {
-  if (previous === undefined || previous.length === 0) return false;
+  if (previous === undefined) return false;
   const prevIds = [...new Set(previous.map((p) => p.id))].sort();
   const nextIds = [...new Set(next.map((p) => p.id))].sort();
   if (prevIds.length !== nextIds.length) return true;
@@ -131,14 +131,14 @@ export const validateKey = action({
         internal.projects.getProjectsCacheForUserInternal,
         { userId: user._id },
       );
-      const result = await listProjects(apiKey, { limit: 50 });
+      const projects = await listAllProjects(apiKey, { limit: 50 });
       const changedFromPrevious = projectSetChanged(
         previous?.projects,
-        result.data,
+        projects,
       );
       await ctx.runMutation(internal.projects.writeProjectsCacheInternal, {
         userId: user._id,
-        projects: result.data,
+        projects,
       });
       return { ok: true, changedFromPrevious };
     } catch (err) {
@@ -168,10 +168,10 @@ export const refreshProjects = action({
     }
 
     try {
-      const result = await listProjects(apiKey, { limit: 50 });
+      const projects = await listAllProjects(apiKey, { limit: 50 });
       await ctx.runMutation(internal.projects.writeProjectsCacheInternal, {
         userId: user._id,
-        projects: result.data,
+        projects,
       });
       return { ok: true };
     } catch (err) {

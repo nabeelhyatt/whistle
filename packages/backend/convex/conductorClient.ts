@@ -218,6 +218,27 @@ export async function listProjects(
   });
 }
 
+export async function listAllProjects(
+  apiKey: string,
+  opts?: { limit?: number },
+): Promise<ConductorProject[]> {
+  const limit = opts?.limit ?? 50;
+  const projects: ConductorProject[] = [];
+  let offset = 0;
+
+  for (;;) {
+    const page = await listProjects(apiKey, { limit, offset });
+    projects.push(...page.data);
+
+    if (!page.hasMore) {
+      return projects;
+    }
+
+    const nextOffset = page.offset + page.data.length;
+    offset = nextOffset > offset ? nextOffset : offset + limit;
+  }
+}
+
 export interface CreateWorkspaceResponse {
   workspaceId: string;
   sessionId: string;
