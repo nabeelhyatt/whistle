@@ -171,6 +171,26 @@ public protocol ConvexServiceProtocol: Sendable {
     func capturesDeleteScreenshot(id: String) async throws
     func capturesMarkOpened(id: String) async throws
     func capturesArchive(id: String) async throws
+
+    // MARK: connection self-healing (wedged-websocket rebuild)
+
+    /// Fires once, asynchronously, right after `rebuildClient()` swaps in a
+    /// fresh Convex client following a detected wedge (a short streak of
+    /// consecutive call timeouts with no proof-of-life). The app wires this
+    /// to a drain of the local sync queue so a stuck capture retries seconds
+    /// after the rebuild instead of waiting for the next periodic drain tick.
+    /// Settable (not init-only) because the app constructs the drain closure
+    /// only after the Convex service already exists. Default no-op get/set
+    /// via the extension below keeps existing fakes/tests source-compatible.
+    var onConnectionRebuilt: (@Sendable () async -> Void)? { get set }
+
+    /// True once at least one consecutive-call-timeout has been recorded
+    /// against the current client generation and no success has reset it
+    /// yet. Drives the app-side degraded-mode fast probe: a second drain
+    /// loop runs on a much shorter interval only while this is true, closing
+    /// the gap between "wedge detected" and "rebuilt client actually
+    /// exercised." Default `false` via the extension below.
+    var isConnectionDegraded: Bool { get }
 }
 
 /// Default no-op so pre-existing `ConvexServiceProtocol` fakes (test doubles
@@ -186,6 +206,19 @@ public extension ConvexServiceProtocol {
     func conductorValidateKeyDetailed(key: String?) async throws -> ConductorValidateResult {
         ConductorValidateResult(ok: try await conductorValidateKey(key: key), projectsChanged: false)
     }
+
+    /// Default no-op storage-less accessor so pre-existing fakes/test doubles
+    /// don't need to be touched just to keep conforming (mirrors
+    /// `detachAuth()`'s default above). Only `LiveConvexService` needs a real
+    /// implementation.
+    var onConnectionRebuilt: (@Sendable () async -> Void)? {
+        get { nil }
+        set {}
+    }
+
+    /// Default: a fake/test double is never "degraded" unless it overrides
+    /// this itself.
+    var isConnectionDegraded: Bool { false }
 }
 
 // MARK: - Supporting request/response shapes
@@ -324,6 +357,181 @@ public struct CaptureCreateInput: Equatable, Sendable {
     }
 }
 
+// MARK: - Connection self-healing: health tracker + auth-gate epoch
+//
+// Both types below are free of any ConvexMobile/convex-swift dependency
+// (plain NSLock + closures), so they live outside the `canImport(ConvexMobile)`
+// guard around `LiveConvexService` and are unit-testable without a live
+// Convex client — see `ConvexReconnectTests`.
+
+/// Detects a wedged Convex websocket via a generation-stamped consecutive-
+/// timeout streak (see the "self-heal a wedged Convex connection" plan,
+/// KTD1/KTD2/R2). Mirrors `ConvexAuthAttachmentGate`'s single-NSLock design.
+///
+/// Generation stamping is the load-bearing race fix: every authed call in
+/// `LiveConvexService` captures `(client, generation)` together at entry
+/// (`currentClient()`) and reports that SAME generation here at completion
+/// via `recordOutcome(_:clientGeneration:)`. An outcome whose
+/// `clientGeneration` no longer matches the tracker's current `generation`
+/// is ignored entirely — neither increments nor resets — so a slow success
+/// from an already-rebuilt-away client can't paper over a real wedge, and a
+/// late timeout from an old client can't inflate the new generation's
+/// counter or force a second, spurious rebuild.
+final class ConvexConnectionHealthTracker: @unchecked Sendable {
+    /// Outcome classification for one authed call, as judged by its caller:
+    /// `.timedOut` for `requestFailed("operation timed out" | "query timed
+    /// out waiting for a value" | "auth attach timed out")`; `.success` for
+    /// any call that provably round-tripped (a real result, a server error,
+    /// a decoding failure — the connection is alive); `.neutral` for a
+    /// missing-token `notAuthenticated` (no network round-trip happened, so
+    /// it says nothing about the connection's health).
+    enum Outcome {
+        case timedOut
+        case success
+        case neutral
+    }
+
+    private let lock = NSLock()
+    private var consecutiveTimeouts = 0
+    private var generation = 0
+    private var lastRebuildAt: Date?
+    private let threshold: Int
+    private let cooldown: TimeInterval
+    private let now: @Sendable () -> Date
+
+    /// - Parameters:
+    ///   - threshold: consecutive matching-generation timeouts required to
+    ///     trip a rebuild. 2 (not 3) — safe because of the generation guard
+    ///     above; saves a full periodic-drain cycle of recovery latency.
+    ///   - cooldown: minimum wall-clock time between rebuilds. Belt-and-
+    ///     suspenders behind the generation guard, not the primary storm
+    ///     defense (the guard already makes concurrent double-trips
+    ///     impossible under the lock).
+    ///   - now: injectable clock so cooldown behavior is deterministic in
+    ///     tests.
+    init(
+        threshold: Int = 2,
+        cooldown: TimeInterval = 60,
+        now: @escaping @Sendable () -> Date = { Date() }
+    ) {
+        self.threshold = threshold
+        self.cooldown = cooldown
+        self.now = now
+    }
+
+    /// Snapshot together with `LiveConvexService.client` under its own lock
+    /// (see `currentClient()`) so every authed call's `(client, generation)`
+    /// pair is internally consistent even as `rebuildClient()` swaps both.
+    var currentGeneration: Int {
+        lock.withLock { generation }
+    }
+
+    /// True once at least one timeout has been recorded against the current
+    /// generation and no success has reset it yet. Drives the app-side
+    /// degraded-mode fast probe (U5) — cheap to poll from any thread.
+    var isDegraded: Bool {
+        lock.withLock { consecutiveTimeouts >= 1 }
+    }
+
+    /// Records one call's outcome, stamped with the generation it ran
+    /// against. Returns `true` exactly when the caller should rebuild the
+    /// client now (threshold crossed AND cooldown elapsed since the last
+    /// rebuild) — the caller is responsible for actually rebuilding.
+    @discardableResult
+    func recordOutcome(_ outcome: Outcome, clientGeneration: Int) -> Bool {
+        lock.withLock {
+            guard clientGeneration == generation else {
+                // Stale generation: this outcome ran against a client that
+                // has already been rebuilt away. Neither increments nor
+                // resets — see the type doc above for why.
+                return false
+            }
+            switch outcome {
+            case .neutral:
+                return false
+            case .success:
+                consecutiveTimeouts = 0
+                return false
+            case .timedOut:
+                consecutiveTimeouts += 1
+                guard consecutiveTimeouts >= threshold else { return false }
+                if let lastRebuildAt, now().timeIntervalSince(lastRebuildAt) < cooldown {
+                    return false
+                }
+                return true
+            }
+        }
+    }
+
+    /// Called by `rebuildClient()` in the SAME lock acquisition that swaps
+    /// `LiveConvexService.client`, so `currentClient()`'s (client,
+    /// generation) snapshot can never observe half of an old pair and half
+    /// of a new one. Bumps the generation, zeroes the counter, stamps the
+    /// cooldown clock, and returns the new generation for logging.
+    func noteRebuilt() -> Int {
+        lock.withLock {
+            generation += 1
+            consecutiveTimeouts = 0
+            lastRebuildAt = now()
+            return generation
+        }
+    }
+}
+
+/// Serializes "attach auth once; re-attempt after failure" semantics for
+/// `LiveConvexService`. Internal (not private) so the sequencing regression
+/// can be unit-tested without a live Convex client.
+///
+/// Epoch compare-and-set (KTD4/R3): a rebuild's `reset()` bumps `epoch` so an
+/// `ensureAuthAttached` call that started its `attach()` against the OLD
+/// client (before the rebuild) cannot latch `attached = true` after the
+/// rebuild completes — that would silently re-wedge every future call into
+/// `NotAuthenticatedError` forever, because the NEW client would never get a
+/// chance to attach. `runIfNeeded` captures `epoch` before running `attach`
+/// and only latches if `epoch` is unchanged when `attach()` returns;
+/// otherwise it discards the result (even a `true` one) and the next call
+/// re-attempts against the current epoch/client.
+final class ConvexAuthAttachmentGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var attached = false
+    private var epoch = 0
+
+    /// Runs `attach` unless a prior attempt already succeeded (and no
+    /// `reset()` has run since). Returns the overall attached state. A
+    /// failed attempt, or one whose epoch moved mid-flight, leaves the gate
+    /// open so the next call re-attempts.
+    func runIfNeeded(_ attach: () async -> Bool) async -> Bool {
+        let startEpoch: Int? = lock.withLock { attached ? nil : epoch }
+        guard let startEpoch else { return true }
+        let success = await attach()
+        return lock.withLock {
+            guard epoch == startEpoch else {
+                // `reset()` ran during `attach()` (a rebuild happened
+                // mid-flight) — discard this result even if it was `true`;
+                // the next call re-attaches against the new epoch/client.
+                return false
+            }
+            if success {
+                attached = true
+            }
+            return success
+        }
+    }
+
+    /// Forces the next `runIfNeeded` call to re-attempt `attach`, even if a
+    /// prior attempt already succeeded, and bumps `epoch` so any attach
+    /// already in flight against the pre-reset state cannot latch. Called on
+    /// sign-out (via `detachAuth()`) and on every client rebuild
+    /// (`rebuildClient()`) so a later sign-in or a post-rebuild call can't
+    /// short-circuit on stale `attached == true` state.
+    func reset() {
+        lock.withLock {
+            attached = false
+            epoch &+= 1
+        }
+    }
+}
+
 // MARK: - LiveConvexService
 
 /// The real `ConvexServiceProtocol` implementation, backed by convex-swift's
@@ -339,19 +547,158 @@ public struct CaptureCreateInput: Equatable, Sendable {
 /// `sink`, so app-target code (History window, status item) only ever
 /// deals in AsyncStream, matching `CaptureStore`'s idiom.
 #if canImport(ConvexMobile)
+    /// Testable seam abstracting exactly the convex-swift surface
+    /// `LiveConvexService` uses (mutation/action/subscribe/loginFromCache/
+    /// logout/watchWebSocketState), so `ConvexReconnectTests` can inject a
+    /// fake/hanging client and drive `rebuildClient()` deterministically
+    /// without a live server — the "thorough" seam from the reconnect design
+    /// doc, R5/§5. `ConvexClientWithAuth<String>` conforms via the extension
+    /// below with no extra glue: every requirement is already present on the
+    /// real type (`mutation`/`action`/`subscribe`/`watchWebSocketState` from
+    /// `ConvexClient`, `loginFromCache`/`logout` from `ConvexClientWithAuth`
+    /// itself).
+    protocol ConvexClientAdapter: Sendable {
+        func mutation<T: Decodable>(_ name: String, with args: [String: ConvexEncodable?]?) async throws -> T
+        func mutation(_ name: String, with args: [String: ConvexEncodable?]?) async throws
+        func action<T: Decodable>(_ name: String, with args: [String: ConvexEncodable?]?) async throws -> T
+        func action(_ name: String, with args: [String: ConvexEncodable?]?) async throws
+        func subscribe<T: Decodable>(
+            to name: String, with args: [String: ConvexEncodable?]?, yielding output: T.Type?
+        ) -> AnyPublisher<T, ClientError>
+        func loginFromCache() async -> Result<String, Error>
+        func logout() async
+        func watchWebSocketState() -> AnyPublisher<WebSocketState, Never>
+    }
+
+    extension ConvexClientWithAuth: ConvexClientAdapter, @retroactive @unchecked Sendable where T == String {}
+
     public final class LiveConvexService: ConvexServiceProtocol, @unchecked Sendable {
-        private let client: ConvexClientWithAuth<String>
+        /// Mutable (not `let`): `rebuildClient()` swaps this in under `lock`
+        /// when the health tracker detects a wedge. Every call site must
+        /// snapshot `(client, generation)` together ONCE at entry via
+        /// `currentClient()` and capture that snapshot in its escaping
+        /// closure — never read `self.client` inside a `withTimeout`/
+        /// subscribe closure (R5's load-bearing snapshot rule): a leaked
+        /// hung task from before a rebuild must never touch the new client.
+        private var client: any ConvexClientAdapter
+        /// Builds a fresh client on demand (captures `deploymentUrl` +
+        /// the auth bridge internally). Also the test seam: `init(makeClient:)`
+        /// lets `ConvexReconnectTests` inject a fake/hanging client and
+        /// drive `rebuildClient()` deterministically without a live server.
+        private let makeClient: @Sendable () -> any ConvexClientAdapter
         private let authGate = ConvexAuthAttachmentGate()
+        private let healthTracker: ConvexConnectionHealthTracker
+        /// Publishes the client generation on every `rebuildClient()`, so the
+        /// `asyncStream` resubscribe loop (U4) can wait for "either the
+        /// server naturally ends this subscription, or the client got
+        /// rebuilt out from under it" without polling.
+        private let generationSubject = CurrentValueSubject<Int, Never>(0)
         private var cancellables: Set<AnyCancellable> = []
         private let lock = NSLock()
+
+        /// Set by the app after construction (`WhistleApp` wires this to
+        /// `drainSyncIfSignedIn()`) and fired once, asynchronously, at the
+        /// end of every `rebuildClient()` — see the protocol doc.
+        public var onConnectionRebuilt: (@Sendable () async -> Void)?
+
+        public var isConnectionDegraded: Bool { healthTracker.isDegraded }
 
         /// - Parameters:
         ///   - deploymentUrl: Convex deployment URL (dashboard → Settings).
         ///   - authProvider: WhistleCore's own auth seam. Bridged internally
         ///     into convex-swift's `AuthProvider<String>` shape.
-        public init(deploymentUrl: String, authProvider: any WhistleAuthProvider) {
+        public convenience init(deploymentUrl: String, authProvider: any WhistleAuthProvider) {
             let bridge = WhistleToConvexAuthProviderBridge(authProvider: authProvider)
-            self.client = ConvexClientWithAuth(deploymentUrl: deploymentUrl, authProvider: bridge)
+            self.init(makeClient: {
+                ConvexClientWithAuth(deploymentUrl: deploymentUrl, authProvider: bridge)
+            })
+        }
+
+        /// Internal factory seam (not `private`) so tests can construct a
+        /// `LiveConvexService` around a fake `ConvexClientAdapter` and drive
+        /// rebuild deterministically. `healthTracker` is also injectable so
+        /// tests can use a short threshold/cooldown/fake clock, and
+        /// `authedCallTimeout` so tests can exercise a REAL (short) hang
+        /// through `ensureAuthAttached`/`authedMutation`/etc. instead of only
+        /// simulating a timeout's error shape; production uses the
+        /// documented defaults (threshold 2, cooldown 60s, timeout 15s).
+        init(
+            makeClient: @escaping @Sendable () -> any ConvexClientAdapter,
+            healthTracker: ConvexConnectionHealthTracker = ConvexConnectionHealthTracker(),
+            authedCallTimeout: Duration = .seconds(15)
+        ) {
+            self.makeClient = makeClient
+            self.client = makeClient()
+            self.healthTracker = healthTracker
+            self.authedCallTimeout = authedCallTimeout
+            watchWebSocketState(generation: healthTracker.currentGeneration)
+        }
+
+        /// Snapshots `(client, generation)` together under `lock`, so the
+        /// pair is always internally consistent with whatever
+        /// `rebuildClient()` last swapped in — see `ConvexConnectionHealthTracker.noteRebuilt()`.
+        private func currentClient() -> (client: any ConvexClientAdapter, generation: Int) {
+            lock.withLock { (client, healthTracker.currentGeneration) }
+        }
+
+        /// Discards the current (wedged) client and builds a fresh one via
+        /// `makeClient`, re-attaching auth on the next call (KTD3). Does
+        /// **not** call `client.logout()` on the old client — that's another
+        /// FFI call into a dead socket; the old reference is simply dropped
+        /// and any of its leaked in-flight tasks settle (or don't) on their
+        /// own, per `withTimeout`'s single-resume race arbiter.
+        private func rebuildClient() {
+            let newGeneration = lock.withLock { () -> Int in
+                client = makeClient()
+                return healthTracker.noteRebuilt()
+            }
+            // The new client has no auth attached; reset the gate (and bump
+            // its own epoch, KTD4) so the very next authed call re-runs
+            // `loginFromCache()` against the new client rather than
+            // short-circuiting on the old client's stale `attached == true`.
+            authGate.reset()
+            NSLog(
+                "Whistle: Convex client wedged (%d consecutive timeouts) — rebuilt client (generation %d)",
+                Self.rebuildThreshold, newGeneration
+            )
+            watchWebSocketState(generation: newGeneration)
+            // Wakes any `asyncStream` resubscribe loops (U4) waiting on the
+            // old generation, so long-lived subscriptions heal without a
+            // History/Settings/Projects flash.
+            generationSubject.send(newGeneration)
+            if let onConnectionRebuilt {
+                Task { await onConnectionRebuilt() }
+            }
+        }
+
+        /// Consecutive-timeout threshold used only for the log line above —
+        /// the real threshold lives inside `healthTracker` (KTD1: 2).
+        private static let rebuildThreshold = 2
+
+        /// Subscribes to `client.watchWebSocketState()` for diagnostics only
+        /// (KTD7/R7): logs every transition tagged with the client
+        /// generation it belongs to. NOT a rebuild trigger — `WebSocketState`
+        /// has no `.disconnected` case and is a no-replay `PassthroughSubject`,
+        /// so a "stuck in `.connecting`" accelerant would rest on an
+        /// unverified assumption. The next wedge's `log show` output decides
+        /// empirically whether that's worth adding later.
+        private func watchWebSocketState(generation: Int) {
+            let (client, _) = currentClient()
+            let cancellable = client.watchWebSocketState()
+                .sink { state in
+                    NSLog("Whistle: Convex websocket state (generation %d): %@", generation, String(describing: state))
+                }
+            lock.withLock { _ = cancellables.insert(cancellable) }
+        }
+
+        /// Records one authed call's outcome against the generation it ran
+        /// on, and rebuilds the client if the tracker says a wedge has been
+        /// detected. Shared by `ensureAuthAttached`, `authedMutation`,
+        /// `authedAction`, and `authedQuery`'s catch/success paths.
+        private func noteOutcome(_ outcome: ConvexConnectionHealthTracker.Outcome, generation: Int) {
+            if healthTracker.recordOutcome(outcome, clientGeneration: generation) {
+                rebuildClient()
+            }
         }
 
         // MARK: - Auth attachment
@@ -372,7 +719,17 @@ public struct CaptureCreateInput: Equatable, Sendable {
         // briefly unavailable).
 
         private func ensureAuthAttached() async throws {
-            let attached = await authGate.runIfNeeded { [client] in
+            // Snapshot ONCE at entry (R5) — the closure below must never
+            // read `self.client`, only this snapshot, so a leaked attach
+            // from a since-rebuilt-away client can't touch the current one.
+            let (client, generation) = currentClient()
+            // `ConvexAuthAttachmentGate.runIfNeeded`'s closure is
+            // non-throwing, so a timeout is recorded here via this flag
+            // rather than thrown from inside the closure — checked after
+            // `runIfNeeded` returns, below, to implement KTD6's error split
+            // (timeout -> `.requestFailed`, token failure -> `.notAuthenticated`).
+            var timedOut = false
+            let attached = await authGate.runIfNeeded {
                 // `loginFromCache()` is itself a network-touching call with
                 // no internal timeout; a hang here (before `withTimeout` ever
                 // wraps the mutation/action below) would wedge syncing just
@@ -380,22 +737,42 @@ public struct CaptureCreateInput: Equatable, Sendable {
                 // login defers (revert-to-`.queued` via `.notAuthenticated`)
                 // instead of blocking the drain forever.
                 do {
-                    let result = try await Self.withTimeout(Self.authedCallTimeout) {
+                    let result = try await Self.withTimeout(authedCallTimeout) {
                         await client.loginFromCache()
                     }
                     switch result {
                     case .success:
+                        self.noteOutcome(.success, generation: generation)
                         return true
                     case let .failure(error):
                         NSLog("Whistle: attaching auth to Convex client failed: %@", String(describing: error))
+                        // Genuine token/login rejection — no network round-
+                        // trip failure to count, and definitely not a
+                        // transport timeout (KTD6).
+                        self.noteOutcome(.neutral, generation: generation)
                         return false
                     }
                 } catch {
                     NSLog("Whistle: attaching auth to Convex client timed out: %@", String(describing: error))
+                    self.noteOutcome(.timedOut, generation: generation)
+                    timedOut = true
                     return false
                 }
             }
-            guard attached else { throw ConvexServiceError.notAuthenticated }
+            guard attached else {
+                // KTD6: stop conflating transport-timeout with token-failure.
+                // A genuine outage would otherwise repeatedly reset the gate
+                // (every rebuild) and re-surface as `.notAuthenticated`,
+                // driving `onAuthDeferred` -> a spurious "sign in again"
+                // prompt. Only a real token/login rejection (or an
+                // epoch-discarded attach, KTD4) throws `.notAuthenticated`;
+                // the timeout branch throws `.requestFailed` instead, which
+                // `SyncEngine` treats as an ordinary retryable `.syncFailed`.
+                if timedOut {
+                    throw ConvexServiceError.requestFailed("auth attach timed out")
+                }
+                throw ConvexServiceError.notAuthenticated
+            }
         }
 
         /// Maps convex-swift's stringly server error for backend auth
@@ -456,7 +833,8 @@ public struct CaptureCreateInput: Equatable, Sendable {
             // afterward regardless of whether logout completed or timed out
             // -- a stuck logout must not also leave the attach gate latched
             // to the old session.
-            _ = try? await Self.withTimeout(Self.authedCallTimeout) { [client] in
+            let (client, _) = currentClient()
+            _ = try? await Self.withTimeout(authedCallTimeout) {
                 await client.logout()
             }
             authGate.reset()
@@ -471,20 +849,44 @@ public struct CaptureCreateInput: Equatable, Sendable {
         /// cancellation (see `withTimeout`). This is what prevents a hung call
         /// from permanently wedging `SyncEngine`'s `isDraining` reentrancy
         /// guard, the failure that once left captures unsynced for 20+ hours
-        /// until an app relaunch. 15s is generous for a real slow network yet
-        /// short enough that a genuine hang self-resolves into a retry quickly.
-        private static let authedCallTimeout: Duration = .seconds(15)
+        /// until an app relaunch. 15s (the production default) is generous
+        /// for a real slow network yet short enough that a genuine hang
+        /// self-resolves into a retry quickly. Instance property (not
+        /// `static let`) so `init(makeClient:healthTracker:authedCallTimeout:)`
+        /// can inject a short duration for tests.
+        private let authedCallTimeout: Duration
+
+        /// Classifies a call's thrown error for the health tracker (shared by
+        /// `authedMutation`/`authedAction`/`authedQuery`'s catch arms):
+        /// `requestFailed` whose message mentions a timeout counts as
+        /// `.timedOut`; anything else (a real result path never reaches
+        /// here, decoding failures, backend/`ConvexError` rejections
+        /// including a server-side `NotAuthenticatedError`) proves the
+        /// connection round-tripped, so it counts as `.success` — see KTD1's
+        /// COUNT/RESET rules.
+        private static func classifyOutcome(_ error: Error) -> ConvexConnectionHealthTracker.Outcome {
+            if case let .requestFailed(message)? = error as? ConvexServiceError,
+               message.contains("timed out")
+            {
+                return .timedOut
+            }
+            return .success
+        }
 
         private func authedMutation<T: Decodable>(
             _ name: String, with args: [String: ConvexEncodable?]? = nil
         ) async throws -> T {
             try await ensureAuthAttached()
+            let (client, generation) = currentClient()
             do {
-                return try await Self.withTimeout(Self.authedCallTimeout) {
-                    try await self.client.mutation(name, with: args)
+                let result: T = try await Self.withTimeout(authedCallTimeout) {
+                    try await client.mutation(name, with: args)
                 }
+                noteOutcome(.success, generation: generation)
+                return result
             } catch {
                 NSLog("Whistle: Convex mutation %@ failed: %@", name, String(describing: error))
+                noteOutcome(Self.classifyOutcome(error), generation: generation)
                 throw Self.mapAuthError(error)
             }
         }
@@ -499,12 +901,16 @@ public struct CaptureCreateInput: Equatable, Sendable {
             _ name: String, with args: [String: ConvexEncodable?]? = nil
         ) async throws -> T {
             try await ensureAuthAttached()
+            let (client, generation) = currentClient()
             do {
-                return try await Self.withTimeout(Self.authedCallTimeout) {
-                    try await self.client.action(name, with: args)
+                let result: T = try await Self.withTimeout(authedCallTimeout) {
+                    try await client.action(name, with: args)
                 }
+                noteOutcome(.success, generation: generation)
+                return result
             } catch {
                 NSLog("Whistle: Convex action %@ failed: %@", name, String(describing: error))
+                noteOutcome(Self.classifyOutcome(error), generation: generation)
                 throw Self.mapAuthError(error)
             }
         }
@@ -528,12 +934,16 @@ public struct CaptureCreateInput: Equatable, Sendable {
             _ name: String, with args: [String: ConvexEncodable?]? = nil
         ) async throws -> T {
             try await ensureAuthAttached()
+            let (client, generation) = currentClient()
             do {
-                return try await Self.firstValue(
+                let result: T = try await Self.firstValue(
                     from: client.subscribe(to: name, with: args, yielding: T.self)
                 )
+                noteOutcome(.success, generation: generation)
+                return result
             } catch {
                 NSLog("Whistle: Convex query %@ failed: %@", name, String(describing: error))
+                noteOutcome(Self.classifyOutcome(error), generation: generation)
                 throw Self.mapAuthError(error)
             }
         }
@@ -794,6 +1204,53 @@ public struct CaptureCreateInput: Equatable, Sendable {
 
         // MARK: - Combine -> AsyncStream bridge
 
+        /// Single-resume arbiter for one subscribe-iteration of the
+        /// resubscribing bridge below: whichever happens first — the
+        /// server naturally ending this subscription (`.completed`), or a
+        /// rebuild bumping the generation out from under it (`.rebuilt`) —
+        /// wins and delivers its outcome. Mirrors `TimeoutState`'s
+        /// single-resume design but for a non-throwing two-way race.
+        private final class SubscriptionRaceState: @unchecked Sendable {
+            enum Outcome { case completed, rebuilt }
+            private let lock = NSLock()
+            private var result: Outcome?
+            private var continuation: CheckedContinuation<Outcome, Never>?
+
+            func finish(_ outcome: Outcome) {
+                let waiting: CheckedContinuation<Outcome, Never>? = lock.withLock {
+                    guard result == nil else { return nil }
+                    result = outcome
+                    defer { continuation = nil }
+                    return continuation
+                }
+                waiting?.resume(returning: outcome)
+            }
+
+            func value() async -> Outcome {
+                await withCheckedContinuation { cont in
+                    let ready: Outcome? = lock.withLock {
+                        if let result { return result }
+                        continuation = cont
+                        return nil
+                    }
+                    if let ready { cont.resume(returning: ready) }
+                }
+            }
+        }
+
+        /// Bridges convex-swift's Combine `subscribe` into an `AsyncStream`,
+        /// and — implementing U4's generation-aware resubscribe — heals a
+        /// long-lived subscription across a `rebuildClient()` without ever
+        /// finishing the continuation. A wedge would otherwise leave
+        /// `projectsList()`/`capturesListRecent()` subscribers silently
+        /// stale forever (they're bound to the dead pre-rebuild client and
+        /// never go through `withTimeout`, so they never time out either —
+        /// see the plan's R1 latency walk-through). Convex redelivers the
+        /// full current query result on every (re)subscribe, and consumers
+        /// (`HistoryViewModel.handleServerRecords` etc.) replace their
+        /// snapshot wholesale, so resubscribing on the new client restores
+        /// correct state within one round trip with no duplicate/cleared
+        /// emission (R6) — zero changes needed in any consumer.
         private func asyncStream<T: Decodable & Sendable>(
             subscribingTo name: String,
             args: [String: ConvexEncodable?]? = nil
@@ -804,41 +1261,71 @@ public struct CaptureCreateInput: Equatable, Sendable {
                         continuation.finish()
                         return
                     }
-                    // Best-effort auth attach BEFORE subscribing, so
-                    // authenticated queries don't land on the websocket
-                    // without a JWT. An unauthenticated subscribe still goes
-                    // through (matching prior behavior for the signed-out
-                    // state); the server then rejects it and the stream
-                    // finishes.
-                    try? await self.ensureAuthAttached()
-                    if Task.isCancelled {
-                        continuation.finish()
-                        return
-                    }
-                    let cancellable = self.client.subscribe(to: name, with: args, yielding: T.self)
-                        .sink(
-                            receiveCompletion: { completion in
-                                if case let .failure(error) = completion {
-                                    NSLog(
-                                        "Whistle: Convex subscription %@ failed: %@",
-                                        name, String(describing: error)
-                                    )
+                    while !Task.isCancelled {
+                        // Snapshot ONCE per resubscribe iteration (R5) — the
+                        // sink closure below must never read `self.client`.
+                        let (client, generation) = self.currentClient()
+                        // Best-effort auth attach BEFORE subscribing, so
+                        // authenticated queries don't land on the websocket
+                        // without a JWT. An unauthenticated subscribe still
+                        // goes through (matching prior behavior for the
+                        // signed-out state); the server then rejects it and
+                        // the subscription completes below.
+                        try? await self.ensureAuthAttached()
+                        if Task.isCancelled { break }
+
+                        let raceState = SubscriptionRaceState()
+                        let cancellable = client.subscribe(to: name, with: args, yielding: T.self)
+                            .sink(
+                                receiveCompletion: { completion in
+                                    if case let .failure(error) = completion {
+                                        NSLog(
+                                            "Whistle: Convex subscription %@ failed: %@",
+                                            name, String(describing: error)
+                                        )
+                                    }
+                                    raceState.finish(.completed)
+                                },
+                                receiveValue: { value in continuation.yield(value) }
+                            )
+                        self.lock.withLock { _ = self.cancellables.insert(cancellable) }
+
+                        // Race the subscription's own natural completion
+                        // against a generation change (a rebuild). Cancelling
+                        // this task (stream consumer went away) must also
+                        // stop the wait promptly, so a completed-looking
+                        // outcome is forced on cancellation.
+                        let outcome = await withTaskCancellationHandler(
+                            operation: { () async -> SubscriptionRaceState.Outcome in
+                                let watchTask = Task {
+                                    for await latestGeneration in self.generationSubject.values {
+                                        if latestGeneration != generation {
+                                            raceState.finish(.rebuilt)
+                                            return
+                                        }
+                                    }
                                 }
-                                continuation.finish()
+                                defer { watchTask.cancel() }
+                                return await raceState.value()
                             },
-                            receiveValue: { value in continuation.yield(value) }
+                            onCancel: { raceState.finish(.completed) }
                         )
-                    self.lock.withLock { _ = self.cancellables.insert(cancellable) }
-                    // Replaces the task-cancelling handler installed below;
-                    // by this point the task is finishing, so cancelling the
-                    // subscription itself is all termination needs to do.
-                    // (AsyncStream invokes a newly set onTermination
-                    // immediately if the stream already terminated, so the
-                    // subscription can't leak in that race.)
-                    continuation.onTermination = { [weak self] _ in
-                        self?.lock.withLock { _ = self?.cancellables.remove(cancellable) }
+
+                        self.lock.withLock { _ = self.cancellables.remove(cancellable) }
                         cancellable.cancel()
+
+                        switch outcome {
+                        case .completed:
+                            continuation.finish()
+                            return
+                        case .rebuilt:
+                            // Loop and resubscribe on the new client — the
+                            // continuation stays open, so consumers never
+                            // see this as a finished stream.
+                            continue
+                        }
                     }
+                    continuation.finish()
                 }
                 continuation.onTermination = { _ in
                     subscriptionTask.cancel()
@@ -986,35 +1473,6 @@ public struct CaptureCreateInput: Equatable, Sendable {
         /// on the `refreshProjects` response and on older backends — decode as
         /// optional and treat absence as "no change."
         let changedFromPrevious: Bool?
-    }
-
-    /// Serializes "attach auth once; re-attempt after failure" semantics for
-    /// `LiveConvexService`. Internal (not private) so the sequencing
-    /// regression can be unit-tested without a live Convex client.
-    final class ConvexAuthAttachmentGate: @unchecked Sendable {
-        private let lock = NSLock()
-        private var attached = false
-
-        /// Runs `attach` unless a prior attempt already succeeded. Returns
-        /// the overall attached state. A failed attempt leaves the gate
-        /// open so the next call re-attempts.
-        func runIfNeeded(_ attach: () async -> Bool) async -> Bool {
-            if lock.withLock({ attached }) { return true }
-            let success = await attach()
-            if success {
-                lock.withLock { attached = true }
-            }
-            return success
-        }
-
-        /// Forces the next `runIfNeeded` call to re-attempt `attach`, even if
-        /// a prior attempt already succeeded. Called on sign-out (via
-        /// `detachAuth()`) so a later sign-in -- as the same user or a
-        /// different one -- can't short-circuit on the old `attached == true`
-        /// and skip pulling a fresh token.
-        func reset() {
-            lock.withLock { attached = false }
-        }
     }
 
     /// Bridges WhistleCore's pull-based `WhistleAuthProvider.currentIdToken()`
