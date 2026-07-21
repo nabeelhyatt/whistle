@@ -48,6 +48,13 @@ class MockConductor {
   >();
   messagesBySession = new Map<string, MockMessage[]>();
 
+  /** Projects the API key can see (GET /v0/projects). Defaults to the id the
+   * test fixtures capture under ("proj-1"); a test can replace this to
+   * simulate a key from a different Conductor account that can't see it. */
+  projects: Array<{ id: string; name: string; gitRemote: string }> = [
+    { id: "proj-1", name: "Whistle", gitRemote: "https://github.com/org/whistle.git" },
+  ];
+
   createWorkspaceCount = 0;
   sendMessageCalls: Array<{ sessionId: string; messageId: string }> = [];
 
@@ -149,6 +156,19 @@ class MockConductor {
       const ws = this.workspaces.get(workspaceId);
       if (!ws) return json(200, { data: [] });
       return json(200, { data: [{ id: ws.sessionId }] });
+    }
+
+    // GET /v0/projects (project-visibility guard + key validation)
+    if (method === "GET" && (path === "/v0/projects" || path.startsWith("/v0/projects?"))) {
+      const parsed = new URL(url);
+      const offset = Number(parsed.searchParams.get("offset") ?? "0");
+      const limit = Number(parsed.searchParams.get("limit") ?? String(this.projects.length));
+      const data = this.projects.slice(offset, offset + limit);
+      return json(200, {
+        data,
+        offset,
+        hasMore: offset + data.length < this.projects.length,
+      });
     }
 
     // GET /v0/projects/{id}/workspaces (orphan adoption search)
@@ -654,6 +674,67 @@ describe("happy path", () => {
     const capture = await asUser.query(api.captures.get, { captureId });
     expect(capture?.status).toBe("agentWorking");
     expect(mock.sendMessageCalls).toHaveLength(1);
+  });
+});
+
+describe("project-visibility guard (canonical-accounts)", () => {
+  test("capture's project not visible to the key -> terminal failed/auth, no workspace created", async () => {
+    const t = convexTest(schema, modules);
+    // The key can only see a *different* project than the capture's proj-1,
+    // simulating a key that belongs to a different Conductor account (the one
+    // the capture's project was picked under).
+    mock.projects = [
+      { id: "proj-other", name: "Other", gitRemote: "https://github.com/org/other.git" },
+    ];
+    const { asUser, captureId } = await setupUserWithCapture(t, "auth0|proj-guard", {
+      clientId: "client-proj-guard",
+      projectId: "proj-1",
+    });
+
+    await tick(t);
+
+    const capture = await asUser.query(api.captures.get, { captureId });
+    expect(capture?.status).toBe("failed");
+    expect(capture?.errorCode).toBe("auth");
+    expect(capture?.error).toMatch(/different Conductor account/i);
+    // Guard fires before any workspace/message side effects.
+    expect(mock.createWorkspaceCount).toBe(0);
+    expect(mock.sendMessageCalls).toHaveLength(0);
+  });
+
+  test("capture's project visible to the key -> proceeds to create + agentWorking", async () => {
+    const t = convexTest(schema, modules);
+    // Default mock.projects includes proj-1, so the guard passes.
+    const { asUser, captureId } = await setupUserWithCapture(t, "auth0|proj-guard-ok", {
+      clientId: "client-proj-guard-ok",
+      projectId: "proj-1",
+    });
+
+    await tick(t);
+
+    const capture = await asUser.query(api.captures.get, { captureId });
+    expect(capture?.status).toBe("agentWorking");
+    expect(mock.createWorkspaceCount).toBe(1);
+  });
+
+  test("capture's project visible on a later projects page -> proceeds to create", async () => {
+    const t = convexTest(schema, modules);
+    mock.projects = Array.from({ length: 51 }, (_, i) => ({
+      id: `proj-${i + 1}`,
+      name: `Project ${i + 1}`,
+      gitRemote: `https://github.com/org/project-${i + 1}.git`,
+    }));
+    const { asUser, captureId } = await setupUserWithCapture(t, "auth0|proj-guard-page", {
+      clientId: "client-proj-guard-page",
+      projectId: "proj-51",
+      projectName: "Project 51",
+    });
+
+    await tick(t);
+
+    const capture = await asUser.query(api.captures.get, { captureId });
+    expect(capture?.status).toBe("agentWorking");
+    expect(mock.createWorkspaceCount).toBe(1);
   });
 });
 

@@ -10,7 +10,7 @@
 // (settings.update), screenshot on/off default, the template editor
 // (TemplateEditor.swift), account/sign-out, and API key management (masked
 // display via settings.get hasKey/last-4; replace flow =
-// settings.setConductorKey then conductor.validateKey).
+// conductor.validateKey then settings.setConductorKey).
 
 import AppKit
 import Combine
@@ -49,6 +49,11 @@ public final class SettingsViewModel: ObservableObject {
     @Published public private(set) var isReplacingKey = false
     @Published public private(set) var keyStatusMessage: String?
     @Published public private(set) var keyReplaceSucceeded: Bool?
+    /// Set after a successful Save & Validate when the new key lists a
+    /// different set of Conductor projects than the previous key — a heads-up
+    /// that it may belong to a different Conductor account (canonical-accounts).
+    @Published public private(set) var keyProjectsChanged = false
+    @Published public private(set) var keyProjectsAvailable = false
 
     @Published public private(set) var loadError: String?
     @Published public private(set) var authState: AuthState
@@ -94,6 +99,7 @@ public final class SettingsViewModel: ObservableObject {
             screenshotsEnabled = snapshot.screenshotsEnabled
             defaultProjectId = snapshot.defaultProjectId
             hasKey = snapshot.hasKey
+            keyProjectsAvailable = snapshot.hasKey
             keyLastFour = snapshot.lastFour
             loadError = nil
         } catch {
@@ -187,9 +193,8 @@ public final class SettingsViewModel: ObservableObject {
         return "•••••••••••• (on file)"
     }
 
-    /// Replace flow per plan U10: `settings.setConductorKey` then
-    /// `conductor.validateKey` (validates the stored key server-side and
-    /// refreshes the projects cache).
+    /// Replace flow per plan U10: validate the pasted key first, then persist
+    /// it only after Conductor accepts it.
     public func replaceKey() async {
         let key = newKeyInput.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !key.isEmpty else {
@@ -201,25 +206,40 @@ public final class SettingsViewModel: ObservableObject {
         isReplacingKey = true
         defer { isReplacingKey = false }
 
+        let result: ConductorValidateResult
+        do {
+            result = try await convex.conductorValidateKeyDetailed(key: key)
+        } catch {
+            keyStatusMessage = "Couldn't save/validate the key (network or server error)."
+            keyReplaceSucceeded = false
+            keyProjectsChanged = false
+            return
+        }
+
+        guard result.ok else {
+            keyStatusMessage = "Conductor rejected this key. Double-check it at app.conductor.build/users/api-keys."
+            keyReplaceSucceeded = false
+            keyProjectsChanged = false
+            return
+        }
+
         do {
             try await convex.settingsSetConductorKey(key)
-            let valid = try await convex.conductorValidateKey(key: nil)
-            if valid {
-                keyStatusMessage = "Key saved and validated."
-                keyReplaceSucceeded = true
-                newKeyInput = ""
-                // Refresh masked display (hasKey / last-4).
-                if let snapshot = try? await convex.settingsGet() {
-                    hasKey = snapshot.hasKey
-                    keyLastFour = snapshot.lastFour
-                }
-            } else {
-                keyStatusMessage = "Key saved, but Conductor rejected it. Double-check it at app.conductor.build/users/api-keys."
-                keyReplaceSucceeded = false
+            keyStatusMessage = "Key saved and validated."
+            keyReplaceSucceeded = true
+            keyProjectsChanged = result.projectsChanged
+            keyProjectsAvailable = true
+            newKeyInput = ""
+            // Refresh masked display (hasKey / last-4).
+            if let snapshot = try? await convex.settingsGet() {
+                hasKey = snapshot.hasKey
+                keyLastFour = snapshot.lastFour
             }
         } catch {
             keyStatusMessage = "Couldn't save/validate the key (network or server error)."
             keyReplaceSucceeded = false
+            keyProjectsChanged = false
+            keyProjectsAvailable = false
         }
     }
 
@@ -343,6 +363,27 @@ struct SettingsView: View {
                     )
                     .foregroundStyle(viewModel.keyReplaceSucceeded == true ? Color.secondary : .orange)
                     .font(.callout)
+                }
+
+                if viewModel.keyProjectsChanged {
+                    Label(
+                        "This key can see a different set of Conductor projects than your previous key. If that's unexpected, it may belong to a different Conductor account than the one you use in the Conductor app.",
+                        systemImage: "exclamationmark.triangle"
+                    )
+                    .foregroundStyle(.orange)
+                    .font(.callout)
+                }
+            }
+
+            // Which Conductor account is this key on? There's no Conductor
+            // whoami endpoint, so we show the projects the key can reach as an
+            // identity proxy — a mismatch with what the user expects is the
+            // tell that captures will land in the wrong account.
+            if viewModel.hasKey && viewModel.keyProjectsAvailable && !viewModel.projects.isEmpty {
+                Section("Projects this key can access") {
+                    ForEach(viewModel.projects) { project in
+                        Text(project.name)
+                    }
                 }
             }
         }

@@ -85,6 +85,15 @@ private final class FakeOnboardingConvexService: ConvexServiceProtocol, @uncheck
         return try validateKeyResult.get()
     }
 
+    var validateKeyDetailedResult: Result<ConductorValidateResult, Error>?
+    func conductorValidateKeyDetailed(key: String?) async throws -> ConductorValidateResult {
+        lock.lock(); validateKeyCalls.append(key); let detailed = validateKeyDetailedResult; lock.unlock()
+        if let detailed {
+            return try detailed.get()
+        }
+        return ConductorValidateResult(ok: try validateKeyResult.get(), projectsChanged: false)
+    }
+
     func conductorRefreshProjects() async throws {}
 
     // MARK: projects
@@ -681,13 +690,27 @@ final class SettingsViewModelTests: XCTestCase {
         viewModel.newKeyInput = "ck_new_key_7890"
         await viewModel.replaceKey()
 
-        // Replace flow order per plan U10: setConductorKey THEN validateKey
-        // (validate with key: nil = validate the stored key).
+        // Replace flow order per plan U10: validate the candidate first, then
+        // store it only after Conductor accepts it.
         XCTAssertEqual(convex.setConductorKeyCalls, ["ck_new_key_7890"])
-        XCTAssertEqual(convex.validateKeyCalls, [nil])
+        XCTAssertEqual(convex.validateKeyCalls, ["ck_new_key_7890"])
         XCTAssertEqual(viewModel.keyReplaceSucceeded, true)
         XCTAssertTrue(viewModel.newKeyInput.isEmpty, "input clears after a successful replace")
         XCTAssertEqual(viewModel.maskedKeyDisplay, "••••••••••••7890")
+    }
+
+    func testSuccessfulReplaceCanWarnWhenProjectSetChanged() async throws {
+        let convex = FakeOnboardingConvexService()
+        convex.validateKeyDetailedResult = .success(ConductorValidateResult(ok: true, projectsChanged: true))
+        let (viewModel, _, _) = makeViewModel(convex: convex)
+        await viewModel.load()
+
+        viewModel.newKeyInput = "ck_new_key_7890"
+        await viewModel.replaceKey()
+
+        XCTAssertEqual(viewModel.keyReplaceSucceeded, true)
+        XCTAssertTrue(viewModel.keyProjectsChanged)
+        XCTAssertTrue(viewModel.keyProjectsAvailable)
     }
 
     func testReplaceKeyRejectedByConductorSurfacesInlineWarning() async throws {
@@ -701,6 +724,33 @@ final class SettingsViewModelTests: XCTestCase {
 
         XCTAssertEqual(viewModel.keyReplaceSucceeded, false)
         XCTAssertNotNil(viewModel.keyStatusMessage)
+        XCTAssertTrue(convex.setConductorKeyCalls.isEmpty, "a rejected replacement key must never be stored")
+    }
+
+    func testRejectedStoredKeyReplacementDoesNotReplaceTheCurrentKeyOrCache() async throws {
+        let convex = FakeOnboardingConvexService()
+        convex.settingsSnapshot = SettingsSnapshot(
+            defaultProjectId: nil, agent: "claude", model: nil,
+            screenshotsEnabled: true, hasKey: true, lastFour: "old1"
+        )
+        convex.projectsToYield = [
+            Project(id: "old-project", name: "Old Account Project", gitRemote: "git@example.com:old.git")
+        ]
+        convex.validateKeyDetailedResult = .success(ConductorValidateResult(ok: false, projectsChanged: false))
+        let (viewModel, _, _) = makeViewModel(convex: convex)
+        await viewModel.load()
+
+        try await Whistle_waitUntil { viewModel.projects.count == 1 }
+        XCTAssertTrue(viewModel.keyProjectsAvailable)
+
+        viewModel.newKeyInput = "ck_rejected_new_key"
+        await viewModel.replaceKey()
+
+        XCTAssertEqual(viewModel.keyReplaceSucceeded, false)
+        XCTAssertTrue(convex.setConductorKeyCalls.isEmpty, "the rejected key must not become the stored key")
+        XCTAssertTrue(viewModel.keyProjectsAvailable)
+        XCTAssertEqual(viewModel.maskedKeyDisplay, "••••••••••••old1")
+        XCTAssertEqual(viewModel.projects.map(\.id), ["old-project"])
     }
 
     func testSignOutTransitionsAuthToSignedOut() async throws {

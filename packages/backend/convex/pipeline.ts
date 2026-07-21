@@ -22,6 +22,7 @@ import {
   createWorkspace,
   getSessionStatus,
   getWorkspaceStatus,
+  listAllProjects,
   listMessages,
   listProjectWorkspaces,
   listWorkspaceSessions,
@@ -85,6 +86,11 @@ export function buildWorkspaceName(args: {
 /** Returns the `#<clientId prefix>` tag used for orphan-workspace adoption. */
 function orphanTag(clientId: string): string {
   return `#${clientId.slice(0, 6)}`;
+}
+
+async function projectVisibleToKey(apiKey: string, projectId: string): Promise<boolean> {
+  const visibleProjects = await listAllProjects(apiKey, { limit: 50 });
+  return visibleProjects.some((p) => p.id === projectId);
 }
 
 // ─── Clarifying-questions / summary extraction (dumb, safe heuristics) ──
@@ -401,6 +407,25 @@ async function runSubmit(
   let deepLink = capture.deepLink;
 
   if (workspaceId === undefined || sessionId === undefined) {
+    // 3·0. Project-visibility guard (canonical-accounts). The stored key must
+    // be able to see this capture's project. A key that belongs to a
+    // *different* Conductor account than the one the user picked the project
+    // under lists a different project set (or none) — orphan-adoption's
+    // listProjectWorkspaces and createWorkspace would then fail with an opaque
+    // 4xx that burns all five retries and strands the capture in "Agent
+    // working" pointing at a workspace the user can't open. Fail fast with a
+    // Settings-routing message instead. Runs only on a fresh submit (no
+    // workspaceId yet); adopted/created captures skip it on later passes.
+    if (!(await projectVisibleToKey(apiKey, capture.projectId))) {
+      await patchCapture(ctx, captureId, {
+        status: "failed",
+        errorCode: "auth",
+        error:
+          "This capture's Conductor project isn't visible to your saved API key — the key may belong to a different Conductor account. Update it in Settings.",
+      });
+      return;
+    }
+
     // 3a. Orphan adoption: search for a workspace already tagged with our
     // clientId (a previous run created it but died before patching ids).
     const tag = orphanTag(capture.clientId);

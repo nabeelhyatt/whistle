@@ -144,6 +144,11 @@ public protocol ConvexServiceProtocol: Sendable {
 
     // MARK: conductor
     func conductorValidateKey(key: String?) async throws -> Bool
+    /// Like `conductorValidateKey`, but also reports whether this key's project
+    /// set differs from the previously-saved key (canonical-accounts). Has a
+    /// default implementation so existing fakes/tests conform unchanged; only
+    /// `LiveConvexService` decodes the extra signal.
+    func conductorValidateKeyDetailed(key: String?) async throws -> ConductorValidateResult
     func conductorRefreshProjects() async throws
 
     // MARK: projects
@@ -174,6 +179,13 @@ public protocol ConvexServiceProtocol: Sendable {
 /// that wants to assert on the call can still override it.
 public extension ConvexServiceProtocol {
     func detachAuth() async {}
+
+    /// Default: fall back to the plain bool validate and report no project-set
+    /// change. `LiveConvexService` overrides this to decode the real signal;
+    /// fakes/onboarding that only care about validity inherit this unchanged.
+    func conductorValidateKeyDetailed(key: String?) async throws -> ConductorValidateResult {
+        ConductorValidateResult(ok: try await conductorValidateKey(key: key), projectsChanged: false)
+    }
 }
 
 // MARK: - Supporting request/response shapes
@@ -189,6 +201,22 @@ public struct UserSelfSnapshot: Codable, Equatable, Sendable {
     public init(email: String?, authSubject: String) {
         self.email = email
         self.authSubject = authSubject
+    }
+}
+
+/// The richer result of validating a Conductor API key (canonical-accounts):
+/// besides `ok`, `projectsChanged` reports whether this key sees a different
+/// set of Conductor projects than the previously-saved key — a heads-up that
+/// the key may belong to a different Conductor account than the one the user
+/// runs the Conductor app under. There is no Conductor whoami endpoint, so the
+/// project set is the closest available identity proxy.
+public struct ConductorValidateResult: Equatable, Sendable {
+    public let ok: Bool
+    public let projectsChanged: Bool
+
+    public init(ok: Bool, projectsChanged: Bool) {
+        self.ok = ok
+        self.projectsChanged = projectsChanged
     }
 }
 
@@ -595,6 +623,19 @@ public struct CaptureCreateInput: Equatable, Sendable {
             return result.ok
         }
 
+        public func conductorValidateKeyDetailed(key: String?) async throws -> ConductorValidateResult {
+            // Same wire call as `conductorValidateKey` (see the note there), but
+            // surfaces the `changedFromPrevious` field the Settings key flow
+            // uses to warn about a possible different-account key.
+            let result: ConductorActionResult = try await authedAction(
+                "projects:validateKey", with: Self.conductorValidateKeyArgs(key)
+            )
+            return ConductorValidateResult(
+                ok: result.ok,
+                projectsChanged: result.changedFromPrevious ?? false
+            )
+        }
+
         /// Builds the `projects:validateKey` argument dict, omitting the
         /// `apiKey` key entirely when `key` is `nil` rather than including it
         /// with a `nil` value. The backend validator is `v.optional(v.string())`
@@ -940,6 +981,11 @@ public struct CaptureCreateInput: Equatable, Sendable {
     struct ConductorActionResult: Decodable, Sendable {
         let ok: Bool
         let error: String?
+        /// True when this key lists a different set of Conductor projects than
+        /// the previously-cached key (see `projects.ts` `validateKey`). Absent
+        /// on the `refreshProjects` response and on older backends — decode as
+        /// optional and treat absence as "no change."
+        let changedFromPrevious: Bool?
     }
 
     /// Serializes "attach auth once; re-attempt after failure" semantics for
