@@ -415,6 +415,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func noteAuthDeferredDrain() {
         consecutiveAuthDeferredDrains += 1
+        // Diagnostic: makes the escalation cadence toward `.reauthRequired`
+        // visible in logs (a stale-token session climbs 1 → 2 → 3 here just
+        // before "session expired" surfaces). See the ID-token-expiry fix in
+        // `Auth0AuthProvider.currentIdToken()`.
+        NSLog(
+            "Whistle: auth-deferred drain #%d (threshold %d)",
+            consecutiveAuthDeferredDrains,
+            Self.authDeferredEscalationThreshold
+        )
         guard consecutiveAuthDeferredDrains >= Self.authDeferredEscalationThreshold,
               authController?.state == .signedIn
         else { return }
