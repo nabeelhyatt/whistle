@@ -48,6 +48,16 @@ final class Auth0IdTokenExpiryTests: XCTestCase {
         XCTAssertEqual(try XCTUnwrap(ttl), 120, accuracy: 1)
     }
 
+    func testTwoSegmentTokenDecodes() {
+        // The decoder accepts `header.payload` with no signature segment
+        // (`segments.count >= 2`, not `== 3`). Assert that boundary actually
+        // decodes rather than being rejected as malformed.
+        let header = base64URLEncode(Data(#"{"alg":"RS256"}"#.utf8))
+        let payload = base64URLEncode(try! JSONSerialization.data(withJSONObject: ["exp": now.timeIntervalSince1970 + 500]))
+        let ttl = Auth0AuthProvider.idTokenSecondsRemaining("\(header).\(payload)", now: now)
+        XCTAssertEqual(try XCTUnwrap(ttl), 500, accuracy: 1)
+    }
+
     func testMissingExpClaimReturnsNil() {
         let jwt = makeJWT(claims: ["sub": "auth0|abc", "aud": "client"])
         XCTAssertNil(Auth0AuthProvider.idTokenSecondsRemaining(jwt, now: now))

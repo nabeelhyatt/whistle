@@ -99,15 +99,22 @@ public actor Auth0AuthProvider: WhistleAuthProvider {
     private let config: Auth0Config?
     private var hasAuthenticatedThisSession = false
 
-    /// Bumped on every `logout()`. `currentIdToken()` captures it before an
-    /// in-flight credential fetch / `renew()` and, once the fetch completes,
-    /// discards the result and re-clears the Keychain if the value changed. A
-    /// proactive refresh that lands *after* sign-out would otherwise re-persist
-    /// credentials (both `CredentialsManager.credentials` and `renew` store on
-    /// success) and resurrect the just-ended session — the actor suspends
-    /// across those awaits, so a concurrent `logout()` can interleave. See the
-    /// cubic review on PR #23.
+    /// Bumped on every session-state transition — both `login()` and
+    /// `logout()`. `currentIdToken()` captures it before an in-flight credential
+    /// fetch / `renew()` and, once the fetch completes, discards the result if
+    /// the value changed (a proactive refresh landing *after* a transition is
+    /// stale — the actor suspends across those awaits, so `login`/`logout` can
+    /// interleave). See the cubic review on PR #23.
     private var sessionGeneration = 0
+
+    /// The `sessionGeneration` value set by the most recent `logout()`. Lets
+    /// `discardingIfSignedOut` tell "signed out, nothing logged in since"
+    /// (`sessionGeneration == lastLogoutGeneration`) from "a newer `login()`
+    /// has since stored a legitimate session" (`sessionGeneration >`). Only in
+    /// the former case may it re-clear the Keychain — clearing on the latter
+    /// would delete the new session a straggler refresh raced past, silently
+    /// re-creating the "session expired" bug on account switch (PR #23 review).
+    private var lastLogoutGeneration = 0
 
     #if canImport(Auth0)
         private lazy var credentialsManager: CredentialsManager? = {
@@ -198,8 +205,17 @@ public actor Auth0AuthProvider: WhistleAuthProvider {
         /// nil so sign-out stays final.
         private func discardingIfSignedOut(_ token: String, since generation: Int, manager: CredentialsManager) -> String? {
             guard generation == sessionGeneration else {
-                _ = manager.clear()
-                NSLog("Whistle: discarded a token from a refresh that completed after sign-out")
+                // A `login()` or `logout()` interleaved with our fetch, so this
+                // token is stale — never return it. Only re-clear the Keychain
+                // when we're actually signed out (the last transition was a
+                // logout with no login after it). If a newer login has stored a
+                // fresh session, clearing here would delete *that* session — the
+                // account-switch regression flagged in PR #23 review — so leave
+                // it be and just drop our stale token.
+                if sessionGeneration == lastLogoutGeneration {
+                    _ = manager.clear()
+                    NSLog("Whistle: discarded a token from a refresh that completed after sign-out")
+                }
                 return nil
             }
             return token
@@ -208,22 +224,25 @@ public actor Auth0AuthProvider: WhistleAuthProvider {
         /// Bridges `CredentialsManager.credentials` (callback) to async. Auto-
         /// renews only when the *access token* is expired (see `currentIdToken`).
         private func storedCredentials(_ manager: CredentialsManager) async -> Credentials? {
-            await withCheckedContinuation { continuation in
-                manager.credentials { result in
-                    switch result {
-                    case let .success(credentials): continuation.resume(returning: credentials)
-                    case .failure: continuation.resume(returning: nil)
-                    }
-                }
-            }
+            await bridgedCredentials { manager.credentials(callback: $0) }
         }
 
         /// Bridges `CredentialsManager.renew` (callback) to async — a forced
         /// refresh-token exchange that returns (and persists) fresh credentials,
         /// including a new ID token, regardless of access-token validity.
         private func renewedCredentials(_ manager: CredentialsManager) async -> Credentials? {
+            await bridgedCredentials { manager.renew(callback: $0) }
+        }
+
+        /// Shared callback-to-async bridge for the `CredentialsManager` calls
+        /// above: awaits the callback, mapping `.success` to the credentials and
+        /// `.failure` to nil. Extracted so the success/failure mapping lives in
+        /// one place (PR #23 review).
+        private func bridgedCredentials(
+            _ call: (@escaping (CredentialsManagerResult<Credentials>) -> Void) -> Void
+        ) async -> Credentials? {
             await withCheckedContinuation { continuation in
-                manager.renew { result in
+                call { result in
                     switch result {
                     case let .success(credentials): continuation.resume(returning: credentials)
                     case .failure: continuation.resume(returning: nil)
@@ -308,6 +327,10 @@ public actor Auth0AuthProvider: WhistleAuthProvider {
                     }
             }
             _ = credentialsManager.store(credentials: credentials)
+            // Advance the generation past any `lastLogoutGeneration` so a
+            // straggler refresh from a previous session can't re-clear this
+            // freshly-stored one (see `discardingIfSignedOut`).
+            sessionGeneration += 1
             hasAuthenticatedThisSession = true
         #else
             throw Auth0AuthError.notConfigured
@@ -325,7 +348,10 @@ public actor Auth0AuthProvider: WhistleAuthProvider {
             // Bump first: any in-flight `currentIdToken()` refresh that completes
             // after this point sees the changed generation and re-clears rather
             // than resurrecting the session (see `discardingIfSignedOut`).
+            // Record it as the logout marker so `discardingIfSignedOut` knows
+            // we're signed out (vs. a later login having advanced the generation).
             sessionGeneration += 1
+            lastLogoutGeneration = sessionGeneration
             _ = credentialsManager?.clear()
         #endif
         hasAuthenticatedThisSession = false
