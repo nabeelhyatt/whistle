@@ -99,6 +99,23 @@ public actor Auth0AuthProvider: WhistleAuthProvider {
     private let config: Auth0Config?
     private var hasAuthenticatedThisSession = false
 
+    /// Bumped on every session-state transition — both `login()` and
+    /// `logout()`. `currentIdToken()` captures it before an in-flight credential
+    /// fetch / `renew()` and, once the fetch completes, discards the result if
+    /// the value changed (a proactive refresh landing *after* a transition is
+    /// stale — the actor suspends across those awaits, so `login`/`logout` can
+    /// interleave). See the cubic review on PR #23.
+    private var sessionGeneration = 0
+
+    /// The `sessionGeneration` value set by the most recent `logout()`. Lets
+    /// `discardingIfSignedOut` tell "signed out, nothing logged in since"
+    /// (`sessionGeneration == lastLogoutGeneration`) from "a newer `login()`
+    /// has since stored a legitimate session" (`sessionGeneration >`). Only in
+    /// the former case may it re-clear the Keychain — clearing on the latter
+    /// would delete the new session a straggler refresh raced past, silently
+    /// re-creating the "session expired" bug on account switch (PR #23 review).
+    private var lastLogoutGeneration = 0
+
     #if canImport(Auth0)
         private lazy var credentialsManager: CredentialsManager? = {
             guard let config else { return nil }
@@ -113,22 +130,166 @@ public actor Auth0AuthProvider: WhistleAuthProvider {
 
     // MARK: WhistleAuthProvider
 
+    /// Leeway (seconds) before the ID token's `exp` at which we proactively
+    /// force a refresh-token exchange. The ID token is the JWT handed to
+    /// Convex; if it's already expired (or about to be) when a call goes out,
+    /// the backend rejects it as `NotAuthenticatedError`. 5 minutes is
+    /// comfortably longer than any single Convex round-trip yet short relative
+    /// to the ID token's lifetime, so we refresh at most once per token window.
+    static let idTokenRefreshLeeway: TimeInterval = 300
+
+    /// Returns a currently-valid Auth0 **ID token** for Convex, proactively
+    /// renewing it when it is at/near expiry.
+    ///
+    /// Why this is not just `credentialsManager.credentials { $0.idToken }`:
+    /// Auth0.swift's `CredentialsManager` decides whether to renew by looking
+    /// at the **access token**'s expiry (`Credentials.expiresIn`), and only
+    /// then hands back whatever `idToken` it has stored. But login here uses
+    /// no `.audience()`, so the access token is an opaque `/userinfo` token
+    /// (~24h) while the ID token expires at the tenant default (~10h). In the
+    /// window between those two lifetimes the manager considers the credentials
+    /// "valid" and returns a **stale, already-expired ID token** — Convex then
+    /// rejects every call and the app escalates to "session expired". We close
+    /// that window by decoding the ID token's own `exp` and forcing
+    /// `renew()` (a real refresh-token exchange) when it's within the leeway.
     public func currentIdToken() async -> String? {
         #if canImport(Auth0)
             guard let credentialsManager else { return nil }
-            return await withCheckedContinuation { continuation in
-                credentialsManager.credentials { result in
-                    switch result {
-                    case let .success(credentials):
-                        continuation.resume(returning: credentials.idToken)
-                    case .failure:
-                        continuation.resume(returning: nil)
-                    }
-                }
+            // Capture the session generation before any awaited credential fetch
+            // so a `logout()` that races the fetch can be detected and its
+            // resurrecting side effect undone (see `discardingIfSignedOut`).
+            let generationAtStart = sessionGeneration
+            guard let credentials = await storedCredentials(credentialsManager) else {
+                return nil
             }
+            let idTokenTTL = Self.idTokenSecondsRemaining(credentials.idToken)
+            let ttlDescription = idTokenTTL.map { String(format: "%.0f", $0) } ?? "unknown"
+            NSLog(
+                "Whistle: currentIdToken — idToken ttl=%@s, accessToken expiresIn=%.0fs",
+                ttlDescription,
+                credentials.expiresIn.timeIntervalSinceNow
+            )
+            // Fresh enough: hand back the cached ID token unchanged.
+            if let ttl = idTokenTTL, ttl > Self.idTokenRefreshLeeway {
+                return discardingIfSignedOut(credentials.idToken, since: generationAtStart, manager: credentialsManager)
+            }
+            // Missing/undecodable `exp` or within the leeway: force a real
+            // refresh-token exchange so Convex always gets a fresh ID token.
+            NSLog("Whistle: ID token at/near expiry (ttl=%@s) — forcing refresh-token exchange", ttlDescription)
+            guard let renewed = await renewedCredentials(credentialsManager) else {
+                // Renew failed (refresh token revoked/expired, offline). Returning
+                // nil makes the *explicit* attach path
+                // (WhistleToConvexAuthProviderBridge → `ensureAuthAttached`'s
+                // `loginFromCache`) throw `.notAuthenticated` so the app escalates
+                // to reauth rather than resending a stale token. Caveat: convex-
+                // swift's own `fetchToken(forceRefresh:)` FFI path swallows that
+                // throw with `try?` and keeps its previously cached token, so a
+                // stale token can still ride *that* path until the deferral streak
+                // escalates. Clearing it (re-attach on failure) is tracked as
+                // deferred work in docs/BACKLOG.md (Phase C, item 3).
+                NSLog("Whistle: ID token refresh failed — surfacing as unauthenticated")
+                return nil
+            }
+            return discardingIfSignedOut(renewed.idToken, since: generationAtStart, manager: credentialsManager)
         #else
             return nil
         #endif
+    }
+
+    #if canImport(Auth0)
+        /// Guards the just-fetched token against a `logout()` that ran while the
+        /// fetch/`renew()` was in flight. `CredentialsManager.credentials`/`renew`
+        /// both persist on success, so a refresh completing after sign-out would
+        /// re-populate the Keychain and resurrect the session. If the generation
+        /// moved, we clear the Keychain again (undoing that re-persist) and return
+        /// nil so sign-out stays final.
+        private func discardingIfSignedOut(_ token: String, since generation: Int, manager: CredentialsManager) -> String? {
+            guard generation == sessionGeneration else {
+                // A `login()` or `logout()` interleaved with our fetch, so this
+                // token is stale — never return it. Only re-clear the Keychain
+                // when we're actually signed out (the last transition was a
+                // logout with no login after it). If a newer login has stored a
+                // fresh session, clearing here would delete *that* session — the
+                // account-switch regression flagged in PR #23 review — so leave
+                // it be and just drop our stale token.
+                if sessionGeneration == lastLogoutGeneration {
+                    _ = manager.clear()
+                    NSLog("Whistle: discarded a token from a refresh that completed after sign-out")
+                }
+                return nil
+            }
+            return token
+        }
+
+        /// Bridges `CredentialsManager.credentials` (callback) to async. Auto-
+        /// renews only when the *access token* is expired (see `currentIdToken`).
+        private func storedCredentials(_ manager: CredentialsManager) async -> Credentials? {
+            await bridgedCredentials { manager.credentials(callback: $0) }
+        }
+
+        /// Bridges `CredentialsManager.renew` (callback) to async — a forced
+        /// refresh-token exchange that returns (and persists) fresh credentials,
+        /// including a new ID token, regardless of access-token validity.
+        private func renewedCredentials(_ manager: CredentialsManager) async -> Credentials? {
+            await bridgedCredentials { manager.renew(callback: $0) }
+        }
+
+        /// Shared callback-to-async bridge for the `CredentialsManager` calls
+        /// above: awaits the callback, mapping `.success` to the credentials and
+        /// `.failure` to nil. Extracted so the success/failure mapping lives in
+        /// one place (PR #23 review).
+        private func bridgedCredentials(
+            _ call: (@escaping (CredentialsManagerResult<Credentials>) -> Void) -> Void
+        ) async -> Credentials? {
+            await withCheckedContinuation { continuation in
+                call { result in
+                    switch result {
+                    case let .success(credentials): continuation.resume(returning: credentials)
+                    case .failure: continuation.resume(returning: nil)
+                    }
+                }
+            }
+        }
+    #endif
+
+    /// Seconds remaining until a compact-JWS JWT's `exp` claim, or `nil` if the
+    /// token can't be decoded or carries no numeric `exp`. Dependency-free (no
+    /// JWTDecode import — it isn't a declared product dependency of this
+    /// target): splits on `.`, base64url-decodes the payload segment, and reads
+    /// `exp`. Pure and `static` so it's unit-testable without a live Auth0
+    /// (`Auth0IdTokenExpiryTests`); the surrounding `currentIdToken()` renew
+    /// orchestration can't be, per this file's MockAuthProvider note.
+    static func idTokenSecondsRemaining(_ jwt: String, now: Date = Date()) -> TimeInterval? {
+        let segments = jwt.split(separator: ".", omittingEmptySubsequences: false)
+        guard segments.count >= 2,
+              let payload = base64URLDecode(String(segments[1])),
+              let json = try? JSONSerialization.jsonObject(with: payload) as? [String: Any]
+        else {
+            return nil
+        }
+        // JSON numbers bridge to NSNumber; accept either an integer or
+        // fractional `exp` (seconds since the Unix epoch).
+        let exp: Double
+        if let d = json["exp"] as? Double {
+            exp = d
+        } else if let i = json["exp"] as? Int {
+            exp = Double(i)
+        } else {
+            return nil
+        }
+        return Date(timeIntervalSince1970: exp).timeIntervalSince(now)
+    }
+
+    /// Decodes a base64url segment (JWT-style: `-`/`_` alphabet, no padding).
+    static func base64URLDecode(_ segment: String) -> Data? {
+        var s = segment
+            .replacingOccurrences(of: "-", with: "+")
+            .replacingOccurrences(of: "_", with: "/")
+        let remainder = s.count % 4
+        if remainder > 0 {
+            s += String(repeating: "=", count: 4 - remainder)
+        }
+        return Data(base64Encoded: s)
     }
 
     public var isAuthenticated: Bool {
@@ -166,6 +327,10 @@ public actor Auth0AuthProvider: WhistleAuthProvider {
                     }
             }
             _ = credentialsManager.store(credentials: credentials)
+            // Advance the generation past any `lastLogoutGeneration` so a
+            // straggler refresh from a previous session can't re-clear this
+            // freshly-stored one (see `discardingIfSignedOut`).
+            sessionGeneration += 1
             hasAuthenticatedThisSession = true
         #else
             throw Auth0AuthError.notConfigured
@@ -180,6 +345,13 @@ public actor Auth0AuthProvider: WhistleAuthProvider {
     /// into `AuthController.signOut()`.
     public func logout() async {
         #if canImport(Auth0)
+            // Bump first: any in-flight `currentIdToken()` refresh that completes
+            // after this point sees the changed generation and re-clears rather
+            // than resurrecting the session (see `discardingIfSignedOut`).
+            // Record it as the logout marker so `discardingIfSignedOut` knows
+            // we're signed out (vs. a later login having advanced the generation).
+            sessionGeneration += 1
+            lastLogoutGeneration = sessionGeneration
             _ = credentialsManager?.clear()
         #endif
         hasAuthenticatedThisSession = false
