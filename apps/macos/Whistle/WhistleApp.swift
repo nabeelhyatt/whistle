@@ -85,8 +85,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         CrashReporting.configure()
 
         let authProvider = Self.makeAuthProvider()
-        let convexService = Self.makeConvexService(authProvider: authProvider)
+        // `var`, not `let`: `ConvexServiceProtocol.onConnectionRebuilt` is a
+        // `{ get set }` requirement, and calling its setter through an `any
+        // ConvexServiceProtocol` existential requires a mutable binding even
+        // though the real conformer (`LiveConvexService`) is a class.
+        var convexService = Self.makeConvexService(authProvider: authProvider)
         self.convexService = convexService
+        // Self-heal a wedged Convex connection (KTD5): fires once,
+        // asynchronously, right after `LiveConvexService.rebuildClient()`
+        // swaps in a fresh client following a detected wedge (a short streak
+        // of consecutive call timeouts with no proof-of-life). Removes the
+        // "wait for the next periodic drain tick" tail from recovery
+        // latency -- sync retries seconds after the swap, not up to 180s
+        // later. `drainSyncIfSignedIn()` is itself a no-op while signed out,
+        // same gate as every other trigger.
+        convexService.onConnectionRebuilt = { [weak self] in
+            await self?.drainSyncIfSignedIn()
+        }
 
         let auth = AuthController(
             authProvider: authProvider,
@@ -171,6 +186,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             await syncEngine.runPeriodicDrain(gate: { [weak self] in
                 await MainActor.run { self?.isSignedIn == true }
             })
+        }
+        // Degraded-mode fast probe (KTD5): the 180s periodic interval above
+        // is the real driver of wedge-recovery latency (a socket death
+        // between drains otherwise sits silent until the next tick). While
+        // `isConnectionDegraded` (>=1 unresolved consecutive Convex call
+        // timeout) AND signed in AND at least one draft is queued/syncFailed,
+        // drain every 20s instead -- collapsing detection-to-healed from
+        // ~9 minutes to roughly ~90s. Idle (no wakeups beyond the 20s poll)
+        // once the connection is healthy again.
+        Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(20))
+                guard let self else { return }
+                guard let convexService = self.convexService, convexService.isConnectionDegraded else { continue }
+                guard self.isSignedIn else { continue }
+                guard let store = self.captureStore,
+                      let pendingDrafts = try? store.drafts(in: [.queued, .syncFailed]),
+                      !pendingDrafts.isEmpty
+                else { continue }
+                await self.drainSyncIfSignedIn()
+            }
         }
 
         let notificationService = NotificationService()

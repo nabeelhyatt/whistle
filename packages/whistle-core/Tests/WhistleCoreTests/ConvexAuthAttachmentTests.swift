@@ -92,6 +92,77 @@ final class ConvexAuthAttachmentGateTests: XCTestCase {
         XCTAssertEqual(attempts.value, 2, "reset() must force the next call to re-attempt attach instead of short-circuiting on stale state")
     }
 
+    // MARK: - Epoch compare-and-set (KTD4/R3, the reconnect plan)
+    //
+    // Regression coverage for the silent-re-wedge bug the epoch guards
+    // against: without it, an `ensureAuthAttached()` call that started its
+    // `attach()` against the OLD (pre-rebuild) client could complete AFTER
+    // `rebuildClient()` swapped in a new one and latch `attached = true` —
+    // the NEW client would then never get a chance to attach, and every
+    // future call would fail `NotAuthenticatedError` forever. `reset()` now
+    // bumps an internal epoch; `runIfNeeded` only latches a success if the
+    // epoch is unchanged when `attach()` returns.
+
+    func testResetDuringAnInFlightAttachDiscardsALateSuccessAndForcesReattach() async {
+        let gate = ConvexAuthAttachmentGate()
+        let attempts = Counter()
+        let releaseGate = ReleaseGate()
+
+        // Start an attach and hold it mid-flight (as if `loginFromCache()`
+        // were still in progress against the OLD client) until the test
+        // explicitly releases it.
+        let attachTask = Task {
+            await gate.runIfNeeded {
+                attempts.increment()
+                await releaseGate.wait()
+                return true
+            }
+        }
+
+        // Give the task a moment to pass the `attached` fast-path check and
+        // actually enter `attach()`.
+        try? await Task.sleep(for: .milliseconds(20))
+        // Simulates `rebuildClient()` calling `authGate.reset()` mid-flight.
+        gate.reset()
+        releaseGate.release()
+
+        let firstResult = await attachTask.value
+        XCTAssertFalse(
+            firstResult,
+            "an attach whose epoch moved mid-flight must be discarded (report unattached), even though its own attach() returned true"
+        )
+
+        // The next call must actually re-run attach() against the fresh
+        // epoch/client, not short-circuit on a stale `attached == true` the
+        // discarded attempt might otherwise have left behind.
+        let second = await gate.runIfNeeded {
+            attempts.increment()
+            return true
+        }
+        XCTAssertTrue(second, "the call after the epoch-discarded attach must re-attach and succeed")
+        XCTAssertEqual(attempts.value, 2, "the discarded attach must not block or skip the next real attempt")
+    }
+
+    func testAttachCompletingBeforeAnyResetLatchesNormally() async {
+        // Sanity check that the epoch machinery doesn't interfere with the
+        // ordinary (no-rebuild) path already covered above.
+        let gate = ConvexAuthAttachmentGate()
+        let attempts = Counter()
+
+        let first = await gate.runIfNeeded {
+            attempts.increment()
+            return true
+        }
+        XCTAssertTrue(first)
+
+        let second = await gate.runIfNeeded {
+            attempts.increment()
+            return true
+        }
+        XCTAssertTrue(second)
+        XCTAssertEqual(attempts.value, 1, "no reset happened, so the second call must short-circuit on the latched attach")
+    }
+
     // Regression coverage for the reauth-wedge bug: `LiveConvexService.detachAuth()`
     // previously awaited `client.logout()` with no timeout -- the only Convex
     // call in the file not wrapped in `withTimeout` -- while the reauth path
@@ -217,5 +288,38 @@ private final class TokenBox: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         return token
+    }
+}
+
+/// One-shot async gate: `wait()` suspends until `release()` is called (from
+/// any thread, any number of times -- only the first has an effect). Used to
+/// hold an in-flight `attach()` closure open long enough for the test to
+/// call `gate.reset()` mid-flight, deterministically reproducing the epoch
+/// race without relying on timing alone.
+private final class ReleaseGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var released = false
+    private var continuation: CheckedContinuation<Void, Never>?
+
+    func wait() async {
+        await withCheckedContinuation { cont in
+            lock.lock()
+            if released {
+                lock.unlock()
+                cont.resume()
+            } else {
+                continuation = cont
+                lock.unlock()
+            }
+        }
+    }
+
+    func release() {
+        lock.lock()
+        released = true
+        let pending = continuation
+        continuation = nil
+        lock.unlock()
+        pending?.resume()
     }
 }
