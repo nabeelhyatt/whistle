@@ -23,6 +23,11 @@ out/
 # misc
 .DS_Store
 *.pem
+# Signing / notarization secrets — never commit (repo is public)
+*.p12
+*.p8
+*.key
+*.mobileprovision
 
 # debug
 npm-debug.log*

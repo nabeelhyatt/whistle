@@ -1,12 +1,12 @@
 // Sparkle.xcconfig
 // Sparkle 2 auto-update configuration (TECH-SPEC §10, plan U11).
 //
-// SU_FEED_URL: PLACEHOLDER — no production web domain exists yet for this
-// one-shot build (same situation as AUTH0_DOMAIN in Auth0.xcconfig). Points
-// at the apps/web appcast route (a static public/appcast.xml file) under a
-// placeholder "whistle.app" domain, matching the sensible-placeholder
-// convention used elsewhere in this repo. Replace with the real production
-// domain once one exists, then re-run `xcodegen generate`.
+// SU_FEED_URL: the production Sparkle appcast feed, hosted at
+// nabeelhyatt.com/experiments/whistle/appcast.xml (a static XML file served
+// over HTTPS with Content-Type application/xml). The GitHub release workflow
+// (release.yml) emits a signed <item> per release; merge it into that hosted
+// appcast.xml to offer the update to existing installs. If the feed ever
+// moves, update the URL here and re-run `xcodegen generate`.
 //
 // SU_PUBLIC_ED_KEY: the PUBLIC half of a Sparkle EdDSA keypair generated
 // locally via Sparkle's `generate_keys` tool (see SECRETS.md for exactly
@@ -17,5 +17,5 @@
 // URL here would silently truncate to `https:`. The empty variable
 // substitution `$()` below splits the two slashes without changing the
 // resolved value — the standard xcconfig idiom for URLs.
-SU_FEED_URL = https:/$()/whistle.app/appcast.xml
+SU_FEED_URL = https:/$()/nabeelhyatt.com/experiments/whistle/appcast.xml
 SU_PUBLIC_ED_KEY = Y9Xz7q5K5r2Q3o4m/0UPgG9X+oU0zCujfMDbAdzabd4=
