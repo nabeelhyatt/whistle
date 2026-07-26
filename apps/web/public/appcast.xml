@@ -5,8 +5,8 @@
   Served verbatim by Next.js at /appcast.xml (static public/ asset — no
   route handler on purpose; see AGENTS.md caveat about this Next.js
   version). The macOS app's SUFeedURL (Info.plist, via
-  apps/macos/Config/Sparkle.xcconfig) points here under the placeholder
-  production domain.
+  apps/macos/Config/Sparkle.xcconfig) points at the hosted copy of this
+  file at nabeelhyatt.com/experiments/whistle/appcast.xml.
 
   This file is intentionally an EMPTY-but-valid appcast: zero <item>
   entries means Sparkle reports "you're up to date". Real release entries
@@ -17,7 +17,7 @@
 <rss version="2.0" xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle">
   <channel>
     <title>Whistle</title>
-    <link>https://whistle.app/appcast.xml</link>
+    <link>https://nabeelhyatt.com/experiments/whistle/appcast.xml</link>
     <description>Sparkle update feed for the Whistle macOS app.</description>
     <language>en</language>
   </channel>
