@@ -130,9 +130,11 @@ jobs:
           mkdir -p "$RUNNER_TEMP/sparkle"
           tar -xf "$RUNNER_TEMP/sparkle.tar.xz" -C "$RUNNER_TEMP/sparkle"
           printf '%s' "$SPARKLE_ED_PRIVATE_KEY" > "$RUNNER_TEMP/sparkle_ed_key"
+          # sign_update prints BOTH sparkle:edSignature="…" AND length="…",
+          # so SIGNATURE_ATTRS already carries the enclosure length — do not
+          # add a second length attribute below (duplicate attrs are invalid XML).
           SIGNATURE_ATTRS="$("$RUNNER_TEMP/sparkle/bin/sign_update" -f "$RUNNER_TEMP/sparkle_ed_key" "$DMG")"
           rm -f "$RUNNER_TEMP/sparkle_ed_key"
-          SIZE="$(stat -f%z "$DMG")"
           BUILD_NUMBER="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' \
             apps/macos/dist/DerivedData/Build/Products/Release/Whistle.app/Contents/Info.plist)"
           cat > apps/macos/dist/appcast-item.xml <<ITEM
@@ -145,7 +147,6 @@ jobs:
             <enclosure
               url="https://github.com/${GITHUB_REPOSITORY}/releases/download/v${VERSION}/$(basename "$DMG")"
               ${SIGNATURE_ATTRS}
-              length="${SIZE}"
               type="application/octet-stream" />
           </item>
           ITEM
