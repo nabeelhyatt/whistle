@@ -412,6 +412,26 @@ public final class CaptureViewModel: ObservableObject {
     /// clobbered by a later update.
     private func applyTranscriptUpdate(_ update: TranscriptUpdate) {
         let newServiceText = update.displayText
+
+        // Defensive, and deliberately not covered by a unit test: a blank
+        // update never improves on text already on screen, so drop it rather
+        // than letting the fast path below adopt it and momentarily clear the
+        // box. Neither shipping transcriber emits a blank update after having
+        // produced text (both fold `live` into `committed` instead), and the
+        // effect is a single-frame flicker that converges on the next update
+        // -- so no final-state assertion can observe it. The guard is here
+        // because new transcribers are coming (SpeechAnalyzer has never run
+        // against the real API; a third-party engine may follow) and a
+        // flash-cleared transcript box is the one failure this screen must
+        // never show again.
+        //
+        // Placed *before* the `defer` below on purpose: `lastServiceText`
+        // must keep pointing at the last text the service really produced.
+        // Letting it fall to "" would leave the next genuine update nothing
+        // to diff against, and `appendDictated` would then append a whole
+        // utterance on top of the field.
+        guard !newServiceText.isEmpty || transcriptText.isEmpty else { return }
+
         defer { lastServiceText = newServiceText }
 
         if transcriptText.isEmpty || transcriptText == lastServiceText {
