@@ -137,6 +137,9 @@ enum LiveSpeechAnalyzerEngineError: Error {
     /// nil — there is no format this analyzer/transcriber combination can
     /// accept, so analysis cannot start at all.
     case noCompatibleAudioFormat
+    /// `AssetInventory.reserve(locale:)` declined the reservation without
+    /// throwing, so the analyzer must not start against that locale.
+    case localeReservationFailed
 }
 
 @available(macOS 26, *)
@@ -175,6 +178,15 @@ final class LiveSpeechAnalyzerEngine: SpeechAnalyzerResultsEngine, @unchecked Se
     private var didLogConversionFailure = false
     private var setupTask: Task<Void, Never>?
     private var resultsTask: Task<Void, Never>?
+    /// True only while this engine owns a successful locale reservation.
+    /// Access is serialized by `stateLock` because setup and teardown run
+    /// from separate tasks.
+    private var hasReservedLocale = false
+    /// Once true, the setup task owns releasing the locale after
+    /// `analyzer.start` returns. This prevents teardown from releasing it
+    /// in the small interval between committing the start and entering the
+    /// async Speech API.
+    private var analysisStartCommitted = false
     private var isClosed = false
 
     init(locale: Locale) {
@@ -242,13 +254,23 @@ final class LiveSpeechAnalyzerEngine: SpeechAnalyzerResultsEngine, @unchecked Se
                 // `SpeechAnalyzerTranscriber.handle`) rather than starting
                 // the analyzer against an unreserved locale.
                 do {
-                    _ = try await AssetInventory.reserve(locale: self.locale)
+                    guard try await AssetInventory.reserve(locale: self.locale) else {
+                        continuation.yield(.error(LiveSpeechAnalyzerEngineError.localeReservationFailed))
+                        continuation.finish()
+                        return
+                    }
                 } catch {
                     continuation.yield(.error(error))
                     continuation.finish()
                     return
                 }
-                guard !Task.isCancelled, !self.isClosedLocked() else { return }
+                self.stateLock.lock()
+                self.hasReservedLocale = true
+                self.stateLock.unlock()
+                guard !Task.isCancelled, !self.isClosedLocked() else {
+                    await self.releaseReservedLocale()
+                    return
+                }
 
                 // (b) THE ROOT-CAUSE FIX: discover the Int16 format the
                 // analyzer's precondition requires (see file header)
@@ -281,13 +303,21 @@ final class LiveSpeechAnalyzerEngine: SpeechAnalyzerResultsEngine, @unchecked Se
 
                 // (d) Only now start the analyzer against the (converted)
                 // input stream.
+                self.stateLock.lock()
+                guard !Task.isCancelled, !self.isClosed else {
+                    self.stateLock.unlock()
+                    await self.releaseReservedLocale()
+                    return
+                }
+                self.analysisStartCommitted = true
+                self.stateLock.unlock()
                 do {
                     try await analyzer.start(inputSequence: inputStream)
                 } catch {
                     continuation.yield(.error(error))
                     continuation.finish()
-                    return
                 }
+                await self.releaseReservedLocale()
             }
             self.stateLock.lock()
             if self.isClosed {
@@ -354,11 +384,18 @@ final class LiveSpeechAnalyzerEngine: SpeechAnalyzerResultsEngine, @unchecked Se
         self.resultsTask = nil
         let continuation = inputContinuation
         inputContinuation = nil
+        let shouldReleaseLocale = hasReservedLocale && !analysisStartCommitted
+        if shouldReleaseLocale {
+            hasReservedLocale = false
+        }
         stateLock.unlock()
         setupTask?.cancel()
         continuation?.finish()
         try? await analyzer?.finalizeAndFinishThroughEndOfInput()
         resultsTask?.cancel()
+        if shouldReleaseLocale {
+            _ = await AssetInventory.release(reservedLocale: locale)
+        }
     }
 
     func cancel() {
@@ -372,16 +409,36 @@ final class LiveSpeechAnalyzerEngine: SpeechAnalyzerResultsEngine, @unchecked Se
         self.resultsTask = nil
         let continuation = inputContinuation
         inputContinuation = nil
+        let shouldReleaseLocale = hasReservedLocale && !analysisStartCommitted
+        if shouldReleaseLocale {
+            hasReservedLocale = false
+        }
         stateLock.unlock()
         setupTask?.cancel()
         resultsTask?.cancel()
         continuation?.finish()
+        if shouldReleaseLocale {
+            let locale = locale
+            Task {
+                _ = await AssetInventory.release(reservedLocale: locale)
+            }
+        }
     }
 
     private func isClosedLocked() -> Bool {
         stateLock.lock()
         defer { stateLock.unlock() }
         return isClosed
+    }
+
+    private func releaseReservedLocale() async {
+        stateLock.lock()
+        let shouldReleaseLocale = hasReservedLocale
+        hasReservedLocale = false
+        stateLock.unlock()
+        if shouldReleaseLocale {
+            _ = await AssetInventory.release(reservedLocale: locale)
+        }
     }
 }
 
