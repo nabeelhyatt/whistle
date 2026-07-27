@@ -270,7 +270,7 @@ final class LiveSpeechAnalyzerEngine: SpeechAnalyzerResultsEngine, @unchecked Se
                 self.stateLock.lock()
                 self.hasReservedLocale = true
                 self.stateLock.unlock()
-                guard !Task.isCancelled, !self.isClosedLocked() else {
+                guard !Task.isCancelled, !self.checkIsClosed() else {
                     await self.releaseReservedLocale()
                     return
                 }
@@ -284,7 +284,7 @@ final class LiveSpeechAnalyzerEngine: SpeechAnalyzerResultsEngine, @unchecked Se
                     await self.releaseReservedLocale()
                     return
                 }
-                guard !Task.isCancelled, !self.isClosedLocked() else { return }
+                guard !Task.isCancelled, !self.checkIsClosed() else { return }
 
                 // (c) Publish the format and drain whatever `appendAudio`
                 // queued while setup was still in flight, all in one
@@ -458,7 +458,11 @@ final class LiveSpeechAnalyzerEngine: SpeechAnalyzerResultsEngine, @unchecked Se
         }
     }
 
-    private func isClosedLocked() -> Bool {
+    /// Reads `isClosed` by taking `stateLock` itself — so, unlike the
+    /// `...Locked` helpers above, callers must NOT already hold the lock
+    /// (`stateLock` is a non-recursive `NSLock`; re-entering it deadlocks
+    /// the mic path).
+    private func checkIsClosed() -> Bool {
         stateLock.lock()
         defer { stateLock.unlock() }
         return isClosed

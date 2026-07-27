@@ -504,6 +504,10 @@ final class SpeechAnalyzerTranscriberStitchingTests: XCTestCase {
 
         let updates = await recorder.values()
 
+        // Assert the count before indexing: a regression that yields fewer
+        // updates would otherwise trap on the out-of-range subscript and
+        // take the whole test process down instead of failing this test.
+        XCTAssertEqual(updates.count, 3)
         XCTAssertEqual(updates[0], TranscriptUpdate(committed: "first", live: ""))
         XCTAssertEqual(updates[1], TranscriptUpdate(committed: "first", live: "partial"))
         XCTAssertEqual(updates[2], TranscriptUpdate(committed: "first", live: ""))

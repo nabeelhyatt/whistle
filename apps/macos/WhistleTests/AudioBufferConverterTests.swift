@@ -157,6 +157,11 @@ final class AudioBufferConverterTests: XCTestCase {
         _ = try converter.convert(inputBuffer, to: outputFormat)
         let tailBuffers = try converter.finish(convertingTo: outputFormat)
 
+        // Per this test's name, an empty tail is a legitimate outcome (the
+        // converter reset rather than drained), so `allSatisfy` passing
+        // vacuously is intentional -- it constrains the SHAPE of any tail
+        // buffers that do come back, not whether any do. The load-bearing
+        // assertion is the reusability check below.
         XCTAssertTrue(tailBuffers.allSatisfy {
             $0.format.commonFormat == .pcmFormatInt16 && $0.frameLength > 0
         })
