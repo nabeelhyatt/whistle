@@ -48,6 +48,7 @@ final class AudioBufferConverter {
     private var converter: AVAudioConverter?
     private var converterInputFormat: AVAudioFormat?
     private var converterOutputFormat: AVAudioFormat?
+    private var lastOutputFrameCapacity: AVAudioFrameCount = 0
 
     /// Converts `buffer` to `outputFormat`. If `buffer.format` already
     /// equals `outputFormat`, returns `buffer` unchanged (fast path — no
@@ -74,6 +75,7 @@ final class AudioBufferConverter {
         ) else {
             throw AudioBufferConverterError.outputBufferAllocationFailed
         }
+        lastOutputFrameCapacity = max(outputFrameCapacity, 1)
 
         // One-shot input block per Apple's sample pattern: hand the
         // converter the whole input buffer exactly once (`.haveData`),
@@ -102,6 +104,45 @@ final class AudioBufferConverter {
         return outputBuffer
     }
 
+    /// Drains any resampler-delay frames after the final input buffer. The
+    /// caller must yield these before closing its downstream input stream.
+    func finish(convertingTo outputFormat: AVAudioFormat) throws -> [AVAudioPCMBuffer] {
+        guard let converter, converterOutputFormat == outputFormat, lastOutputFrameCapacity > 0 else {
+            return []
+        }
+
+        var outputBuffers: [AVAudioPCMBuffer] = []
+        while true {
+            guard let outputBuffer = AVAudioPCMBuffer(
+                pcmFormat: outputFormat,
+                frameCapacity: lastOutputFrameCapacity
+            ) else {
+                throw AudioBufferConverterError.outputBufferAllocationFailed
+            }
+
+            var conversionError: NSError?
+            let status = converter.convert(to: outputBuffer, error: &conversionError) { _, inputStatus in
+                inputStatus.pointee = .endOfStream
+                return nil
+            }
+
+            if status == .error {
+                throw AudioBufferConverterError.conversionFailed(conversionError ?? NSError(
+                    domain: "AudioBufferConverter",
+                    code: -1,
+                    userInfo: [NSLocalizedDescriptionKey: "AVAudioConverter drain failed with no error detail"]
+                ))
+            }
+            if outputBuffer.frameLength > 0 {
+                outputBuffers.append(outputBuffer)
+            }
+            guard status == .haveData else { break }
+        }
+
+        converter.reset()
+        return outputBuffers
+    }
+
     /// Returns the cached converter if `inputFormat`/`outputFormat` match
     /// the last call, otherwise builds (and caches) a new one.
     private func converter(from inputFormat: AVAudioFormat, to outputFormat: AVAudioFormat) throws -> AVAudioConverter {
@@ -116,6 +157,7 @@ final class AudioBufferConverter {
         converter = newConverter
         converterInputFormat = inputFormat
         converterOutputFormat = outputFormat
+        lastOutputFrameCapacity = 0
         return newConverter
     }
 }

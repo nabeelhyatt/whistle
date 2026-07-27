@@ -149,6 +149,25 @@ final class AudioBufferConverterTests: XCTestCase {
         )
     }
 
+    func testFinishDrainsOrResetsTheResamplerAfterANonIntegerRatioBuffer() throws {
+        let converter = AudioBufferConverter()
+        let outputFormat = int16Format(sampleRate: 16000)
+        let inputBuffer = makeFloat32Buffer(sampleRate: 44100, frameCount: 4096)
+
+        _ = try converter.convert(inputBuffer, to: outputFormat)
+        let tailBuffers = try converter.finish(convertingTo: outputFormat)
+
+        XCTAssertTrue(tailBuffers.allSatisfy {
+            $0.format.commonFormat == .pcmFormatInt16 && $0.frameLength > 0
+        })
+
+        let nextBuffer = try converter.convert(
+            makeFloat32Buffer(sampleRate: 44100, frameCount: 4096),
+            to: outputFormat
+        )
+        XCTAssertGreaterThan(nextBuffer.frameLength, 0)
+    }
+
     // MARK: - Repeated conversions reuse the converter
 
     func testThreeSequentialConversionsReuseTheConverterAndProduceConsistentOutput() throws {

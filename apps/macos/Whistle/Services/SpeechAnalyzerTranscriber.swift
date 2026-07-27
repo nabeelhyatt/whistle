@@ -187,6 +187,9 @@ final class LiveSpeechAnalyzerEngine: SpeechAnalyzerResultsEngine, @unchecked Se
     /// in the small interval between committing the start and entering the
     /// async Speech API.
     private var analysisStartCommitted = false
+    /// Prevents the setup task from releasing a locale while `finish()` is
+    /// still asking SpeechAnalyzer to finalize its remaining results.
+    private var localeReleaseDeferredUntilFinalization = false
     private var isClosed = false
 
     init(locale: Locale) {
@@ -278,6 +281,7 @@ final class LiveSpeechAnalyzerEngine: SpeechAnalyzerResultsEngine, @unchecked Se
                 guard let format = await SpeechAnalyzer.bestAvailableAudioFormat(compatibleWith: [transcriber]) else {
                     continuation.yield(.error(LiveSpeechAnalyzerEngineError.noCompatibleAudioFormat))
                     continuation.finish()
+                    await self.releaseReservedLocale()
                     return
                 }
                 guard !Task.isCancelled, !self.isClosedLocked() else { return }
@@ -291,6 +295,7 @@ final class LiveSpeechAnalyzerEngine: SpeechAnalyzerResultsEngine, @unchecked Se
                 self.stateLock.lock()
                 guard !self.isClosed else {
                     self.stateLock.unlock()
+                    await self.releaseReservedLocale()
                     return
                 }
                 self.analyzerFormat = format
@@ -317,7 +322,12 @@ final class LiveSpeechAnalyzerEngine: SpeechAnalyzerResultsEngine, @unchecked Se
                     continuation.yield(.error(error))
                     continuation.finish()
                 }
-                await self.releaseReservedLocale()
+                self.stateLock.lock()
+                let shouldReleaseLocale = !self.localeReleaseDeferredUntilFinalization
+                self.stateLock.unlock()
+                if shouldReleaseLocale {
+                    await self.releaseReservedLocale()
+                }
             }
             self.stateLock.lock()
             if self.isClosed {
@@ -377,23 +387,46 @@ final class LiveSpeechAnalyzerEngine: SpeechAnalyzerResultsEngine, @unchecked Se
         stateLock.lock()
         isClosed = true
         pendingBuffers = []
-        analyzerFormat = nil
         let setupTask = setupTask
         self.setupTask = nil
         let resultsTask = resultsTask
         self.resultsTask = nil
         let continuation = inputContinuation
+        if let format = analyzerFormat, let continuation {
+            do {
+                for buffer in try bufferConverter.finish(convertingTo: format) {
+                    continuation.yield(AnalyzerInput(buffer: buffer))
+                }
+            } catch {
+                if !didLogConversionFailure {
+                    didLogConversionFailure = true
+                    NSLog("LiveSpeechAnalyzerEngine: dropping converter tail after conversion failure: \(error)")
+                }
+            }
+        }
+        analyzerFormat = nil
         inputContinuation = nil
-        let shouldReleaseLocale = hasReservedLocale && !analysisStartCommitted
+        let analysisWasCommitted = analysisStartCommitted
+        if analysisWasCommitted {
+            localeReleaseDeferredUntilFinalization = true
+        }
+        let shouldReleaseLocale = hasReservedLocale && !analysisWasCommitted
         if shouldReleaseLocale {
             hasReservedLocale = false
         }
         stateLock.unlock()
-        setupTask?.cancel()
+        if !analysisWasCommitted {
+            setupTask?.cancel()
+        }
         continuation?.finish()
         try? await analyzer?.finalizeAndFinishThroughEndOfInput()
         resultsTask?.cancel()
-        if shouldReleaseLocale {
+        if analysisWasCommitted {
+            stateLock.lock()
+            localeReleaseDeferredUntilFinalization = false
+            stateLock.unlock()
+            await releaseReservedLocale()
+        } else if shouldReleaseLocale {
             _ = await AssetInventory.release(reservedLocale: locale)
         }
     }
