@@ -65,10 +65,21 @@ public enum SpeechModelAvailability: Equatable, Sendable {
 }
 
 /// Factory: picks the concrete `TranscriptionService` implementation at
-/// runtime. `LegacySpeechTranscriber` is the tested shipping path for this
-/// host (macOS 15.7.3); `SpeechAnalyzerTranscriber` compiles behind
-/// `#available(macOS 26, *)` against the macOS 26 SDK present in Xcode
-/// 26.3/26.2 but is runtime-unverified here (TECH-SPEC §4.1/§13 U7).
+/// runtime. `LegacySpeechTranscriber` is the tested shipping path on macOS
+/// 14–15; `SpeechAnalyzerTranscriber` (behind `#available(macOS 26, *)`,
+/// against the macOS 26 SDK present in Xcode 26.3/26.2) is now the
+/// confirmed-running path on macOS 26 hosts (TECH-SPEC §4.1/§13 U7). Its
+/// mic tap feeds native Float32 buffers (`AudioEngineTap`, native hardware
+/// format) that must be converted to the Int16 format
+/// `SpeechAnalyzer`/`SpeechTranscriber` require before use — handing Speech
+/// a Float32 buffer directly hits an uncatchable precondition, "Audio
+/// sample data must be 16-bit signed integers", which crashes the process
+/// (SIGTRAP) rather than throwing a catchable error. The engine also must
+/// reserve its locale via `AssetInventory.reserve(locale:)` before starting
+/// analysis, or Speech logs "Cannot use modules with unallocated locales"
+/// (a warning today, a future error). See `SpeechAnalyzerTranscriber.swift`
+/// (`LiveSpeechAnalyzerEngine`) and `AudioBufferConverter.swift` for the
+/// fix.
 public enum TranscriptionServiceFactory {
     public static func make(locale: Locale = Locale(identifier: "en-US")) -> any TranscriptionService {
         if #available(macOS 26, *) {

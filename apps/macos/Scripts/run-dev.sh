@@ -104,6 +104,18 @@ fi
 # step done ahead of notarization) ---------------------------------------------
 if [[ "$HAVE_SIGNING_IDENTITY" == 1 ]]; then
   SPARKLE_FW="$APP_PATH/Contents/Frameworks/Sparkle.framework"
+  # Xcode's Debug builds link the app's own code as a separate
+  # Whistle.debug.dylib next to the executable ("debug dylib" /
+  # ENABLE_DEBUG_DYLIB). It must be re-signed with the same identity as
+  # the app: hardened runtime + Developer ID enforce library validation,
+  # and a Team-ID mismatch between the executable and the dylib makes
+  # dyld abort at launch ("Library not loaded: @rpath/Whistle.debug.dylib
+  # ... different Team IDs").
+  DEBUG_DYLIB="$APP_PATH/Contents/MacOS/Whistle.debug.dylib"
+  if [[ -f "$DEBUG_DYLIB" ]]; then
+    log "Re-signing Whistle.debug.dylib"
+    codesign -f -s "$SIGN_IDENTITY" -o runtime "$DEBUG_DYLIB"
+  fi
   if [[ -d "$SPARKLE_FW" ]]; then
     log "Re-signing Sparkle.framework nested components"
     codesign -f -s "$SIGN_IDENTITY" -o runtime --preserve-metadata=entitlements \
