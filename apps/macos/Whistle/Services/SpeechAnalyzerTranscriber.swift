@@ -173,6 +173,9 @@ final class LiveSpeechAnalyzerEngine: SpeechAnalyzerResultsEngine, @unchecked Se
     private var pendingBuffers: [AVAudioPCMBuffer] = []
     private let bufferConverter = AudioBufferConverter()
     private var didLogConversionFailure = false
+    private var setupTask: Task<Void, Never>?
+    private var resultsTask: Task<Void, Never>?
+    private var isClosed = false
 
     init(locale: Locale) {
         self.locale = locale
@@ -181,6 +184,7 @@ final class LiveSpeechAnalyzerEngine: SpeechAnalyzerResultsEngine, @unchecked Se
     func appendAudio(buffer: AVAudioPCMBuffer) {
         stateLock.lock()
         defer { stateLock.unlock() }
+        guard !isClosed else { return }
         guard let format = analyzerFormat else {
             pendingBuffers.append(buffer)
             if pendingBuffers.count > Self.maxPendingBuffers {
@@ -225,9 +229,11 @@ final class LiveSpeechAnalyzerEngine: SpeechAnalyzerResultsEngine, @unchecked Se
             self.analyzer = analyzer
 
             let (inputStream, inputContinuation) = AsyncStream<AnalyzerInput>.makeStream()
+            self.stateLock.lock()
             self.inputContinuation = inputContinuation
+            self.stateLock.unlock()
 
-            Task {
+            let setupTask = Task {
                 // (a) Reserve the locale's assets before starting analysis
                 // -- fixes the "Cannot use modules with unallocated
                 // locales" warning (see file header). A throw here means
@@ -242,6 +248,7 @@ final class LiveSpeechAnalyzerEngine: SpeechAnalyzerResultsEngine, @unchecked Se
                     continuation.finish()
                     return
                 }
+                guard !Task.isCancelled, !self.isClosedLocked() else { return }
 
                 // (b) THE ROOT-CAUSE FIX: discover the Int16 format the
                 // analyzer's precondition requires (see file header)
@@ -251,6 +258,7 @@ final class LiveSpeechAnalyzerEngine: SpeechAnalyzerResultsEngine, @unchecked Se
                     continuation.finish()
                     return
                 }
+                guard !Task.isCancelled, !self.isClosedLocked() else { return }
 
                 // (c) Publish the format and drain whatever `appendAudio`
                 // queued while setup was still in flight, all in one
@@ -259,6 +267,10 @@ final class LiveSpeechAnalyzerEngine: SpeechAnalyzerResultsEngine, @unchecked Se
                 // leapfrogged by a newer one and the converter is never
                 // touched from two threads at once.
                 self.stateLock.lock()
+                guard !self.isClosed else {
+                    self.stateLock.unlock()
+                    return
+                }
                 self.analyzerFormat = format
                 let queuedBuffers = self.pendingBuffers
                 self.pendingBuffers = []
@@ -277,8 +289,16 @@ final class LiveSpeechAnalyzerEngine: SpeechAnalyzerResultsEngine, @unchecked Se
                     return
                 }
             }
+            self.stateLock.lock()
+            if self.isClosed {
+                self.stateLock.unlock()
+                setupTask.cancel()
+            } else {
+                self.setupTask = setupTask
+                self.stateLock.unlock()
+            }
 
-            Task {
+            let resultsTask = Task {
                 do {
                     for try await result in transcriber.results {
                         // No `isFinal` field on `SpeechTranscriber.Result`
@@ -312,24 +332,56 @@ final class LiveSpeechAnalyzerEngine: SpeechAnalyzerResultsEngine, @unchecked Se
                     continuation.finish()
                 }
             }
+            self.stateLock.lock()
+            if self.isClosed {
+                self.stateLock.unlock()
+                resultsTask.cancel()
+            } else {
+                self.resultsTask = resultsTask
+                self.stateLock.unlock()
+            }
         }
     }
 
     func finish() async {
         stateLock.lock()
+        isClosed = true
         pendingBuffers = []
-        stateLock.unlock()
-        inputContinuation?.finish()
+        analyzerFormat = nil
+        let setupTask = setupTask
+        self.setupTask = nil
+        let resultsTask = resultsTask
+        self.resultsTask = nil
+        let continuation = inputContinuation
         inputContinuation = nil
+        stateLock.unlock()
+        setupTask?.cancel()
+        continuation?.finish()
         try? await analyzer?.finalizeAndFinishThroughEndOfInput()
+        resultsTask?.cancel()
     }
 
     func cancel() {
         stateLock.lock()
+        isClosed = true
         pendingBuffers = []
-        stateLock.unlock()
-        inputContinuation?.finish()
+        analyzerFormat = nil
+        let setupTask = setupTask
+        self.setupTask = nil
+        let resultsTask = resultsTask
+        self.resultsTask = nil
+        let continuation = inputContinuation
         inputContinuation = nil
+        stateLock.unlock()
+        setupTask?.cancel()
+        resultsTask?.cancel()
+        continuation?.finish()
+    }
+
+    private func isClosedLocked() -> Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return isClosed
     }
 }
 
@@ -445,6 +497,11 @@ public actor SpeechAnalyzerTranscriber: TranscriptionService {
             // segment; committed text is preserved and surfaced as-is.
             liveSegment = ""
             continuation?.yield(TranscriptUpdate(committed: committedTranscript, live: liveSegment))
+            continuation?.finish()
+            continuation = nil
+            audioTap.stop()
+            engine?.cancel()
+            engine = nil
         }
     }
 

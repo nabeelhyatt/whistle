@@ -57,6 +57,30 @@ final class AudioBufferConverterTests: XCTestCase {
         return format
     }
 
+    private func assertContainsNonZeroInt16Samples(
+        _ buffer: AVAudioPCMBuffer,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        guard let channelData = buffer.int16ChannelData else {
+            XCTFail("expected Int16 channel data", file: file, line: line)
+            return
+        }
+
+        let frameLength = Int(buffer.frameLength)
+        let containsNonZeroSample = (0..<Int(buffer.format.channelCount)).contains { channel in
+            let samples = channelData[channel]
+            return (0..<frameLength).contains { samples[$0] != 0 }
+        }
+
+        XCTAssertTrue(
+            containsNonZeroSample,
+            "converted sine-wave buffer should contain non-zero Int16 samples",
+            file: file,
+            line: line
+        )
+    }
+
     // MARK: - Float32 48kHz mono -> Int16 16kHz
 
     func testFloat32ToInt16DownsampleProducesExpectedFormatAndFrameCount() throws {
@@ -76,6 +100,7 @@ final class AudioBufferConverterTests: XCTestCase {
             2,
             "expected ~\(expectedFrames) frames, got \(outputBuffer.frameLength)"
         )
+        assertContainsNonZeroInt16Samples(outputBuffer)
     }
 
     // MARK: - Same-format passthrough (identity)
