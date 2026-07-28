@@ -793,6 +793,57 @@ final class CaptureViewModelTests: XCTestCase {
         viewModel.stopTranscription()
     }
 
+    @MainActor
+    func testWhitespaceOnlyUpdateDoesNotReplaceTheServiceBaselineAfterUserEdit() async throws {
+        let (store, tempDir) = try TestSupport.makeStore()
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let manual = ManualTranscriptionService()
+        let viewModel = CaptureViewModel(
+            store: store,
+            transcriptionServiceFactory: { manual },
+            micPermissionStatus: { .granted },
+            requestMicPermission: { true },
+            speechPermissionStatus: { .granted },
+            requestSpeechPermission: { true }
+        )
+        viewModel.beginCapture()
+        await manual.emit(TranscriptUpdate(committed: "", live: "Hello"))
+        try await Self.waitUntil { viewModel.transcriptText == "Hello" }
+
+        viewModel.transcriptText = "Hello there"
+        await manual.emit(TranscriptUpdate(committed: "", live: " \n"))
+        await manual.emit(TranscriptUpdate(committed: "", live: "Hello world"))
+        try await Self.waitUntil { viewModel.transcriptText == "Hello there world" }
+
+        viewModel.stopTranscription()
+    }
+
+    @MainActor
+    func testPartialWordExtensionAfterUserEditAppendsTheWholeWord() async throws {
+        let (store, tempDir) = try TestSupport.makeStore()
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let manual = ManualTranscriptionService()
+        let viewModel = CaptureViewModel(
+            store: store,
+            transcriptionServiceFactory: { manual },
+            micPermissionStatus: { .granted },
+            requestMicPermission: { true },
+            speechPermissionStatus: { .granted },
+            requestSpeechPermission: { true }
+        )
+        viewModel.beginCapture()
+        await manual.emit(TranscriptUpdate(committed: "", live: "add c"))
+        try await Self.waitUntil { viewModel.transcriptText == "add c" }
+
+        viewModel.transcriptText = "add c please"
+        await manual.emit(TranscriptUpdate(committed: "", live: "add code"))
+        try await Self.waitUntil { viewModel.transcriptText == "add c please code" }
+
+        viewModel.stopTranscription()
+    }
+
     private static func waitUntil(
         timeout: TimeInterval = 1,
         file: StaticString = #filePath,

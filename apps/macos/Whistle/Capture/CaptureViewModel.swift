@@ -162,6 +162,9 @@ public final class CaptureViewModel: ObservableObject {
     private var transcriptionService: (any TranscriptionService)?
     private var transcriptionTask: Task<Void, Never>?
     private var projectsTask: Task<Void, Never>?
+    /// Invalidates updates and completion callbacks from a stream that was
+    /// stopped or superseded before they reach the main actor.
+    private var transcriptionGeneration = 0
 
     /// The transcription service's own running display text as of the last
     /// update, kept separately from `transcriptText` (the transcript field
@@ -386,6 +389,8 @@ public final class CaptureViewModel: ObservableObject {
     /// share one implementation.
     private func beginRunningTranscription() {
         let service = transcriptionServiceFactory()
+        transcriptionGeneration &+= 1
+        let generation = transcriptionGeneration
         transcriptionService = service
         isListening = true
         transcriptionTask = Task { [weak self] in
@@ -393,6 +398,7 @@ public final class CaptureViewModel: ObservableObject {
             for await update in stream {
                 guard let self else { return }
                 await MainActor.run {
+                    guard self.transcriptionGeneration == generation else { return }
                     self.applyTranscriptUpdate(update)
                 }
             }
@@ -400,6 +406,7 @@ public final class CaptureViewModel: ObservableObject {
             // via `stopTranscription()` -- still clear the indicator so the
             // flap doesn't churn against a dead service.
             await MainActor.run {
+                guard self?.transcriptionGeneration == generation else { return }
                 self?.isListening = false
             }
         }
@@ -430,7 +437,7 @@ public final class CaptureViewModel: ObservableObject {
         // Letting it fall to "" would leave the next genuine update nothing
         // to diff against, and `appendDictated` would then append a whole
         // utterance on top of the field.
-        guard !newServiceText.isEmpty || transcriptText.isEmpty else { return }
+        guard !newServiceText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || transcriptText.isEmpty else { return }
 
         defer { lastServiceText = newServiceText }
 
@@ -494,8 +501,14 @@ public final class CaptureViewModel: ObservableObject {
         let common = newText.commonPrefix(with: previousText)
         // One string is a prefix of the other: nothing was revised, so the
         // whole common run is safe to skip.
-        if common.count == newText.count || common.count == previousText.count {
+        if common.count == newText.count {
             return common.count
+        }
+        if common.count == previousText.count {
+            let next = newText.index(newText.startIndex, offsetBy: common.count)
+            if common.last?.isWhitespace == true || newText[next].isWhitespace {
+                return common.count
+            }
         }
         guard let lastBoundary = common.lastIndex(where: { $0.isWhitespace }) else {
             // Diverged inside the very first word -- keep nothing.
@@ -507,6 +520,7 @@ public final class CaptureViewModel: ObservableObject {
     /// Stops the transcription service (e.g. panel closing). Safe to call
     /// multiple times.
     public func stopTranscription() {
+        transcriptionGeneration &+= 1
         transcriptionTask?.cancel()
         transcriptionTask = nil
         let service = transcriptionService
