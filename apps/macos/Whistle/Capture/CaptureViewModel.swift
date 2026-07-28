@@ -12,8 +12,15 @@
 
 import AVFoundation
 import Foundation
+import os
 import Speech
 import WhistleCore
+
+/// Unified-log destination for this file's diagnostics. NSLog content is
+/// privacy-redacted to "<private>" in `log show` on modern macOS, which made
+/// every message here unreadable in the field -- os.Logger with explicit
+/// `privacy: .public` interpolations is the only way these stay legible.
+private let captureLog = Logger(subsystem: "build.conductor.whistle.app", category: "transcription")
 
 /// Optional pre-fill used by the "Duplicate as new capture" entry point
 /// (TECH-SPEC §4.1 `HistoryWindow`/`CaptureViewModel` rows, wired fully by
@@ -411,7 +418,8 @@ public final class CaptureViewModel: ObservableObject {
         // tap runs forever (mic indicator stays hot). Stopping first makes
         // any double-start self-healing: at most one service is ever live.
         if transcriptionService != nil {
-            NSLog("CaptureViewModel: beginRunningTranscription found a live service (gen %d) — stopping it first", transcriptionGeneration)
+            let supersededGeneration = transcriptionGeneration
+            captureLog.notice("CaptureViewModel: beginRunningTranscription found a live service (gen \(supersededGeneration)) — stopping it first")
             stopTranscription()
         }
 
@@ -420,7 +428,7 @@ public final class CaptureViewModel: ObservableObject {
         let generation = transcriptionGeneration
         transcriptionService = service
         isListening = true
-        NSLog("CaptureViewModel: starting transcription (gen %d)", generation)
+        captureLog.notice("CaptureViewModel: starting transcription (gen \(generation))")
         transcriptionTask = Task { [weak self] in
             let stream = await service.start()
             for await update in stream {
@@ -433,7 +441,7 @@ public final class CaptureViewModel: ObservableObject {
             // Stream ended on its own (service-side stop/error) rather than
             // via `stopTranscription()` -- still clear the indicator so the
             // flap doesn't churn against a dead service.
-            NSLog("CaptureViewModel: transcription stream ended (gen %d)", generation)
+            captureLog.notice("CaptureViewModel: transcription stream ended (gen \(generation))")
             await MainActor.run {
                 guard self?.transcriptionGeneration == generation else { return }
                 self?.isListening = false
@@ -556,7 +564,8 @@ public final class CaptureViewModel: ObservableObject {
         transcriptionService = nil
         isListening = false
         if let service {
-            NSLog("CaptureViewModel: stopTranscription (now gen %d) — stopping service", transcriptionGeneration)
+            let newGeneration = transcriptionGeneration
+            captureLog.notice("CaptureViewModel: stopTranscription (now gen \(newGeneration)) — stopping service")
             Task { await service.stop() }
         }
     }
