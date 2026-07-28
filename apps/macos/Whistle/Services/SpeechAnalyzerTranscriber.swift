@@ -145,6 +145,9 @@ enum LiveSpeechAnalyzerEngineError: Error {
     /// nil — there is no format this analyzer/transcriber combination can
     /// accept, so analysis cannot start at all.
     case noCompatibleAudioFormat
+    /// The locale's assets are absent, but Speech cannot create a request
+    /// to install the transcriber's required model.
+    case assetInstallationUnavailable
 }
 
 @available(macOS 26, *)
@@ -295,10 +298,15 @@ final class LiveSpeechAnalyzerEngine: SpeechAnalyzerResultsEngine, @unchecked Se
                     let wanted = self.locale.identifier(.bcp47)
                     if !installed.contains(where: { $0.identifier(.bcp47) == wanted }) {
                         speechLog.notice("LiveSpeechAnalyzerEngine: SpeechTranscriber assets for \(wanted, privacy: .public) not installed — downloading")
-                        if let request = try await AssetInventory.assetInstallationRequest(supporting: [transcriber]) {
-                            try await request.downloadAndInstall()
-                            speechLog.notice("LiveSpeechAnalyzerEngine: SpeechTranscriber asset download complete")
+                        guard let request = try await AssetInventory.assetInstallationRequest(supporting: [transcriber]) else {
+                            speechLog.error("LiveSpeechAnalyzerEngine: SpeechTranscriber assets are missing and no installation request is available")
+                            continuation.yield(.error(LiveSpeechAnalyzerEngineError.assetInstallationUnavailable))
+                            continuation.finish()
+                            await self.releaseReservedLocale()
+                            return
                         }
+                        try await request.downloadAndInstall()
+                        speechLog.notice("LiveSpeechAnalyzerEngine: SpeechTranscriber asset download complete")
                     }
                 } catch {
                     speechLog.error("LiveSpeechAnalyzerEngine: asset install failed — session cannot start: \(String(describing: error), privacy: .public)")
