@@ -337,17 +337,23 @@ struct SettingsView: View {
         .padding(12)
     }
 
-    /// E.g. "1.0.12 (1)" -- `CFBundleShortVersionString` (the
+    /// E.g. "1.0.12" -- `CFBundleShortVersionString` (the
     /// `MARKETING_VERSION` AGENTS.md asks every behavior-changing PR to
-    /// bump) plus `CFBundleVersion` (the build number) in parens, read from
-    /// the running app's own bundle rather than a hardcoded constant so the
-    /// label can never drift from what was actually built. Falls back to
-    /// "unknown" for either half if `Bundle.main`'s Info.plist is missing
-    /// the key (a malformed build/test host, never a real app run).
+    /// bump), read from the running app's own bundle rather than a
+    /// hardcoded constant so the label can never drift from what was
+    /// actually built. `CFBundleVersion` is appended in parens only when it
+    /// differs (it normally tracks `MARKETING_VERSION` via
+    /// `CURRENT_PROJECT_VERSION` in project.yml, so showing both would just
+    /// repeat the number). Falls back to "unknown" if `Bundle.main`'s
+    /// Info.plist is missing the key (a malformed build/test host, never a
+    /// real app run).
     private static var appVersionDisplay: String {
         let shortVersion = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "unknown"
-        let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "unknown"
-        return "\(shortVersion) (\(build))"
+        let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String
+        if let build, build != shortVersion {
+            return "\(shortVersion) (\(build))"
+        }
+        return shortVersion
     }
 
     private var apiKeyTab: some View {
