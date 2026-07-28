@@ -323,9 +323,31 @@ struct SettingsView: View {
             if let error = viewModel.loadError {
                 Text(error).foregroundStyle(.red).font(.callout)
             }
+
+            // The version lives here (rather than e.g. a menu-bar item)
+            // because Settings -> General is the one place a user reporting
+            // a bug is likely to look. A single `LabeledContent` row fits
+            // the window's fixed 560x520 frame without pushing the other
+            // sections around.
+            Section {
+                LabeledContent("Version:", value: Self.appVersionDisplay)
+            }
         }
         .formStyle(.grouped)
         .padding(12)
+    }
+
+    /// E.g. "1.0.12 (1)" -- `CFBundleShortVersionString` (the
+    /// `MARKETING_VERSION` AGENTS.md asks every behavior-changing PR to
+    /// bump) plus `CFBundleVersion` (the build number) in parens, read from
+    /// the running app's own bundle rather than a hardcoded constant so the
+    /// label can never drift from what was actually built. Falls back to
+    /// "unknown" for either half if `Bundle.main`'s Info.plist is missing
+    /// the key (a malformed build/test host, never a real app run).
+    private static var appVersionDisplay: String {
+        let shortVersion = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "unknown"
+        let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "unknown"
+        return "\(shortVersion) (\(build))"
     }
 
     private var apiKeyTab: some View {

@@ -284,16 +284,26 @@ public final class CaptureViewModel: ObservableObject {
 
     /// "Clear" button (plan U8 fix #4a): empties transcript, notes, and
     /// screenshot, and mints a fresh `clientId` so a subsequent submit is
-    /// recorded as a distinct capture. The panel stays open and
-    /// transcription keeps running -- `lastServiceText` resets so dictation
-    /// after a clear starts fresh instead of trying to diff against the
-    /// discarded text.
+    /// recorded as a distinct capture. Transcription is restarted (rather
+    /// than left running) because the service actor accumulates its own
+    /// `committedTranscript` across the whole session and only resets that
+    /// buffer in `start()` -- it is never told about `clear()`. Resetting
+    /// only `lastServiceText` here would desync the view model from the
+    /// service: the next update's `displayText` still carries the old,
+    /// supposedly-cleared text (committed service-side), and
+    /// `applyTranscriptUpdate`'s fast path (fired because `transcriptText`
+    /// is now empty) adopts it wholesale -- the old text reappears, prefixed
+    /// to the new speech. Stopping and restarting mints a fresh service
+    /// instance whose buffers are empty in lockstep with the view model's,
+    /// so the next update has nothing stale to reintroduce.
     public func clear() {
         transcriptText = ""
         notesText = ""
         screenshotData = nil
         lastServiceText = ""
         clientId = UUID().uuidString
+        stopTranscription()
+        startTranscriptionIfPermitted()
     }
 
     /// Called by `CapturePanelController` when the pre-panel screenshot
@@ -388,11 +398,29 @@ public final class CaptureViewModel: ObservableObject {
     /// synchronous already-granted path and the async post-request path
     /// share one implementation.
     private func beginRunningTranscription() {
+        // Double-start hardening: `startTranscriptionIfPermitted()` can be
+        // in flight twice at once -- e.g. `clear()`'s restart racing a
+        // mid-flight TCC permission request whose unstructured `Task` was
+        // kicked off by an earlier `beginCapture()`/`resumeDraft()` and only
+        // reaches here later. Without this guard, the earlier flow's
+        // `Task` would still call `beginRunningTranscription()` after this
+        // one already has, silently overwriting `transcriptionService` and
+        // `transcriptionTask` -- the generation token bump below keeps that
+        // orphaned stream's text from reaching the field, but nothing would
+        // ever call `stop()` on its service, leaking a service whose audio
+        // tap runs forever (mic indicator stays hot). Stopping first makes
+        // any double-start self-healing: at most one service is ever live.
+        if transcriptionService != nil {
+            NSLog("CaptureViewModel: beginRunningTranscription found a live service (gen %d) — stopping it first", transcriptionGeneration)
+            stopTranscription()
+        }
+
         let service = transcriptionServiceFactory()
         transcriptionGeneration &+= 1
         let generation = transcriptionGeneration
         transcriptionService = service
         isListening = true
+        NSLog("CaptureViewModel: starting transcription (gen %d)", generation)
         transcriptionTask = Task { [weak self] in
             let stream = await service.start()
             for await update in stream {
@@ -405,6 +433,7 @@ public final class CaptureViewModel: ObservableObject {
             // Stream ended on its own (service-side stop/error) rather than
             // via `stopTranscription()` -- still clear the indicator so the
             // flap doesn't churn against a dead service.
+            NSLog("CaptureViewModel: transcription stream ended (gen %d)", generation)
             await MainActor.run {
                 guard self?.transcriptionGeneration == generation else { return }
                 self?.isListening = false
@@ -527,6 +556,7 @@ public final class CaptureViewModel: ObservableObject {
         transcriptionService = nil
         isListening = false
         if let service {
+            NSLog("CaptureViewModel: stopTranscription (now gen %d) — stopping service", transcriptionGeneration)
             Task { await service.stop() }
         }
     }

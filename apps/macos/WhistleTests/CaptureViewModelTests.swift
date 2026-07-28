@@ -100,6 +100,53 @@ actor ManualTranscriptionService: TranscriptionService {
     }
 }
 
+/// Test-only gate for a permission-request seam (`requestMicPermission`),
+/// letting a test hold the real system TCC prompt open until it chooses to
+/// resolve it -- needed for
+/// `testClearDuringInFlightPermissionRequestLeavesOneLiveService`, which
+/// races `clear()`'s restart against a still-in-flight permission `Task`
+/// from `beginCapture()`. Supports more than one concurrent waiter (both
+/// flows call through the very same `requestMicPermission` closure), unlike
+/// a single `CheckedContinuation` var, which can only ever hold one caller
+/// and would trap on a second `withCheckedContinuation` resuming an
+/// already-resumed continuation.
+private final class ManualPermissionGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuations: [CheckedContinuation<Bool, Never>] = []
+    private var _waitingCount = 0
+
+    /// Synchronous, lock-protected -- so a test's `Whistle_waitUntil`
+    /// (whose `condition` closure is plain synchronous `() -> Bool`) can
+    /// poll it directly to confirm both flows have actually reached the
+    /// gate before resolving it.
+    var waitingCount: Int {
+        lock.lock(); defer { lock.unlock() }
+        return _waitingCount
+    }
+
+    func wait() async -> Bool {
+        await withCheckedContinuation { continuation in
+            lock.lock()
+            _waitingCount += 1
+            continuations.append(continuation)
+            lock.unlock()
+        }
+    }
+
+    /// Resumes every caller currently parked in `wait()` with the same
+    /// result -- "resolve all" rather than "resolve one", since either
+    /// flow could otherwise be left waiting forever.
+    func resolveAll(granted: Bool) {
+        lock.lock()
+        let pending = continuations
+        continuations.removeAll()
+        lock.unlock()
+        for continuation in pending {
+            continuation.resume(returning: granted)
+        }
+    }
+}
+
 @MainActor
 private enum TestSupport {
     static func makeStore() throws -> (store: CaptureStore, tempDir: URL) {
@@ -844,6 +891,183 @@ final class CaptureViewModelTests: XCTestCase {
         viewModel.stopTranscription()
     }
 
+    // MARK: Regression: `clear()` must restart transcription, not just wipe
+    // the field (CRITICAL user-reported bug: cleared text reappears).
+    //
+    // The transcription service actor accumulates its own
+    // `committedTranscript` across the whole session and only resets that
+    // buffer in `start()` -- `clear()` alone never told the service anything
+    // was cleared. So the running service kept emitting updates whose
+    // `displayText` still carried the pre-clear text, and since
+    // `transcriptText` was now empty, `applyTranscriptUpdate`'s fast path
+    // adopted it wholesale -- the old text reappeared, prefixed to the new
+    // speech. These tests need to address the pre-clear and post-clear
+    // service instances separately (`services[0]` / `services[1]`), unlike
+    // every other transcript test in this file, which reuses one
+    // `ManualTranscriptionService` for the whole test via a same-instance
+    // factory (`{ manual }`) -- so they mint a fresh instance per factory
+    // call instead, recording each into `services` in call order.
+
+    @MainActor
+    func testClearRestartsTranscriptionAndOldTextNeverReappears() async throws {
+        let (store, tempDir) = try TestSupport.makeStore()
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        var services: [ManualTranscriptionService] = []
+        let viewModel = CaptureViewModel(
+            store: store,
+            transcriptionServiceFactory: {
+                let service = ManualTranscriptionService()
+                services.append(service)
+                return service
+            },
+            micPermissionStatus: { .granted },
+            requestMicPermission: { true },
+            speechPermissionStatus: { .granted },
+            requestSpeechPermission: { true }
+        )
+
+        viewModel.beginCapture()
+        try await Self.waitUntil { services.count == 1 }
+
+        await services[0].emit(TranscriptUpdate(committed: "old text", live: ""))
+        try await Self.waitUntil { viewModel.transcriptText == "old text" }
+
+        viewModel.clear()
+
+        // `clear()` must both stop the pre-clear service (so its
+        // `committedTranscript` buffer is discarded rather than surviving to
+        // leak into a later update) and start a fresh one. `stopTranscription()`
+        // hands the actual `service.stop()` call to an unstructured `Task`
+        // rather than awaiting it inline, so the call count needs polling --
+        // it can lag slightly behind `clear()` returning.
+        try await Self.waitUntil { services.count == 2 }
+        try await pollStopCallCount(services[0], atLeast: 1)
+        let oldServiceStopCount = await services[0].stopCallCount
+        XCTAssertEqual(oldServiceStopCount, 1, "clear() must stop the pre-clear service, not merely stop reading from it")
+
+        await services[1].emit(TranscriptUpdate(committed: "new", live: ""))
+        try await Self.waitUntil { viewModel.transcriptText == "new" }
+        XCTAssertEqual(viewModel.transcriptText, "new")
+        XCTAssertFalse(viewModel.transcriptText.contains("old"), "the pre-clear text must never reappear")
+
+        viewModel.stopTranscription()
+    }
+
+    @MainActor
+    func testStaleUpdateAfterClearIsDropped() async throws {
+        let (store, tempDir) = try TestSupport.makeStore()
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        var services: [ManualTranscriptionService] = []
+        let viewModel = CaptureViewModel(
+            store: store,
+            transcriptionServiceFactory: {
+                let service = ManualTranscriptionService()
+                services.append(service)
+                return service
+            },
+            micPermissionStatus: { .granted },
+            requestMicPermission: { true },
+            speechPermissionStatus: { .granted },
+            requestSpeechPermission: { true }
+        )
+
+        viewModel.beginCapture()
+        try await Self.waitUntil { services.count == 1 }
+
+        await services[0].emit(TranscriptUpdate(committed: "old text", live: ""))
+        try await Self.waitUntil { viewModel.transcriptText == "old text" }
+
+        viewModel.clear()
+        try await Self.waitUntil { services.count == 2 }
+
+        // A late update from the pre-clear service's still-open continuation
+        // (a straggler that was in flight before `stop()` took effect) must
+        // never resurrect the cleared text -- whether because the stream has
+        // already terminated by this point, or because the generation token
+        // (bumped by both `stopTranscription()` and the restart's
+        // `beginRunningTranscription()`) drops it in `applyTranscriptUpdate`.
+        await services[0].emit(TranscriptUpdate(committed: "old text", live: ""))
+
+        let deadline = Date().addingTimeInterval(0.1)
+        while Date() < deadline {
+            XCTAssertFalse(
+                viewModel.transcriptText.contains("old text"),
+                "a stale update from the pre-clear service must never reappear after clear()"
+            )
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+
+        viewModel.stopTranscription()
+    }
+
+    @MainActor
+    func testClearDuringInFlightPermissionRequestLeavesOneLiveService() async throws {
+        let (store, tempDir) = try TestSupport.makeStore()
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let gate = ManualPermissionGate()
+        var services: [ManualTranscriptionService] = []
+        let viewModel = CaptureViewModel(
+            store: store,
+            transcriptionServiceFactory: {
+                let service = ManualTranscriptionService()
+                services.append(service)
+                return service
+            },
+            // `.notDetermined` so both `beginCapture()` and `clear()`'s
+            // restart each fire a real (gated) permission request rather
+            // than starting synchronously.
+            micPermissionStatus: { .notDetermined },
+            requestMicPermission: { await gate.wait() },
+            speechPermissionStatus: { .granted },
+            requestSpeechPermission: { true }
+        )
+
+        viewModel.beginCapture() // fires the first gated mic-permission request
+        viewModel.clear() // races a second gated request via clear()'s restart
+
+        // Wait until both flows have actually reached the gate before
+        // resolving it -- resolving too early would only unblock whichever
+        // had registered so far and strand the other.
+        try await Whistle_waitUntil { gate.waitingCount == 2 }
+        gate.resolveAll(granted: true)
+
+        // Both flows resolve through to `beginRunningTranscription()`, which
+        // (per the double-start hardening) stops any already-live service
+        // before creating its own -- so exactly two services are ever
+        // created, and only the one from whichever flow lands last stays
+        // live.
+        try await Self.waitUntil { services.count == 2 }
+
+        // As above, the loser's `stop()` call lands via an unstructured
+        // `Task` and can lag slightly behind `beginRunningTranscription()`
+        // returning -- poll until exactly one of the two has been stopped
+        // rather than asserting against a possibly-stale snapshot.
+        var liveCount = 0
+        var stoppedCount = 0
+        let deadline = Date().addingTimeInterval(1)
+        repeat {
+            liveCount = 0
+            stoppedCount = 0
+            for service in services {
+                let stopCount = await service.stopCallCount
+                if stopCount == 0 {
+                    liveCount += 1
+                } else {
+                    stoppedCount += 1
+                }
+            }
+            if stoppedCount == 1 { break }
+            try await Task.sleep(nanoseconds: 10_000_000)
+        } while Date() < deadline
+        XCTAssertEqual(liveCount, 1, "exactly one live service must remain after the double-start race")
+        XCTAssertEqual(stoppedCount, 1, "the loser of the race must have been stopped, not leaked")
+
+        viewModel.stopTranscription()
+    }
+
     private static func waitUntil(
         timeout: TimeInterval = 1,
         file: StaticString = #filePath,
@@ -1072,6 +1296,23 @@ private func pollStartCallCount(
 ) async throws {
     let deadline = Date().addingTimeInterval(timeout)
     while await service.startCallCount < expected, Date() < deadline {
+        try await Task.sleep(nanoseconds: 10_000_000)
+    }
+}
+
+/// Polls a `ManualTranscriptionService`'s actor-isolated `stopCallCount`
+/// until it reaches `expected` or the timeout elapses -- `CaptureViewModel.
+/// stopTranscription()` hands the real `service.stop()` call to an
+/// unstructured `Task` rather than awaiting it inline, so it can lag
+/// slightly behind the synchronous call (`clear()`, `beginRunningTranscription()`'s
+/// double-start hardening) that triggered it.
+private func pollStopCallCount(
+    _ service: ManualTranscriptionService,
+    atLeast expected: Int,
+    timeout: TimeInterval = 1
+) async throws {
+    let deadline = Date().addingTimeInterval(timeout)
+    while await service.stopCallCount < expected, Date() < deadline {
         try await Task.sleep(nanoseconds: 10_000_000)
     }
 }
