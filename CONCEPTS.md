@@ -39,3 +39,17 @@ The protocol (`ConvexServiceProtocol`) and its live implementation (`LiveConvexS
 The server-side capture record, mirroring the Convex `captures` table (TECH-SPEC §5). Distinct from CaptureDraft — a ServerCaptureRecord only exists after `captures.create` succeeds on the server. Carries `CaptureServerStatus` (pipeline lifecycle: `.queued` → `.creating` → `.sending` → `.agentWorking` → `.ready`/`.readyUnverified`/`.failed`) and `CaptureErrorCode` (`.auth`, `.workspaceSetup`, `.network`, `.stalled`, `.unknown`). `SyncEngine` does not create or update ServerCaptureRecords directly; they arrive via Convex subscriptions that `CaptureStore` caches in `history_cache`.
 
 Non-obvious invariant: a ServerCaptureRecord has two distinct serialized shapes that must never be coupled. On the wire, Convex delivers raw documents (id keyed as `_id`, timestamps as milliseconds-since-epoch numbers), which are decoded through a dedicated wire-twin intermediary and mapped in one place. On disk, the record's own Codable shape is the `history_cache` cache format (`id`-keyed, ISO-8601 dates) — changing it to match the wire shape would silently corrupt previously cached rows, so wire-contract changes always go through the twin, never the record itself.
+
+## Transcription domain
+
+### Committed / Live transcript
+
+The two-part contract every transcriber publishes: **committed** is finalized text that will never change; **live** is the current in-flight hypothesis, which later updates may revise or replace wholesale. The UI always renders committed followed by live.
+
+Non-obvious rules: live hypotheses are non-monotonic (a revision can rewrite earlier words, not just extend), so consumers must replace the live segment rather than append to it; and stopping a capture mid-utterance folds the live hypothesis into committed rather than dropping it.
+
+### Task-cycling
+
+The legacy speech path's (macOS 14–15) named process for long dictation sessions: recognition is deliberately restarted in segments because the OS recognizer cannot sustain long-form sessions, and each finalized segment is stitched onto the committed transcript with a single-space join. The macOS 26 analyzer path supports long-form sessions natively and does not task-cycle — finality there is derived per result from the analyzer's volatile time range instead of per segment.
+
+*Avoid:* segment restarts, recognizer recycling.

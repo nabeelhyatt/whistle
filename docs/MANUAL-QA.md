@@ -161,15 +161,21 @@ the box when you've personally observed the expected outcome.
   join-space, no duplicated words, and no gap at segment boundaries; a
   gentle UI hint appears past the 5-minute soft cap but the transcript
   keeps accumulating and the capture still submits successfully.
-- [ ] **Action (macOS 26 only — runtime-unverified, requires a macOS 26
-  machine):** repeat the 6-minute dictation test on macOS 26+ hardware
-  where `SpeechAnalyzerTranscriber` is selected at runtime (`#available`
-  factory pick).
+- [ ] **Action (macOS 26 only):** repeat the 6-minute dictation test on
+  macOS 26+ hardware where `SpeechAnalyzerTranscriber` is selected at
+  runtime (`#available` factory pick).
   **Expected outcome:** same stitching correctness as the legacy path.
-  **Status:** not run — this host is 15.7.3; `SpeechAnalyzerTranscriber`
-  is compiled and unit-tested only against a fake recognizer
-  (TECH-SPEC §4.1/§13 U7). Explicitly tagged runtime-unverified until a
-  macOS 26 machine runs this.
+  **Status:** partially run 2026-07-27 on macOS 26.5.2 (M4 Pro). The
+  first-ever real execution of this path crashed the shipped 1.0.9 app —
+  an uncatchable Speech-framework precondition, "Audio sample data must
+  be 16-bit signed integers", from feeding native Float32 tap buffers to
+  `AnalyzerInput` unconverted (fixed in 1.0.10 via `AudioBufferConverter`
+  + `AssetInventory.reserve`; see `SpeechAnalyzerTranscriber.swift`
+  header). Post-fix, a live capture ran 35+ s on-device with mic input
+  flowing: no SIGTRAP, and neither the 16-bit-precondition nor the
+  "unallocated locales" message in the unified log. Still to do by a
+  human: the full 6-minute real-speech dictation pass checking transcript
+  stitching quality.
 - [ ] **Action (macOS 14 — not available on this host):** repeat capture
   + dictation smoke tests on real macOS 14 hardware.
   **Expected outcome:** `LegacySpeechTranscriber` (`SFSpeechRecognizer`)

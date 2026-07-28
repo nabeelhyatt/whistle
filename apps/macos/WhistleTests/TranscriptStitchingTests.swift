@@ -213,6 +213,18 @@ private func collectUpdates(
     return updates
 }
 
+private actor TranscriptUpdateRecorder {
+    private var updates: [TranscriptUpdate] = []
+
+    func append(_ update: TranscriptUpdate) {
+        updates.append(update)
+    }
+
+    func values() -> [TranscriptUpdate] {
+        updates
+    }
+}
+
 // MARK: - LegacySpeechTranscriber tests
 
 final class TranscriptStitchingTests: XCTestCase {
@@ -476,20 +488,30 @@ final class SpeechAnalyzerTranscriberStitchingTests: XCTestCase {
             .event(SpeechAnalyzerResultEvent(text: "partial", isFinalized: false)),
             .error(FakeError()),
         ])
-        let transcriber = SpeechAnalyzerTranscriber(audioTap: FakeAudioTap(), engineFactory: { fake })
+        let tap = FakeAudioTap()
+        let transcriber = SpeechAnalyzerTranscriber(audioTap: tap, engineFactory: { fake })
 
         let stream = await transcriber.start()
-        var updates: [TranscriptUpdate] = []
-        for await update in stream {
-            updates.append(update)
-            if updates.count == 3 { break }
+        let recorder = TranscriptUpdateRecorder()
+        let streamFinished = expectation(description: "SpeechAnalyzer stream finishes after an error")
+        Task {
+            for await update in stream {
+                await recorder.append(update)
+            }
+            streamFinished.fulfill()
         }
+        await fulfillment(of: [streamFinished], timeout: 1)
 
+        let updates = await recorder.values()
+
+        // Assert the count before indexing: a regression that yields fewer
+        // updates would otherwise trap on the out-of-range subscript and
+        // take the whole test process down instead of failing this test.
+        XCTAssertEqual(updates.count, 3)
         XCTAssertEqual(updates[0], TranscriptUpdate(committed: "first", live: ""))
         XCTAssertEqual(updates[1], TranscriptUpdate(committed: "first", live: "partial"))
         XCTAssertEqual(updates[2], TranscriptUpdate(committed: "first", live: ""))
-
-        await transcriber.stop()
+        XCTAssertEqual(tap.stopCallCount, 1, "SpeechAnalyzer errors should end the capture session")
     }
 
     func testThreeConsecutiveFinalizationsConcatenateInOrder() async {

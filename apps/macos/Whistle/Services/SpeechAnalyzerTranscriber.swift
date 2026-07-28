@@ -4,17 +4,30 @@
 // finalized results *without* the task-cycling §4.1b requires for
 // `SFSpeechRecognizer` — no artificial segment restarts are needed here.
 //
-// RUNTIME-UNVERIFIED: this host is macOS 15.7.3. The macOS 26.2 SDK
-// (present in this Xcode install) is used to compile this file behind
-// `#available(macOS 26, *)`, and the API surface below was read directly
-// from the SDK's Speech.swiftinterface
+// RUNTIME-VERIFIED on macOS 26 (Tahoe): this path now actually executes on
+// a macOS 26 host, and running it exposed two real bugs the original
+// macOS-15-host implementation couldn't have caught:
+//   1. CRASH (fixed): `AudioEngineTap` installs its tap in the input
+//      node's NATIVE format — Float32 @ 48kHz. Handing that straight to
+//      `AnalyzerInput(buffer:)` hits an internal Speech-framework
+//      precondition, "Audio sample data must be 16-bit signed integers",
+//      which is an UNCATCHABLE SIGTRAP (not a throwable error) — it killed
+//      the app outright. `LiveSpeechAnalyzerEngine` now queues buffers
+//      until it learns the analyzer's required format
+//      (`SpeechAnalyzer.bestAvailableAudioFormat(compatibleWith:)`, which
+//      is the Int16 format the precondition demands) and converts every
+//      buffer through `AudioBufferConverter` before it ever reaches
+//      `AnalyzerInput`.
+//   2. Locale never reserved (fixed): the engine never called
+//      `AssetInventory.reserve(locale:)` before starting analysis, logging
+//      "Cannot use modules with unallocated locales ... This will be an
+//      error in a future release!" — now reserved once per session before
+//      `analyzer.start(inputSequence:)`.
+// The macOS 26.2 SDK (present in this Xcode install) is used to compile
+// this file behind `#available(macOS 26, *)`, and the API surface below
+// was read directly from the SDK's Speech.swiftinterface
 // (MacOSX26.2.sdk/.../Speech.framework/.../arm64e-apple-macos.swiftinterface)
-// rather than guessed from memory. It compiles, and its segment-stitching
-// contract is exercised against a FAKE results sequence in
-// `TranscriptStitchingTests`, but real on-device behavior — model
-// download, volatile-range timing, actual audio-driven results — has never
-// run. See docs/MANUAL-QA.md (U12): "SpeechAnalyzerTranscriber — requires
-// a macOS 26 machine."
+// rather than guessed from memory.
 //
 // API surface actually found in the SDK (summarized from the
 // swiftinterface read above):
@@ -23,6 +36,11 @@
 //   - `SpeechAnalyzer.start(inputSequence:)` consumes an
 //     `AsyncSequence<AnalyzerInput>` (wrapping `AVAudioPCMBuffer`), fed
 //     with an `AsyncStream` we control from the audio tap.
+//   - `static SpeechAnalyzer.bestAvailableAudioFormat(compatibleWith:) async -> AVAudioFormat?`
+//     returns the (Int16) format the analyzer's precondition requires —
+//     the root-cause fix for the crash described above.
+//   - `AssetInventory.reserve(locale:) async throws -> Bool` reserves the
+//     locale's assets for use; must be awaited before `analyzer.start`.
 //   - `SpeechTranscriber.results` is `AsyncSequence<SpeechTranscriber.Result, Error>`.
 //     Each `Result` carries `range: CMTimeRange`, `resultsFinalizationTime: CMTime`,
 //     and `text: AttributedString` — there is no `isFinal` boolean on the
@@ -45,9 +63,8 @@
 // `LegacySpeechTranscriber`'s (`SpeechAnalyzerResultsEngine` protocol), so
 // `TranscriptStitchingTests` can drive this actor's segment-stitching
 // contract with a fake results sequence — no real `SpeechAnalyzer`, no
-// mic, no TCC, and (crucially, since this host can't even construct a real
-// `SpeechAnalyzer` at runtime pre-macOS 26) no macOS 26 requirement to run
-// the tests.
+// mic, no TCC, and (crucially, since not every host running these tests is
+// macOS 26) no macOS 26 requirement to run the tests.
 
 import Foundation
 
@@ -112,19 +129,105 @@ public protocol SpeechAnalyzerResultsEngine: Sendable {
     import CoreMedia
 #endif
 
+/// Errors specific to `LiveSpeechAnalyzerEngine`'s own setup steps (as
+/// opposed to errors thrown by `SpeechAnalyzer`/`AssetInventory`
+/// themselves, which are surfaced as-is).
+enum LiveSpeechAnalyzerEngineError: Error {
+    /// `SpeechAnalyzer.bestAvailableAudioFormat(compatibleWith:)` returned
+    /// nil — there is no format this analyzer/transcriber combination can
+    /// accept, so analysis cannot start at all.
+    case noCompatibleAudioFormat
+    /// `AssetInventory.reserve(locale:)` declined the reservation without
+    /// throwing, so the analyzer must not start against that locale.
+    case localeReservationFailed
+}
+
 @available(macOS 26, *)
 final class LiveSpeechAnalyzerEngine: SpeechAnalyzerResultsEngine, @unchecked Sendable {
+    /// Bound on how many pre-format-discovery buffers get queued before the
+    /// oldest is dropped. `AudioEngineTap` installs its tap with a
+    /// bufferSize of 4096 frames (≈85ms at the typical 48kHz native rate),
+    /// so 64 buffers is ≈5.5s of audio — comfortably longer than analyzer
+    /// setup (locale reservation + format lookup) should ever take, while
+    /// still bounding memory if setup stalls.
+    private static let maxPendingBuffers = 64
+
     private let locale: Locale
     private var analyzer: SpeechAnalyzer?
     private var transcriber: SpeechTranscriber?
     private var inputContinuation: AsyncStream<AnalyzerInput>.Continuation?
+
+    /// Guards `analyzerFormat` and `pendingBuffers`. `appendAudio` is a
+    /// synchronous, non-async protocol method invoked from the owning
+    /// actor as buffers arrive off the mic tap, while `analyzerFormat` is
+    /// discovered and published from the async setup `Task` in
+    /// `startAnalysis()` — an `NSLock` (rather than actor isolation) is
+    /// what keeps those two call paths from racing on the same state.
+    private let stateLock = NSLock()
+    /// The Int16 format `SpeechAnalyzer.bestAvailableAudioFormat` reports
+    /// once setup completes (see file header — this is the root-cause
+    /// fix). `nil` until then: `appendAudio` has nothing to convert TO yet,
+    /// so it queues instead.
+    private var analyzerFormat: AVAudioFormat?
+    /// Buffers received before `analyzerFormat` is known, replayed in
+    /// order through the converter once it is. Bounded by
+    /// `maxPendingBuffers` so a slow/stalled setup can't grow this
+    /// unboundedly.
+    private var pendingBuffers: [AVAudioPCMBuffer] = []
+    private let bufferConverter = AudioBufferConverter()
+    private var didLogConversionFailure = false
+    private var setupTask: Task<Void, Never>?
+    private var resultsTask: Task<Void, Never>?
+    /// True only while this engine owns a successful locale reservation.
+    /// Access is serialized by `stateLock` because setup and teardown run
+    /// from separate tasks. Every release goes through
+    /// `releaseReservedLocale()` — called by `finish()`/`cancel()`, and by
+    /// the setup task itself at each early exit that happens before
+    /// `analyzer.start`. That helper reads-and-clears this flag under the
+    /// lock, so the release is idempotent no matter how many callers race
+    /// it or when in setup/analysis it lands.
+    private var hasReservedLocale = false
+    private var isClosed = false
 
     init(locale: Locale) {
         self.locale = locale
     }
 
     func appendAudio(buffer: AVAudioPCMBuffer) {
-        inputContinuation?.yield(AnalyzerInput(buffer: buffer))
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        guard !isClosed else { return }
+        guard let format = analyzerFormat else {
+            pendingBuffers.append(buffer)
+            if pendingBuffers.count > Self.maxPendingBuffers {
+                pendingBuffers.removeFirst()
+            }
+            return
+        }
+        yieldConvertedLocked(buffer, targetFormat: format)
+    }
+
+    /// Converts `buffer` to `targetFormat` — the Int16 format the
+    /// analyzer's precondition requires (see file header) — and yields it
+    /// as `AnalyzerInput`. Never crashes: a conversion failure drops the
+    /// buffer and logs once, per the "conversion failure -> drop buffer,
+    /// never crash" contract.
+    ///
+    /// MUST be called with `stateLock` held: `bufferConverter` is not
+    /// thread-safe, and holding the lock across convert+yield is also what
+    /// keeps `appendAudio` (owning-actor context) from yielding a fresh
+    /// buffer ahead of older ones while `startAnalysis()`'s setup Task is
+    /// still draining the pending queue.
+    private func yieldConvertedLocked(_ buffer: AVAudioPCMBuffer, targetFormat: AVAudioFormat) {
+        do {
+            let converted = try bufferConverter.convert(buffer, to: targetFormat)
+            inputContinuation?.yield(AnalyzerInput(buffer: converted))
+        } catch {
+            if !didLogConversionFailure {
+                didLogConversionFailure = true
+                NSLog("LiveSpeechAnalyzerEngine: dropping audio buffer(s) after conversion failure: \(error)")
+            }
+        }
     }
 
     func startAnalysis() -> AsyncStream<SpeechAnalyzerOutcome> {
@@ -138,19 +241,94 @@ final class LiveSpeechAnalyzerEngine: SpeechAnalyzerResultsEngine, @unchecked Se
             self.analyzer = analyzer
 
             let (inputStream, inputContinuation) = AsyncStream<AnalyzerInput>.makeStream()
+            self.stateLock.lock()
             self.inputContinuation = inputContinuation
+            self.stateLock.unlock()
 
-            Task {
+            let setupTask = Task {
+                // (a) Reserve the locale's assets before starting analysis
+                // -- fixes the "Cannot use modules with unallocated
+                // locales" warning (see file header). A throw here means
+                // the session can't proceed; end gracefully (committed
+                // text is preserved by the existing `.error` handling in
+                // `SpeechAnalyzerTranscriber.handle`) rather than starting
+                // the analyzer against an unreserved locale.
                 do {
-                    try await analyzer.start(inputSequence: inputStream)
+                    guard try await AssetInventory.reserve(locale: self.locale) else {
+                        continuation.yield(.error(LiveSpeechAnalyzerEngineError.localeReservationFailed))
+                        continuation.finish()
+                        return
+                    }
                 } catch {
                     continuation.yield(.error(error))
                     continuation.finish()
                     return
                 }
+                self.stateLock.lock()
+                self.hasReservedLocale = true
+                self.stateLock.unlock()
+                guard !Task.isCancelled, !self.checkIsClosed() else {
+                    await self.releaseReservedLocale()
+                    return
+                }
+
+                // (b) THE ROOT-CAUSE FIX: discover the Int16 format the
+                // analyzer's precondition requires (see file header)
+                // before any buffer is allowed to reach `AnalyzerInput`.
+                guard let format = await SpeechAnalyzer.bestAvailableAudioFormat(compatibleWith: [transcriber]) else {
+                    continuation.yield(.error(LiveSpeechAnalyzerEngineError.noCompatibleAudioFormat))
+                    continuation.finish()
+                    await self.releaseReservedLocale()
+                    return
+                }
+                guard !Task.isCancelled, !self.checkIsClosed() else { return }
+
+                // (c) Publish the format and drain whatever `appendAudio`
+                // queued while setup was still in flight, all in one
+                // critical section: `appendAudio` blocks on the lock until
+                // the drain completes, so queued buffers can't be
+                // leapfrogged by a newer one and the converter is never
+                // touched from two threads at once.
+                self.stateLock.lock()
+                guard !self.isClosed else {
+                    self.stateLock.unlock()
+                    await self.releaseReservedLocale()
+                    return
+                }
+                self.analyzerFormat = format
+                let queuedBuffers = self.pendingBuffers
+                self.pendingBuffers = []
+                for queuedBuffer in queuedBuffers {
+                    self.yieldConvertedLocked(queuedBuffer, targetFormat: format)
+                }
+                self.stateLock.unlock()
+
+                // (d) Only now start the analyzer against the (converted)
+                // input stream.
+                self.stateLock.lock()
+                guard !Task.isCancelled, !self.isClosed else {
+                    self.stateLock.unlock()
+                    await self.releaseReservedLocale()
+                    return
+                }
+                self.stateLock.unlock()
+                do {
+                    try await analyzer.start(inputSequence: inputStream)
+                } catch {
+                    continuation.yield(.error(error))
+                    continuation.finish()
+                }
+            }
+            self.stateLock.lock()
+            if self.isClosed {
+                self.stateLock.unlock()
+                setupTask.cancel()
+            } else {
+                self.setupTask = setupTask
+                self.stateLock.unlock()
             }
 
-            Task {
+            let resultsTask = Task {
                 do {
                     for try await result in transcriber.results {
                         // No `isFinal` field on `SpeechTranscriber.Result`
@@ -184,18 +362,86 @@ final class LiveSpeechAnalyzerEngine: SpeechAnalyzerResultsEngine, @unchecked Se
                     continuation.finish()
                 }
             }
+            self.stateLock.lock()
+            if self.isClosed {
+                self.stateLock.unlock()
+                resultsTask.cancel()
+            } else {
+                self.resultsTask = resultsTask
+                self.stateLock.unlock()
+            }
         }
     }
 
     func finish() async {
-        inputContinuation?.finish()
+        stateLock.lock()
+        isClosed = true
+        pendingBuffers = []
+        let setupTask = setupTask
+        self.setupTask = nil
+        let resultsTask = resultsTask
+        self.resultsTask = nil
+        let continuation = inputContinuation
+        if let format = analyzerFormat, let continuation {
+            do {
+                for buffer in try bufferConverter.finish(convertingTo: format) {
+                    continuation.yield(AnalyzerInput(buffer: buffer))
+                }
+            } catch {
+                if !didLogConversionFailure {
+                    didLogConversionFailure = true
+                    NSLog("LiveSpeechAnalyzerEngine: dropping converter tail after conversion failure: \(error)")
+                }
+            }
+        }
+        analyzerFormat = nil
         inputContinuation = nil
+        stateLock.unlock()
+        setupTask?.cancel()
+        continuation?.finish()
         try? await analyzer?.finalizeAndFinishThroughEndOfInput()
+        resultsTask?.cancel()
+        await releaseReservedLocale()
     }
 
     func cancel() {
-        inputContinuation?.finish()
+        stateLock.lock()
+        isClosed = true
+        pendingBuffers = []
+        analyzerFormat = nil
+        let setupTask = setupTask
+        self.setupTask = nil
+        let resultsTask = resultsTask
+        self.resultsTask = nil
+        let continuation = inputContinuation
         inputContinuation = nil
+        stateLock.unlock()
+        setupTask?.cancel()
+        resultsTask?.cancel()
+        continuation?.finish()
+        Task {
+            await self.releaseReservedLocale()
+        }
+    }
+
+    /// Reads `isClosed` by taking `stateLock` itself — so, unlike the
+    /// `...Locked` helpers above, callers must NOT already hold the lock
+    /// (`stateLock` is a non-recursive `NSLock`; re-entering it deadlocks
+    /// the mic path).
+    private func checkIsClosed() -> Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return isClosed
+    }
+
+    private func releaseReservedLocale() async {
+        stateLock.lock()
+        let shouldReleaseLocale = hasReservedLocale
+        hasReservedLocale = false
+        stateLock.unlock()
+        if shouldReleaseLocale {
+            _ = await AssetInventory.release(reservedLocale: locale)
+        }
     }
 }
 
@@ -206,9 +452,10 @@ final class LiveSpeechAnalyzerEngine: SpeechAnalyzerResultsEngine, @unchecked Se
 /// `TranscriptUpdate` contract: `committed` accumulates finalized result
 /// text, `live` holds the newest not-yet-finalized result text.
 ///
-/// RUNTIME-UNVERIFIED on this host (see file header) — the engine
-/// (`SpeechAnalyzerResultsEngine`) is injectable so this actor's
-/// committed/live bookkeeping is still exercised by
+/// RUNTIME-VERIFIED on macOS 26 (see file header for the format-conversion
+/// and locale-reservation fixes that verification surfaced) — the engine
+/// (`SpeechAnalyzerResultsEngine`) is still injectable so this actor's
+/// committed/live bookkeeping can also be exercised by
 /// `TranscriptStitchingTests` via a fake engine, without requiring macOS
 /// 26 or a real `SpeechAnalyzer`.
 public actor SpeechAnalyzerTranscriber: TranscriptionService {
@@ -310,6 +557,11 @@ public actor SpeechAnalyzerTranscriber: TranscriptionService {
             // segment; committed text is preserved and surfaced as-is.
             liveSegment = ""
             continuation?.yield(TranscriptUpdate(committed: committedTranscript, live: liveSegment))
+            continuation?.finish()
+            continuation = nil
+            audioTap.stop()
+            engine?.cancel()
+            engine = nil
         }
     }
 
