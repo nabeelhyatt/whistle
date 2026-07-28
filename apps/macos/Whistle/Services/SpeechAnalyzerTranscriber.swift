@@ -180,16 +180,13 @@ final class LiveSpeechAnalyzerEngine: SpeechAnalyzerResultsEngine, @unchecked Se
     private var resultsTask: Task<Void, Never>?
     /// True only while this engine owns a successful locale reservation.
     /// Access is serialized by `stateLock` because setup and teardown run
-    /// from separate tasks.
+    /// from separate tasks. Every release goes through
+    /// `releaseReservedLocale()` — called by `finish()`/`cancel()`, and by
+    /// the setup task itself at each early exit that happens before
+    /// `analyzer.start`. That helper reads-and-clears this flag under the
+    /// lock, so the release is idempotent no matter how many callers race
+    /// it or when in setup/analysis it lands.
     private var hasReservedLocale = false
-    /// Once true, the setup task owns releasing the locale after
-    /// `analyzer.start` returns. This prevents teardown from releasing it
-    /// in the small interval between committing the start and entering the
-    /// async Speech API.
-    private var analysisStartCommitted = false
-    /// Prevents the setup task from releasing a locale while `finish()` is
-    /// still asking SpeechAnalyzer to finalize its remaining results.
-    private var localeReleaseDeferredUntilFinalization = false
     private var isClosed = false
 
     init(locale: Locale) {
@@ -314,19 +311,12 @@ final class LiveSpeechAnalyzerEngine: SpeechAnalyzerResultsEngine, @unchecked Se
                     await self.releaseReservedLocale()
                     return
                 }
-                self.analysisStartCommitted = true
                 self.stateLock.unlock()
                 do {
                     try await analyzer.start(inputSequence: inputStream)
                 } catch {
                     continuation.yield(.error(error))
                     continuation.finish()
-                }
-                self.stateLock.lock()
-                let shouldReleaseLocale = !self.localeReleaseDeferredUntilFinalization
-                self.stateLock.unlock()
-                if shouldReleaseLocale {
-                    await self.releaseReservedLocale()
                 }
             }
             self.stateLock.lock()
@@ -406,29 +396,12 @@ final class LiveSpeechAnalyzerEngine: SpeechAnalyzerResultsEngine, @unchecked Se
         }
         analyzerFormat = nil
         inputContinuation = nil
-        let analysisWasCommitted = analysisStartCommitted
-        if analysisWasCommitted {
-            localeReleaseDeferredUntilFinalization = true
-        }
-        let shouldReleaseLocale = hasReservedLocale && !analysisWasCommitted
-        if shouldReleaseLocale {
-            hasReservedLocale = false
-        }
         stateLock.unlock()
-        if !analysisWasCommitted {
-            setupTask?.cancel()
-        }
+        setupTask?.cancel()
         continuation?.finish()
         try? await analyzer?.finalizeAndFinishThroughEndOfInput()
         resultsTask?.cancel()
-        if analysisWasCommitted {
-            stateLock.lock()
-            localeReleaseDeferredUntilFinalization = false
-            stateLock.unlock()
-            await releaseReservedLocale()
-        } else if shouldReleaseLocale {
-            _ = await AssetInventory.release(reservedLocale: locale)
-        }
+        await releaseReservedLocale()
     }
 
     func cancel() {
@@ -442,19 +415,12 @@ final class LiveSpeechAnalyzerEngine: SpeechAnalyzerResultsEngine, @unchecked Se
         self.resultsTask = nil
         let continuation = inputContinuation
         inputContinuation = nil
-        let shouldReleaseLocale = hasReservedLocale && !analysisStartCommitted
-        if shouldReleaseLocale {
-            hasReservedLocale = false
-        }
         stateLock.unlock()
         setupTask?.cancel()
         resultsTask?.cancel()
         continuation?.finish()
-        if shouldReleaseLocale {
-            let locale = locale
-            Task {
-                _ = await AssetInventory.release(reservedLocale: locale)
-            }
+        Task {
+            await self.releaseReservedLocale()
         }
     }
 
