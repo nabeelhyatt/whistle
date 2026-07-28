@@ -18,6 +18,14 @@ A release spans **three** places. Getting them out of sync is the main failure m
 
 - **Tag == version.** The git tag `vX.Y.Z` must exactly equal `MARKETING_VERSION`
   (`release.yml` asserts this and fails otherwise).
+- **`sparkle:version` must increase every release.** Sparkle decides "is this an update?"
+  by comparing the appcast item's `sparkle:version` (= the built app's `CFBundleVersion`,
+  which release.yml reads via PlistBuddy) against the installed app's `CFBundleVersion` —
+  `sparkle:shortVersionString` is display-only. `CURRENT_PROJECT_VERSION` in
+  `apps/macos/project.yml` is set to `$(MARKETING_VERSION)` so this happens automatically
+  with the normal version bump; don't pin it back to a constant (it was `"1"` through
+  v1.0.12, which made every published update compare equal to every install and never be
+  offered).
 - **Feed URL == hosting location.** `SU_FEED_URL` in `apps/macos/Config/Sparkle.xcconfig`
   is compiled into the app at build time and currently points at
   `https://nabeelhyatt.com/experiments/whistle/appcast.xml`. If the feed ever moves, you
