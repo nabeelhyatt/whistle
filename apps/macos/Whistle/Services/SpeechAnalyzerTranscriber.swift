@@ -255,11 +255,13 @@ final class LiveSpeechAnalyzerEngine: SpeechAnalyzerResultsEngine, @unchecked Se
                 // the analyzer against an unreserved locale.
                 do {
                     guard try await AssetInventory.reserve(locale: self.locale) else {
+                        NSLog("LiveSpeechAnalyzerEngine: AssetInventory.reserve(locale:) returned false — session cannot start")
                         continuation.yield(.error(LiveSpeechAnalyzerEngineError.localeReservationFailed))
                         continuation.finish()
                         return
                     }
                 } catch {
+                    NSLog("LiveSpeechAnalyzerEngine: AssetInventory.reserve(locale:) threw — session cannot start: \(error)")
                     continuation.yield(.error(error))
                     continuation.finish()
                     return
@@ -276,6 +278,7 @@ final class LiveSpeechAnalyzerEngine: SpeechAnalyzerResultsEngine, @unchecked Se
                 // analyzer's precondition requires (see file header)
                 // before any buffer is allowed to reach `AnalyzerInput`.
                 guard let format = await SpeechAnalyzer.bestAvailableAudioFormat(compatibleWith: [transcriber]) else {
+                    NSLog("LiveSpeechAnalyzerEngine: bestAvailableAudioFormat returned nil — session cannot start")
                     continuation.yield(.error(LiveSpeechAnalyzerEngineError.noCompatibleAudioFormat))
                     continuation.finish()
                     await self.releaseReservedLocale()
@@ -315,6 +318,7 @@ final class LiveSpeechAnalyzerEngine: SpeechAnalyzerResultsEngine, @unchecked Se
                 do {
                     try await analyzer.start(inputSequence: inputStream)
                 } catch {
+                    NSLog("LiveSpeechAnalyzerEngine: analyzer.start(inputSequence:) threw: \(error)")
                     continuation.yield(.error(error))
                     continuation.finish()
                 }
@@ -358,6 +362,7 @@ final class LiveSpeechAnalyzerEngine: SpeechAnalyzerResultsEngine, @unchecked Se
                     }
                     continuation.finish()
                 } catch {
+                    NSLog("LiveSpeechAnalyzerEngine: transcriber.results stream threw: \(error)")
                     continuation.yield(.error(error))
                     continuation.finish()
                 }
@@ -507,6 +512,7 @@ public actor SpeechAnalyzerTranscriber: TranscriptionService {
                 Task { await self.feed(buffer) }
             }
         } catch {
+            NSLog("SpeechAnalyzerTranscriber: audioTap.start threw — no mic input this session: \(error)")
             continuation.yield(TranscriptUpdate(committed: committedTranscript, live: liveSegment))
             continuation.finish()
             return stream
@@ -551,10 +557,11 @@ public actor SpeechAnalyzerTranscriber: TranscriptionService {
             }
             continuation?.yield(TranscriptUpdate(committed: committedTranscript, live: liveSegment))
 
-        case .error:
+        case .error(let error):
             // SpeechAnalyzer sessions don't need task-cycling (§4.1b), so
             // an error here ends the session rather than spawning a new
             // segment; committed text is preserved and surfaced as-is.
+            NSLog("SpeechAnalyzerTranscriber: engine error — ending session and stopping the mic: \(error)")
             liveSegment = ""
             continuation?.yield(TranscriptUpdate(committed: committedTranscript, live: liveSegment))
             continuation?.finish()
