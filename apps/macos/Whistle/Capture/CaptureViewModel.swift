@@ -162,6 +162,9 @@ public final class CaptureViewModel: ObservableObject {
     private var transcriptionService: (any TranscriptionService)?
     private var transcriptionTask: Task<Void, Never>?
     private var projectsTask: Task<Void, Never>?
+    /// Invalidates updates and completion callbacks from a stream that was
+    /// stopped or superseded before they reach the main actor.
+    private var transcriptionGeneration = 0
 
     /// The transcription service's own running display text as of the last
     /// update, kept separately from `transcriptText` (the transcript field
@@ -386,6 +389,8 @@ public final class CaptureViewModel: ObservableObject {
     /// share one implementation.
     private func beginRunningTranscription() {
         let service = transcriptionServiceFactory()
+        transcriptionGeneration &+= 1
+        let generation = transcriptionGeneration
         transcriptionService = service
         isListening = true
         transcriptionTask = Task { [weak self] in
@@ -393,6 +398,7 @@ public final class CaptureViewModel: ObservableObject {
             for await update in stream {
                 guard let self else { return }
                 await MainActor.run {
+                    guard self.transcriptionGeneration == generation else { return }
                     self.applyTranscriptUpdate(update)
                 }
             }
@@ -400,6 +406,7 @@ public final class CaptureViewModel: ObservableObject {
             // via `stopTranscription()` -- still clear the indicator so the
             // flap doesn't churn against a dead service.
             await MainActor.run {
+                guard self?.transcriptionGeneration == generation else { return }
                 self?.isListening = false
             }
         }
@@ -412,36 +419,63 @@ public final class CaptureViewModel: ObservableObject {
     /// clobbered by a later update.
     private func applyTranscriptUpdate(_ update: TranscriptUpdate) {
         let newServiceText = update.displayText
+
+        // Defensive, and deliberately not covered by a unit test: a blank
+        // update never improves on text already on screen, so drop it rather
+        // than letting the fast path below adopt it and momentarily clear the
+        // box. Neither shipping transcriber emits a blank update after having
+        // produced text (both fold `live` into `committed` instead), and the
+        // effect is a single-frame flicker that converges on the next update
+        // -- so no final-state assertion can observe it. The guard is here
+        // because new transcribers are coming (SpeechAnalyzer has never run
+        // against the real API; a third-party engine may follow) and a
+        // flash-cleared transcript box is the one failure this screen must
+        // never show again.
+        //
+        // Placed *before* the `defer` below on purpose: `lastServiceText`
+        // must keep pointing at the last text the service really produced.
+        // Letting it fall to "" would leave the next genuine update nothing
+        // to diff against, and `appendDictated` would then append a whole
+        // utterance on top of the field.
+        guard !newServiceText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || transcriptText.isEmpty else { return }
+
         defer { lastServiceText = newServiceText }
 
-        if transcriptText.isEmpty || (transcriptText == lastServiceText && newServiceText.hasPrefix(lastServiceText)) {
-            // Common case: no user edits since the last update, and the
-            // service's own text is a clean extension of what it last
-            // reported -- adopt it wholesale.
+        if transcriptText.isEmpty || transcriptText == lastServiceText {
+            // Common case: no user edits since the last update, so the
+            // service is authoritative -- adopt its text wholesale.
+            //
+            // This deliberately does NOT require `newServiceText` to be a
+            // prefix-extension of `lastServiceText`. Recognizer hypotheses
+            // are not monotonic: both SFSpeechRecognizer and
+            // SpeechAnalyzer revise earlier words as later context arrives
+            // ("sink engine" -> "sync engine"). Requiring a clean extension
+            // here sent every such revision down the `appendDictated` path,
+            // which -- having no prefix to strip -- appended the entire
+            // utterance a second time. That is what produced the
+            // user-reported "garbles and repeats itself" transcript.
             transcriptText = newServiceText
             return
         }
 
-        // Either the user has diverged from the dictated text (a manual
-        // edit mid-dictation), or the service's text didn't extend cleanly
-        // (e.g. a segment restart producing something that doesn't share
-        // the prior prefix). Either way, never rebuild the field from
-        // scratch: append only the newly-dictated material onto whatever is
-        // already on screen, so dictation extends the user's edits instead
-        // of overwriting them.
+        // The user has diverged from the dictated text (a manual edit
+        // mid-dictation). Never rebuild the field from scratch: append only
+        // the newly-dictated material onto whatever is already on screen, so
+        // dictation extends the user's edits instead of overwriting them.
         appendDictated(newServiceText)
     }
 
     /// Appends the portion of `newServiceText` that's new since
     /// `lastServiceText` onto `transcriptText`, rather than replacing the
     /// field outright.
+    ///
+    /// Reached only when the user has diverged from the dictated text, so the
+    /// field cannot be rebuilt from the service's version -- the user's own
+    /// words would be lost. The new material is therefore identified by
+    /// diffing against `lastServiceText` rather than by replacement.
     private func appendDictated(_ newServiceText: String) {
-        let addition: String
-        if newServiceText.hasPrefix(lastServiceText) {
-            addition = String(newServiceText.dropFirst(lastServiceText.count))
-        } else {
-            addition = newServiceText
-        }
+        let keep = Self.commonWordPrefixCount(newServiceText, lastServiceText)
+        let addition = String(newServiceText.dropFirst(keep))
         let trimmedAddition = addition.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedAddition.isEmpty else { return }
 
@@ -452,9 +486,41 @@ public final class CaptureViewModel: ObservableObject {
         }
     }
 
+    /// How many leading characters of `newText` are already accounted for by
+    /// `previousText`, cut only on a word boundary.
+    ///
+    /// When `newText` cleanly extends `previousText` this is just
+    /// `previousText.count` -- the ordinary streaming case. When the service
+    /// *revised* a word instead ("...the sink engine" -> "...the sync
+    /// engine") the two diverge mid-word, and a raw character-level common
+    /// prefix would splice a word fragment onto the field ("...the sink
+    /// engine ync engine"). Backing off to the last whitespace keeps the
+    /// appended material whole words, so the worst case is a duplicated tail
+    /// rather than a duplicated utterance or a mangled one.
+    private static func commonWordPrefixCount(_ newText: String, _ previousText: String) -> Int {
+        let common = newText.commonPrefix(with: previousText)
+        // One string is a prefix of the other: nothing was revised, so the
+        // whole common run is safe to skip.
+        if common.count == newText.count {
+            return common.count
+        }
+        if common.count == previousText.count {
+            let next = newText.index(newText.startIndex, offsetBy: common.count)
+            if common.last?.isWhitespace == true || newText[next].isWhitespace {
+                return common.count
+            }
+        }
+        guard let lastBoundary = common.lastIndex(where: { $0.isWhitespace }) else {
+            // Diverged inside the very first word -- keep nothing.
+            return 0
+        }
+        return common.distance(from: common.startIndex, to: lastBoundary) + 1
+    }
+
     /// Stops the transcription service (e.g. panel closing). Safe to call
     /// multiple times.
     public func stopTranscription() {
+        transcriptionGeneration &+= 1
         transcriptionTask?.cancel()
         transcriptionTask = nil
         let service = transcriptionService

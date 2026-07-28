@@ -703,6 +703,147 @@ final class CaptureViewModelTests: XCTestCase {
         viewModel.stopTranscription()
     }
 
+    // MARK: Regression: a revised hypothesis must replace, not duplicate
+    // (CRITICAL user-reported bug: "it garbles and repeats itself").
+    //
+    // Recognizer hypotheses are not monotonic -- both SFSpeechRecognizer and
+    // SpeechAnalyzer rewrite earlier words as later context arrives. Every
+    // other transcript test in this file emits a clean prefix-extension
+    // sequence, which is precisely why this shipped: the reconciler's fast
+    // path required `hasPrefix`, so a revision fell through to the append
+    // path and re-appended the whole utterance.
+
+    @MainActor
+    func testRevisedHypothesisReplacesEarlierWordsInsteadOfDuplicatingTheUtterance() async throws {
+        let (store, tempDir) = try TestSupport.makeStore()
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let manual = ManualTranscriptionService()
+        let viewModel = CaptureViewModel(
+            store: store,
+            transcriptionServiceFactory: { manual },
+            micPermissionStatus: { .granted },
+            requestMicPermission: { true },
+            speechPermissionStatus: { .granted },
+            requestSpeechPermission: { true }
+        )
+        viewModel.beginCapture()
+
+        // 1. First hypothesis mis-hears "sync" as "sink".
+        await manual.emit(TranscriptUpdate(committed: "", live: "add a retry to the sink engine"))
+        try await Self.waitUntil { viewModel.transcriptText == "add a retry to the sink engine" }
+
+        // 2. More context arrives and the recognizer revises that word. The
+        // update is NOT a prefix-extension of the previous one. The user has
+        // not touched the field, so the corrected text simply replaces it.
+        await manual.emit(TranscriptUpdate(committed: "", live: "add a retry to the sync engine"))
+        try await Self.waitUntil { viewModel.transcriptText == "add a retry to the sync engine" }
+        XCTAssertEqual(
+            viewModel.transcriptText,
+            "add a retry to the sync engine",
+            "a revised hypothesis must replace the earlier one, not append a second copy"
+        )
+
+        viewModel.stopTranscription()
+    }
+
+    // MARK: Regression: a revision arriving *after* a manual edit may not
+    // re-append the whole utterance either.
+    //
+    // Here the field cannot simply be replaced -- that would discard the
+    // user's own words -- so the new material is diffed against the previous
+    // service text. The diff must cut on a word boundary, or the appended
+    // fragment is a mangled partial word ("... sink engine ync engine").
+
+    @MainActor
+    func testRevisionAfterUserEditAppendsOnlyTheRevisedTail() async throws {
+        let (store, tempDir) = try TestSupport.makeStore()
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let manual = ManualTranscriptionService()
+        let viewModel = CaptureViewModel(
+            store: store,
+            transcriptionServiceFactory: { manual },
+            micPermissionStatus: { .granted },
+            requestMicPermission: { true },
+            speechPermissionStatus: { .granted },
+            requestSpeechPermission: { true }
+        )
+        viewModel.beginCapture()
+
+        await manual.emit(TranscriptUpdate(committed: "", live: "add a retry to the sink engine"))
+        try await Self.waitUntil { viewModel.transcriptText == "add a retry to the sink engine" }
+
+        // User appends their own words mid-dictation.
+        viewModel.transcriptText = "add a retry to the sink engine please"
+
+        // The recognizer then revises "sink" -> "sync". Only the revised tail
+        // ("sync engine") is new material relative to the last service text;
+        // the leading "add a retry to the " is already on screen.
+        await manual.emit(TranscriptUpdate(committed: "", live: "add a retry to the sync engine"))
+        try await Self.waitUntil {
+            viewModel.transcriptText == "add a retry to the sink engine please sync engine"
+        }
+        XCTAssertEqual(
+            viewModel.transcriptText,
+            "add a retry to the sink engine please sync engine",
+            "a revision after a manual edit must append only the revised tail, on a word boundary"
+        )
+
+        viewModel.stopTranscription()
+    }
+
+    @MainActor
+    func testWhitespaceOnlyUpdateDoesNotReplaceTheServiceBaselineAfterUserEdit() async throws {
+        let (store, tempDir) = try TestSupport.makeStore()
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let manual = ManualTranscriptionService()
+        let viewModel = CaptureViewModel(
+            store: store,
+            transcriptionServiceFactory: { manual },
+            micPermissionStatus: { .granted },
+            requestMicPermission: { true },
+            speechPermissionStatus: { .granted },
+            requestSpeechPermission: { true }
+        )
+        viewModel.beginCapture()
+        await manual.emit(TranscriptUpdate(committed: "", live: "Hello"))
+        try await Self.waitUntil { viewModel.transcriptText == "Hello" }
+
+        viewModel.transcriptText = "Hello there"
+        await manual.emit(TranscriptUpdate(committed: "", live: " \n"))
+        await manual.emit(TranscriptUpdate(committed: "", live: "Hello world"))
+        try await Self.waitUntil { viewModel.transcriptText == "Hello there world" }
+
+        viewModel.stopTranscription()
+    }
+
+    @MainActor
+    func testPartialWordExtensionAfterUserEditAppendsTheWholeWord() async throws {
+        let (store, tempDir) = try TestSupport.makeStore()
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let manual = ManualTranscriptionService()
+        let viewModel = CaptureViewModel(
+            store: store,
+            transcriptionServiceFactory: { manual },
+            micPermissionStatus: { .granted },
+            requestMicPermission: { true },
+            speechPermissionStatus: { .granted },
+            requestSpeechPermission: { true }
+        )
+        viewModel.beginCapture()
+        await manual.emit(TranscriptUpdate(committed: "", live: "add c"))
+        try await Self.waitUntil { viewModel.transcriptText == "add c" }
+
+        viewModel.transcriptText = "add c please"
+        await manual.emit(TranscriptUpdate(committed: "", live: "add code"))
+        try await Self.waitUntil { viewModel.transcriptText == "add c please code" }
+
+        viewModel.stopTranscription()
+    }
+
     private static func waitUntil(
         timeout: TimeInterval = 1,
         file: StaticString = #filePath,
