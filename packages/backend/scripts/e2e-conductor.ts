@@ -164,16 +164,9 @@ async function main() {
   log(`  -> environment: ${resolved.environment} (${API_BASE})`);
 
   log(`Using scratch project: ${CONDUCTOR_SCRATCH_PROJECT_ID}`);
-  log("Sanity check: GET /v0/projects");
-  const projectsResp = await conductorFetch("GET", "/v0/projects?limit=50");
-  log(`  -> status ${projectsResp.status}`);
-  if (!projectsResp.ok) {
-    throw new Error(
-      `GET /v0/projects failed unexpectedly (status ${projectsResp.status}): ${projectsResp.rawText}`
-    );
-  }
-  const projectMatch = (projectsResp.body as any)?.data?.find(
-    (p: any) => p.id === CONDUCTOR_SCRATCH_PROJECT_ID
+  // The probe already fetched the full project list — no second call needed.
+  const projectMatch = resolved.projects.find(
+    (p) => p.id === CONDUCTOR_SCRATCH_PROJECT_ID
   );
   if (!projectMatch) {
     log(
