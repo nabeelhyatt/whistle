@@ -75,6 +75,14 @@ A release spans **three** places. Getting them out of sync is the main failure m
      at the exact feed URL. (The `index.html` link only affects brand-new downloads; existing
      installs auto-update purely from `appcast.xml`.)
 
+   **Since v1.0.14, `appcast.xml` is the safety net for a stale `index.html` too.** On its
+   very first launch (from `/Applications`, not the mounted DMG) the app silently probes the
+   feed and, if something newer is there, shows the update prompt *before* the onboarding
+   wizard — so a new user who downloaded last release's DMG is offered the current one within
+   seconds instead of a day later. See `apps/macos/Whistle/Updates/UpdateCoordinator.swift`.
+   Two consequences for this step: a forgotten `index.html` bump is now self-correcting, but a
+   broken or stale `appcast.xml` silently costs every new user their first-launch upgrade.
+
 ## Gotchas (learned the hard way, v1.0.9)
 
 - **Green ≠ signed.** See step 3. The first v1.0.9 run "succeeded" but shipped an ad-hoc,
