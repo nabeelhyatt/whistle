@@ -303,6 +303,15 @@ public final class OnboardingViewModel: ObservableObject {
         await loadProjectsAndAdvance()
     }
 
+    /// Restores the environment-specific dashboard link when onboarding is
+    /// resumed on the key step after a key was already committed. This is a
+    /// best-effort display fetch: key entry remains available if it fails.
+    public func loadStoredKeyEnvironment() async {
+        guard connectedEnvironment == nil, apiKeyInput.isEmpty else { return }
+        guard let snapshot = try? await convex.settingsGet(), snapshot.hasKey else { return }
+        connectedEnvironment = snapshot.environment
+    }
+
     /// Step 4 per PRD F5.1: exactly one project → auto-select it with NO
     /// step shown; otherwise show the picker step.
     private func loadProjectsAndAdvance() async {
@@ -558,6 +567,7 @@ struct OnboardingView: View {
             }
         }
         .padding(24)
+        .task { await viewModel.loadStoredKeyEnvironment() }
     }
 
     private var projectStep: some View {
@@ -567,6 +577,7 @@ struct OnboardingView: View {
             Text("New captures go to this Conductor project unless you pick another in the capture panel.")
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
+            stagingConnectionNotice
 
             if viewModel.projects.isEmpty {
                 Text("No projects found on this account yet — you can set a default later in Settings.")
@@ -605,6 +616,7 @@ struct OnboardingView: View {
                 .multilineTextAlignment(.center)
                 .foregroundStyle(.secondary)
                 .padding(.horizontal, 24)
+            stagingConnectionNotice
 
             Button("Start test capture") {
                 viewModel.startTestCapture()
@@ -622,6 +634,15 @@ struct OnboardingView: View {
             Spacer()
         }
         .padding(24)
+    }
+
+    @ViewBuilder
+    private var stagingConnectionNotice: some View {
+        if viewModel.connectedEnvironment == .staging {
+            Label("Connected to Conductor staging.", systemImage: "checkmark.circle")
+                .foregroundStyle(.secondary)
+                .font(.callout)
+        }
     }
 
     private var upsellStep: some View {

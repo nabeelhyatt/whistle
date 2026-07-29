@@ -247,6 +247,8 @@ public final class SettingsViewModel: ObservableObject {
         keyProjectsChanged = result.projectsChanged
         keyProjectsAvailable = true
         environment = result.environment ?? .prod
+        hasKey = true
+        keyLastFour = String(key.suffix(4))
         newKeyInput = ""
         // Refresh masked display (hasKey / last-4 / environment).
         if let snapshot = try? await convex.settingsGet() {

@@ -88,16 +88,17 @@ sequenceDiagram
     A->>P: GET /v0/projects (paginated)
     alt prod accepts (200)
         A->>DB: store key + "prod", seed projectsCache
+        A-->>CS: { ok: true, environment: "prod" }
     else prod rejects (401 auth)
         A->>S: GET /v0/projects (paginated)
         alt staging accepts
             A->>DB: store key + "staging", seed projectsCache
+            A-->>CS: { ok: true, environment: "staging" }
         else both auth → invalid / any network → unreachable
             A-->>CS: { ok: false, error }
             Note over DB: nothing stored
         end
     end
-    A-->>CS: { ok: true, environment }
     UI->>UI: staging → "Connected to Conductor staging."
 ```
 

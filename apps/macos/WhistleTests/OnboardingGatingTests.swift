@@ -36,6 +36,7 @@ private final class FakeOnboardingConvexService: ConvexServiceProtocol, @uncheck
         defaultProjectId: nil, agent: "claude", model: nil,
         screenshotsEnabled: true, hasKey: false, lastFour: nil
     )
+    var settingsGetError: Error?
     static let defaultTemplateBody =
         "Default body.\n## How to end\n3. **\"Clarifying questions:\"** followed by a numbered list."
     var templateBody = FakeOnboardingConvexService.defaultTemplateBody
@@ -70,6 +71,7 @@ private final class FakeOnboardingConvexService: ConvexServiceProtocol, @uncheck
 
     func settingsGet() async throws -> SettingsSnapshot {
         lock.lock(); defer { lock.unlock() }
+        if let settingsGetError { throw settingsGetError }
         return settingsSnapshot
     }
 
@@ -530,6 +532,24 @@ final class OnboardingGatingTests: XCTestCase {
         XCTAssertNil(viewModel.connectedEnvironment)
     }
 
+    func testResumedKeyStepUsesStoredStagingEnvironmentForDashboardLink() async throws {
+        let convex = FakeOnboardingConvexService()
+        convex.settingsSnapshot = SettingsSnapshot(
+            defaultProjectId: nil, agent: "claude", model: nil,
+            screenshotsEnabled: true, hasKey: true, lastFour: "ging", environment: .staging
+        )
+        let stateStore = InMemoryOnboardingStateStore(
+            initial: OnboardingState(step: .apiKey)
+        )
+        let (viewModel, _, _, _) = OnboardingTestSupport.makeViewModel(
+            convex: convex, stateStore: stateStore
+        )
+
+        await viewModel.loadStoredKeyEnvironment()
+
+        XCTAssertEqual(viewModel.connectedEnvironment, .staging)
+    }
+
     // MARK: Happy: exactly one project -> step skipped, auto-selected
 
     func testSingleProjectAutoSelectsWithNoPickerStepAndPatchesDefaultProject() async throws {
@@ -783,6 +803,18 @@ final class SettingsViewModelTests: XCTestCase {
         XCTAssertEqual(convex.setAndValidateKeyCalls, ["ck_new_key_7890"])
         XCTAssertEqual(viewModel.keyReplaceSucceeded, true)
         XCTAssertTrue(viewModel.newKeyInput.isEmpty, "input clears after a successful replace")
+        XCTAssertEqual(viewModel.maskedKeyDisplay, "••••••••••••7890")
+    }
+
+    func testSuccessfulReplaceKeepsMaskWhenRefreshFails() async throws {
+        let (viewModel, convex, _) = makeViewModel()
+        await viewModel.load()
+        convex.settingsGetError = StubError()
+        viewModel.newKeyInput = "ck_new_key_7890"
+
+        await viewModel.replaceKey()
+
+        XCTAssertEqual(viewModel.keyReplaceSucceeded, true)
         XCTAssertEqual(viewModel.maskedKeyDisplay, "••••••••••••7890")
     }
 
