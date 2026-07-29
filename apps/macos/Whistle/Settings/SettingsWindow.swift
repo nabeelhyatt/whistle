@@ -466,6 +466,7 @@ struct SettingsView: View {
 @MainActor
 public final class SettingsWindowController: NSObject, NSWindowDelegate {
     private var window: NSWindow?
+    var isWindowVisible: Bool { window?.isVisible == true }
     public let viewModel: SettingsViewModel
 
     /// Backing state for the selected tab, bridged into SwiftUI via an
