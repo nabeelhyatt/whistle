@@ -2,8 +2,8 @@
 
 Status as of U11 (2026-07-08): the GitHub repo (`nabeelhyatt/whistle`) has
 **zero Actions secrets**. All three workflows in `.github/workflows/` are
-authored so every credentialed step is env-gated — they run and succeed
-today, skipping (with a logged reason) anything that needs a secret.
+authored so local packaging can run without credentials, but a tagged GitHub
+release fails before building unless every distribution secret is present.
 Provision the secrets below to unlock full signed/notarized releases
 (`release.yml`) and automatic backend deploys (`backend-deploy.yml`).
 

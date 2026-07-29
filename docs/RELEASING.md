@@ -20,7 +20,7 @@ The trick that removes all hand-editing: `/releases/latest/download/<asset>` is 
 URL that always resolves to the newest release's copy. So `SU_FEED_URL` in
 `apps/macos/Config/Sparkle.xcconfig` is
 
-```
+```text
 https://github.com/nabeelhyatt/whistle/releases/latest/download/appcast.xml
 ```
 
@@ -68,11 +68,11 @@ item is in fact invalid XML: duplicate `length` attribute, since fixed).
    This builds → Developer-ID signs → notarizes → staples → signs the appcast item → assembles
    `appcast.xml` → publishes the Release. Existing installs are offered the update as soon as
    the assets finish uploading; no other step is required.
-3. **VERIFY THE BUILD IS ACTUALLY SIGNED (do not skip).** A green run does NOT guarantee a
-   distributable DMG — the signing/notarization steps are env-gated and **skip silently** (run
-   still "succeeds") if a secret is missing or empty. Confirm:
+3. **VERIFY THE BUILD IS ACTUALLY SIGNED (do not skip).** Missing distribution secrets now
+   fail the workflow before the build, but a successful credential import is still not proof
+   that Apple accepted the artifact. Confirm:
    ```sh
-   # The cert-import step must have RUN, not skipped:
+   # The cert-import step must have succeeded:
    gh run view <run-id> --json jobs \
      --jq '.jobs[].steps[] | select(.name|test("Import Developer ID")) | .conclusion'   # want: success
 
@@ -82,9 +82,9 @@ item is in fact invalid XML: duplicate `length` attribute, since fixed).
    spctl -a -vv /tmp/wv/mnt/Whistle.app     # want: accepted, source=Notarized Developer ID
    hdiutil detach /tmp/wv/mnt
    ```
-   If it shows `adhoc` / `rejected`, signing was skipped — check `gh secret list` shows all
-   6 secrets with real values, delete the release (`gh release delete vX.Y.Z --cleanup-tag=false`),
-   fix the secret, and re-run (`gh run rerun <run-id>`).
+   If it shows `adhoc` / `rejected`, inspect the signing and notarization logs, delete the
+   release (`gh release delete vX.Y.Z --cleanup-tag=false`), fix the failure, and re-run
+   (`gh run rerun <run-id>`).
 4. **Sanity-check the feed** (optional but cheap):
    ```sh
    curl -sL https://github.com/nabeelhyatt/whistle/releases/latest/download/appcast.xml \
@@ -94,12 +94,14 @@ item is in fact invalid XML: duplicate `length` attribute, since fixed).
 ### Rolling back a bad release
 
 `gh release delete vX.Y.Z` — because the feed is resolved through `latest`, deleting the
-release rolls the update feed back to the previous release atomically. Nothing else to undo.
+release rolls the update feed back to the previous release atomically. Before the first
+GitHub-hosted-feed release is published, the workflow also adds a complete feed asset to the
+previous release, so this rollback path remains valid across the migration.
 
 ## Gotchas (learned the hard way)
 
-- **Green ≠ signed.** See step 3. The first v1.0.9 run "succeeded" but shipped an ad-hoc,
-  Gatekeeper-rejected DMG because a secret was empty. Always run the spctl check.
+- **Green ≠ notarized.** See step 3. Missing secrets now fail the release before it can publish,
+  but always run the spctl check to verify the final downloaded DMG.
 - **Empty secrets from a filename typo.** `base64 -i wrong-name.p12 | gh secret set …` pipes
   an *empty* value on failure, and the secret still appears in `gh secret list`. After setting
   cert secrets, sanity-check: `base64 -i <file>.p12 | wc -c` should be thousands of chars.

@@ -325,13 +325,12 @@ view, not a duplicate of the instructions).
   `.p12` + password as `DEVELOPER_ID_P12_BASE64` /
   `DEVELOPER_ID_P12_PASSWORD` GitHub Actions secrets (SECRETS.md §1).
   **Expected outcome:** `gh secret list` shows both; a subsequent
-  `release.yml` run can codesign without the "skipped — no cert" log
-  line.
+  `release.yml` run passes its credential preflight and can codesign.
 - [ ] **Action:** Provision the App Store Connect API key as
   `NOTARY_KEY_ID` / `NOTARY_ISSUER_ID` / `NOTARY_KEY_P8_BASE64`
   (SECRETS.md §2).
   **Expected outcome:** `release.yml` notarizes and staples instead of
-  skipping.
+  failing its credential preflight.
 - [ ] **Action:** Export the existing Sparkle EdDSA private key (already
   generated during U11, lives in the build machine's keychain — **do
   not** run `generate_keys` again) and provision it as
@@ -356,7 +355,7 @@ view, not a duplicate of the instructions).
   `MARKETING_VERSION` in `apps/macos/project.yml`.
   **Expected outcome:** `release.yml` runs end-to-end: builds, signs,
   notarizes, staples, signs the appcast entry, and uploads to a GitHub
-  Release without any "skipped — credential absent" log lines.
+  Release passes the distribution-credential preflight before building.
 
 ---
 

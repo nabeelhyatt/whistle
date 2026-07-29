@@ -9,11 +9,9 @@
 # the `appcast.xml` asset created below IS the live update feed the moment the
 # release is published. See docs/RELEASING.md.
 #
-# Signing/notarization steps are ENV-GATED (TECH-SPEC §10) and skip with a
-# logged reason when their secret is absent, producing a non-distributable
-# ad-hoc DMG while the run still "succeeds" — always verify with spctl per
-# RELEASING.md. The Sparkle key is the ONE exception: it is a hard failure,
-# because a release with no appcast.xml asset 404s the feed for every install.
+# A release must have signing, notarization, and Sparkle credentials. Publishing
+# a non-distributable DMG or a release without an appcast asset would make the
+# `latest` feed offer a broken update to every existing install.
 #
 # Required secrets for a FULL release (see SECRETS.md for provisioning):
 #   DEVELOPER_ID_P12_BASE64   Developer ID Application cert, base64 .p12
@@ -37,7 +35,9 @@ permissions:
   contents: write # create the GitHub Release + upload assets
 
 concurrency:
-  group: release-${{ github.ref }}
+  # GitHub's `latest` release is the live Sparkle feed. Different tags must
+  # not publish concurrently, or a slower older tag can replace that feed.
+  group: release
   cancel-in-progress: false
 
 jobs:
@@ -51,17 +51,15 @@ jobs:
       HAS_SPARKLE_KEY: ${{ secrets.SPARKLE_ED_PRIVATE_KEY != '' }}
       SPARKLE_VERSION: 2.9.4 # keep in lockstep with project.yml's pin
     steps:
-      # Unlike the signing/notary secrets, a missing Sparkle key is fatal, not a
-      # skip: SU_FEED_URL points at releases/latest/download/appcast.xml, so a
-      # release publishing no appcast.xml 404s the feed for every install.
+      # The published release is the live update feed, so every distribution
+      # credential is mandatory. Checked before the ~10-minute build.
       # Checked before the ~10-minute build so it fails fast.
-      - name: Require Sparkle signing key
-        if: env.HAS_SPARKLE_KEY != 'true'
+      - name: Require distribution credentials
+        if: env.HAS_SIGNING != 'true' || env.HAS_NOTARY != 'true' || env.HAS_SPARKLE_KEY != 'true'
         run: |
-          echo "ERROR: SPARKLE_ED_PRIVATE_KEY is not provisioned (see SECRETS.md)." >&2
-          echo "It is required: this release would publish no appcast.xml, and the" >&2
-          echo "feed URL baked into every install resolves to the latest release's" >&2
-          echo "asset — so a release without it breaks updates for everyone." >&2
+          echo "ERROR: release credentials are incomplete (see SECRETS.md)." >&2
+          echo "A published release must be Developer-ID signed, notarized, and" >&2
+          echo "Sparkle-signed; otherwise the live feed can offer a broken update." >&2
           exit 1
 
       - uses: actions/checkout@v4
@@ -69,7 +67,7 @@ jobs:
       - name: Install xcodegen
         run: brew install xcodegen
 
-      # ---- Codesigning cert (env-gated) ----------------------------------
+      # ---- Codesigning certificate ----------------------------------------
       - name: Import Developer ID certificate
         if: env.HAS_SIGNING == 'true'
         env:
@@ -91,11 +89,7 @@ jobs:
           security list-keychains -d user -s "$KEYCHAIN_PATH" login.keychain-db
           rm -f "$RUNNER_TEMP/developer_id.p12"
 
-      - name: Skip cert import (no signing secrets)
-        if: env.HAS_SIGNING != 'true'
-        run: echo "SKIP Developer ID cert import — DEVELOPER_ID_P12_BASE64 / DEVELOPER_ID_P12_PASSWORD not provisioned (see SECRETS.md). Build will be ad-hoc signed."
-
-      # ---- Notary key (env-gated) -----------------------------------------
+      # ---- Notary key ------------------------------------------------------
       - name: Materialize notary API key
         if: env.HAS_NOTARY == 'true'
         env:
@@ -109,14 +103,9 @@ jobs:
             echo "NOTARY_ISSUER_ID=${{ secrets.NOTARY_ISSUER_ID }}"
           } >> "$GITHUB_ENV"
 
-      - name: Skip notary setup (no notary secrets)
-        if: env.HAS_NOTARY != 'true'
-        run: echo "SKIP notarization setup — NOTARY_KEY_ID / NOTARY_ISSUER_ID / NOTARY_KEY_P8_BASE64 not provisioned (see SECRETS.md)."
-
       # ---- Build / sign / DMG / notarize ----------------------------------
-      # package-dmg.sh env-gates internally: it falls back to ad-hoc signing
-      # when no Developer ID identity is in the keychain and skips
-      # notarization when NOTARY_* are unset.
+      # package-dmg.sh verifies the imported Developer ID identity and submits
+      # the DMG using the notarization credentials prepared above.
       - name: Package DMG
         run: ./apps/macos/Scripts/package-dmg.sh
 
@@ -191,7 +180,9 @@ jobs:
           PRIOR_TAG="$(gh release list --limit 1 --exclude-drafts --exclude-pre-releases \
             --json tagName -q '.[0].tagName // empty')"
           if [[ -n "$PRIOR_TAG" ]]; then
-            # grep, not an XML parser — some historical items are malformed.
+            # The release before this migration has an item but no complete
+            # feed. Build and upload one before publishing, so deleting this
+            # release really rolls `latest` back to a working appcast.
             gh release download "$PRIOR_TAG" --pattern appcast-item.xml \
               --output "$RUNNER_TEMP/prior-item.xml"
             PRIOR="$(grep -o '<sparkle:version>[^<]*' "$RUNNER_TEMP/prior-item.xml" | sed 's/.*>//')"
@@ -205,7 +196,10 @@ jobs:
           else
             echo "No prior release to compare against (first release)."
           fi
-          {
+          write_feed() {
+            local item="$1"
+            local output="$2"
+            {
             printf '%s\n' '<?xml version="1.0" encoding="utf-8"?>' \
               '<rss version="2.0" xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle">' \
               '  <channel>' \
@@ -213,10 +207,17 @@ jobs:
               "    <link>https://github.com/${GITHUB_REPOSITORY}/releases/latest/download/appcast.xml</link>" \
               '    <description>Sparkle update feed for the Whistle macOS app.</description>' \
               '    <language>en</language>'
-            sed 's/^/    /' apps/macos/dist/appcast-item.xml
+              sed 's/^/    /' "$item"
             printf '%s\n' '  </channel>' '</rss>'
-          } > apps/macos/dist/appcast.xml
+            } > "$output"
+          }
+          write_feed apps/macos/dist/appcast-item.xml apps/macos/dist/appcast.xml
           xmllint --noout apps/macos/dist/appcast.xml
+          if [[ -n "$PRIOR_TAG" ]]; then
+            write_feed "$RUNNER_TEMP/prior-item.xml" "$RUNNER_TEMP/appcast.xml"
+            xmllint --noout "$RUNNER_TEMP/appcast.xml"
+            gh release upload "$PRIOR_TAG" "$RUNNER_TEMP/appcast.xml" --clobber
+          fi
           echo "--- apps/macos/dist/appcast.xml ---"
           cat apps/macos/dist/appcast.xml
 
@@ -233,10 +234,15 @@ jobs:
           # the EdDSA signature binds to exact bytes, and this alias's contents
           # change every release.
           cp "$DMG" apps/macos/dist/Whistle.dmg
-          gh release create "$GITHUB_REF_NAME" \
+          # A draft is invisible to `/releases/latest`. If an upload fails,
+          # delete it so a rerun can safely publish the complete asset set.
+          trap 'gh release delete "$GITHUB_REF_NAME" --yes 2>/dev/null || true' ERR
+          gh release create "$GITHUB_REF_NAME" --draft \
             --title "Whistle $GITHUB_REF_NAME" \
             --generate-notes \
             "$DMG" \
             apps/macos/dist/Whistle.dmg \
             apps/macos/dist/appcast.xml \
             apps/macos/dist/appcast-item.xml
+          gh release edit "$GITHUB_REF_NAME" --draft=false
+          trap - ERR
