@@ -1,14 +1,19 @@
 # release.yml — tag-triggered signed release (U11, TECH-SPEC §10).
 #
-# Builds the Whistle app, signs, notarizes, packages a DMG, generates a
-# Sparkle appcast entry, and uploads everything to a GitHub Release.
+# Builds the Whistle app, signs, notarizes, packages a DMG, and publishes it
+# to a GitHub Release together with the Sparkle appcast feed itself.
 #
-# EVERY credentialed step is ENV-GATED (TECH-SPEC §10): it checks its
-# secret first and skips with a logged reason when absent. The repo
-# currently has ZERO Actions secrets, so an un-provisioned run produces an
-# ad-hoc-signed, un-notarized DMG (not distributable) and an unsigned
-# appcast item — the workflow itself still succeeds. Provision the secrets
-# in SECRETS.md to get a full signed/notarized/published release.
+# THIS WORKFLOW IS THE ONLY PUBLISHING SURFACE — nothing is hand-edited on
+# any other host. SU_FEED_URL (apps/macos/Config/Sparkle.xcconfig) points at
+# https://github.com/<owner>/<repo>/releases/latest/download/appcast.xml, so
+# the `appcast.xml` asset created below IS the live update feed the moment the
+# release is published. See docs/RELEASING.md.
+#
+# Signing/notarization steps are ENV-GATED (TECH-SPEC §10) and skip with a
+# logged reason when their secret is absent, producing a non-distributable
+# ad-hoc DMG while the run still "succeeds" — always verify with spctl per
+# RELEASING.md. The Sparkle key is the ONE exception: it is a hard failure,
+# because a release with no appcast.xml asset 404s the feed for every install.
 #
 # Required secrets for a FULL release (see SECRETS.md for provisioning):
 #   DEVELOPER_ID_P12_BASE64   Developer ID Application cert, base64 .p12
@@ -46,6 +51,19 @@ jobs:
       HAS_SPARKLE_KEY: ${{ secrets.SPARKLE_ED_PRIVATE_KEY != '' }}
       SPARKLE_VERSION: 2.9.4 # keep in lockstep with project.yml's pin
     steps:
+      # Unlike the signing/notary secrets, a missing Sparkle key is fatal, not a
+      # skip: SU_FEED_URL points at releases/latest/download/appcast.xml, so a
+      # release publishing no appcast.xml 404s the feed for every install.
+      # Checked before the ~10-minute build so it fails fast.
+      - name: Require Sparkle signing key
+        if: env.HAS_SPARKLE_KEY != 'true'
+        run: |
+          echo "ERROR: SPARKLE_ED_PRIVATE_KEY is not provisioned (see SECRETS.md)." >&2
+          echo "It is required: this release would publish no appcast.xml, and the" >&2
+          echo "feed URL baked into every install resolves to the latest release's" >&2
+          echo "asset — so a release without it breaks updates for everyone." >&2
+          exit 1
+
       - uses: actions/checkout@v4
 
       - name: Install xcodegen
@@ -116,9 +134,8 @@ jobs:
           echo "dmg=$DMG" >> "$GITHUB_OUTPUT"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
-      # ---- Sparkle appcast entry (env-gated) -------------------------------
+      # ---- Sparkle appcast (REQUIRED — the feed IS a release asset) --------
       - name: Sign update & generate appcast item
-        if: env.HAS_SPARKLE_KEY == 'true'
         env:
           SPARKLE_ED_PRIVATE_KEY: ${{ secrets.SPARKLE_ED_PRIVATE_KEY }}
           DMG: ${{ steps.artifact.outputs.dmg }}
@@ -150,12 +167,58 @@ jobs:
               type="application/octet-stream" />
           </item>
           ITEM
-          echo "Appcast item written to apps/macos/dist/appcast-item.xml —"
-          echo "merge it into apps/web/public/appcast.xml and deploy the web app to publish the update."
+          echo "Appcast item written to apps/macos/dist/appcast-item.xml"
 
-      - name: Skip appcast signing (no Sparkle key)
-        if: env.HAS_SPARKLE_KEY != 'true'
-        run: echo "SKIP Sparkle appcast entry — SPARKLE_ED_PRIVATE_KEY not provisioned (see SECRETS.md). Update cannot be offered to existing installs without it."
+      # Wraps the signed item in a complete feed published as the `appcast.xml`
+      # release asset, which is what SU_FEED_URL
+      # (…/releases/latest/download/appcast.xml) resolves to. The feed carries
+      # only the CURRENT release: Sparkle offers the newest applicable item, all
+      # releases share minimumSystemVersion 14.0, and no item carries release
+      # notes, so historical items would change nothing. Each release keeps its
+      # own appcast-item.xml asset, so history stays reconstructible.
+      # (Concatenating history was tried and rejected: v1.0.9's published item
+      # has a duplicate `length` attribute — see the note above — so it is
+      # invalid XML, and one bad historical asset would break every future
+      # release's feed.)
+      - name: Assemble appcast feed
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # sparkle:version must strictly increase or Sparkle never offers the
+          # update. Compare against the release that `latest` points at today.
+          BUILD_NUMBER="$(grep -o '<sparkle:version>[^<]*' apps/macos/dist/appcast-item.xml | sed 's/.*>//')"
+          PRIOR_TAG="$(gh release list --limit 1 --exclude-drafts --exclude-pre-releases \
+            --json tagName -q '.[0].tagName // empty')"
+          if [[ -n "$PRIOR_TAG" ]]; then
+            # grep, not an XML parser — some historical items are malformed.
+            gh release download "$PRIOR_TAG" --pattern appcast-item.xml \
+              --output "$RUNNER_TEMP/prior-item.xml"
+            PRIOR="$(grep -o '<sparkle:version>[^<]*' "$RUNNER_TEMP/prior-item.xml" | sed 's/.*>//')"
+            if [[ "$BUILD_NUMBER" == "$PRIOR" || \
+                  "$(printf '%s\n%s\n' "$PRIOR" "$BUILD_NUMBER" | sort -V | tail -1)" != "$BUILD_NUMBER" ]]; then
+              echo "ERROR: sparkle:version $BUILD_NUMBER does not exceed $PRIOR_TAG's $PRIOR —" >&2
+              echo "Sparkle would never offer this update. Bump MARKETING_VERSION." >&2
+              exit 1
+            fi
+            echo "sparkle:version $BUILD_NUMBER > $PRIOR_TAG's $PRIOR"
+          else
+            echo "No prior release to compare against (first release)."
+          fi
+          {
+            printf '%s\n' '<?xml version="1.0" encoding="utf-8"?>' \
+              '<rss version="2.0" xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle">' \
+              '  <channel>' \
+              '    <title>Whistle</title>' \
+              "    <link>https://github.com/${GITHUB_REPOSITORY}/releases/latest/download/appcast.xml</link>" \
+              '    <description>Sparkle update feed for the Whistle macOS app.</description>' \
+              '    <language>en</language>'
+            sed 's/^/    /' apps/macos/dist/appcast-item.xml
+            printf '%s\n' '  </channel>' '</rss>'
+          } > apps/macos/dist/appcast.xml
+          xmllint --noout apps/macos/dist/appcast.xml
+          echo "--- apps/macos/dist/appcast.xml ---"
+          cat apps/macos/dist/appcast.xml
 
       # ---- Publish -----------------------------------------------------------
       - name: Create GitHub Release
@@ -164,9 +227,16 @@ jobs:
           DMG: ${{ steps.artifact.outputs.dmg }}
         run: |
           set -euo pipefail
-          ASSETS=("$DMG")
-          [[ -f apps/macos/dist/appcast-item.xml ]] && ASSETS+=(apps/macos/dist/appcast-item.xml)
+          # Whistle.dmg is an unversioned COPY so the download page can link to a
+          # permanent …/releases/latest/download/Whistle.dmg and never be edited
+          # again. The appcast <enclosure> keeps pointing at the VERSIONED asset —
+          # the EdDSA signature binds to exact bytes, and this alias's contents
+          # change every release.
+          cp "$DMG" apps/macos/dist/Whistle.dmg
           gh release create "$GITHUB_REF_NAME" \
             --title "Whistle $GITHUB_REF_NAME" \
             --generate-notes \
-            "${ASSETS[@]}"
+            "$DMG" \
+            apps/macos/dist/Whistle.dmg \
+            apps/macos/dist/appcast.xml \
+            apps/macos/dist/appcast-item.xml

@@ -1,42 +1,61 @@
 # Releasing Whistle
 
-How to cut a public release and keep every moving part in sync. Read this before
-tagging a version. First-time CI provisioning is in [`SECRETS.md`](../SECRETS.md).
+How to cut a public release. Since v1.0.15 the whole release lives in **this repo** —
+pushing a tag is the entire process. Read this before tagging. First-time CI provisioning
+is in [`SECRETS.md`](../SECRETS.md).
 
-## The pieces that must stay in sync
+## How it works
 
-A release spans **three** places. Getting them out of sync is the main failure mode:
+`.github/workflows/release.yml` fires on a `v*` tag and publishes a GitHub Release with
+four assets:
 
-1. **This repo** — `MARKETING_VERSION` in `apps/macos/project.yml` and the git tag `vX.Y.Z`.
-2. **GitHub Releases** (`github.com/nabeelhyatt/whistle/releases`) — the signed DMG +
-   `appcast-item.xml`, produced automatically by `.github/workflows/release.yml`.
-3. **`nabeelhyatt.com/experiments/whistle`** — a separately-hosted page (NOT in this repo):
-   `index.html` (download button) + `appcast.xml` (Sparkle update feed). These are edited
-   by hand on that host every release.
+| Asset | Purpose |
+| --- | --- |
+| `Whistle-X.Y.Z.dmg` | the signed, notarized build; what the appcast `<enclosure>` points at |
+| `Whistle.dmg` | byte-identical unversioned copy, so a download page can link to a permanent URL |
+| `appcast.xml` | **the live Sparkle update feed** |
+| `appcast-item.xml` | just this release's signed `<item>`, kept so feed history is reconstructible |
 
-### Invariants (if any of these drift, updates or downloads break)
+The trick that removes all hand-editing: `/releases/latest/download/<asset>` is a permanent
+URL that always resolves to the newest release's copy. So `SU_FEED_URL` in
+`apps/macos/Config/Sparkle.xcconfig` is
 
-- **Tag == version.** The git tag `vX.Y.Z` must exactly equal `MARKETING_VERSION`
-  (`release.yml` asserts this and fails otherwise).
-- **`sparkle:version` must increase every release.** Sparkle decides "is this an update?"
-  by comparing the appcast item's `sparkle:version` (= the built app's `CFBundleVersion`,
-  which release.yml reads via PlistBuddy) against the installed app's `CFBundleVersion` —
-  `sparkle:shortVersionString` is display-only. `CURRENT_PROJECT_VERSION` in
-  `apps/macos/project.yml` is set to `$(MARKETING_VERSION)` so this happens automatically
-  with the normal version bump; don't pin it back to a constant (it was `"1"` through
-  v1.0.12, which made every published update compare equal to every install and never be
-  offered).
-- **Feed URL == hosting location.** `SU_FEED_URL` in `apps/macos/Config/Sparkle.xcconfig`
-  is compiled into the app at build time and currently points at
-  `https://nabeelhyatt.com/experiments/whistle/appcast.xml`. If the feed ever moves, you
-  must change `SU_FEED_URL` **and ship a new build** — old installs keep checking the old URL.
-- **Page download link == latest DMG.** The button in the hosted `index.html` points at a
-  version-specific asset (`Whistle-X.Y.Z.dmg`); bump it every release.
-- **Repo stays public.** The `<enclosure>` URLs and the download button point at public
-  GitHub Release assets. If the repo goes private, both break.
-- **The repo's `apps/web/public/appcast.xml` is a TEMPLATE, not the live feed.** No workflow
-  deploys `apps/web`. Editing that file publishes nothing — the authoritative feed is the
-  hand-maintained copy on nabeelhyatt.com. Keep the repo copy as a reference shell.
+```
+https://github.com/nabeelhyatt/whistle/releases/latest/download/appcast.xml
+```
+
+and publishing a release *is* publishing the update. Likewise the download button on
+`nabeelhyatt.com/experiments/whistle` points at
+`https://github.com/nabeelhyatt/whistle/releases/latest/download/Whistle.dmg` and never needs
+touching again.
+
+The feed carries **only the current release's item**. Sparkle only ever offers the newest
+applicable item, every release shares `minimumSystemVersion` 14.0, and the items carry no
+release notes — so historical items would change nothing, while depending on every past
+release's asset staying well-formed forever would be a standing hazard (v1.0.9's published
+item is in fact invalid XML: duplicate `length` attribute, since fixed).
+
+### Invariants
+
+- **Tag == version.** `vX.Y.Z` must exactly equal `MARKETING_VERSION` in
+  `apps/macos/project.yml` (`release.yml` asserts this and fails otherwise).
+- **`sparkle:version` must increase every release.** Sparkle decides "is this an update?" by
+  comparing the appcast item's `sparkle:version` (= the built app's `CFBundleVersion`) against
+  the installed app's — `sparkle:shortVersionString` is display-only.
+  `CURRENT_PROJECT_VERSION` is set to `$(MARKETING_VERSION)` so a normal version bump handles
+  it; don't pin it back to a constant (it was `"1"` through v1.0.12, which made every published
+  update compare equal to every install and never be offered). `release.yml` now asserts the
+  new item's `sparkle:version` strictly exceeds the previous release's.
+- **Every release must publish `appcast.xml`.** It's the feed. A release without it 404s
+  updates for every install — which is why a missing `SPARKLE_ED_PRIVATE_KEY` is a hard
+  failure, not a skip.
+- **`<enclosure>` URLs stay versioned.** The EdDSA signature binds to exact bytes;
+  `latest/download/Whistle.dmg` changes content every release and must never be an enclosure.
+- **Repo stays public.** The feed, the enclosures, and the download button are all public
+  Release assets. Making the repo private breaks auto-update for every install.
+- **Feed URL is compile-time.** Moving the feed means editing `SU_FEED_URL`, re-running
+  `xcodegen generate`, **and** shipping a new build — existing installs keep checking whatever
+  URL was baked into them.
 
 ## Cutting a release
 
@@ -46,12 +65,12 @@ A release spans **three** places. Getting them out of sync is the main failure m
    ```sh
    git tag vX.Y.Z && git push origin vX.Y.Z    # vX.Y.Z must match MARKETING_VERSION
    ```
-   This triggers `release.yml`, which builds → Developer-ID signs → notarizes → staples →
-   signs the appcast item → publishes a GitHub Release with `Whistle-X.Y.Z.dmg` and
-   `appcast-item.xml`.
+   This builds → Developer-ID signs → notarizes → staples → signs the appcast item → assembles
+   `appcast.xml` → publishes the Release. Existing installs are offered the update as soon as
+   the assets finish uploading; no other step is required.
 3. **VERIFY THE BUILD IS ACTUALLY SIGNED (do not skip).** A green run does NOT guarantee a
-   distributable DMG — the signing/notarization steps are env-gated and **skip silently**
-   (run still "succeeds") if a secret is missing or empty. Confirm:
+   distributable DMG — the signing/notarization steps are env-gated and **skip silently** (run
+   still "succeeds") if a secret is missing or empty. Confirm:
    ```sh
    # The cert-import step must have RUN, not skipped:
    gh run view <run-id> --json jobs \
@@ -66,26 +85,18 @@ A release spans **three** places. Getting them out of sync is the main failure m
    If it shows `adhoc` / `rejected`, signing was skipped — check `gh secret list` shows all
    6 secrets with real values, delete the release (`gh release delete vX.Y.Z --cleanup-tag=false`),
    fix the secret, and re-run (`gh run rerun <run-id>`).
-4. **Update the nabeelhyatt.com page** (on that host, by hand):
-   - **`index.html`**: point the download button at the new
-     `https://github.com/nabeelhyatt/whistle/releases/download/vX.Y.Z/Whistle-X.Y.Z.dmg`.
-   - **`appcast.xml`**: append the new `<item>` from the release's `appcast-item.xml`
-     (`gh release download vX.Y.Z --pattern appcast-item.xml --clobber`). **Keep older items**
-     — Sparkle picks the newest applicable. Serve as `Content-Type: application/xml` over HTTPS
-     at the exact feed URL. (The `index.html` link only affects brand-new downloads; existing
-     installs auto-update purely from `appcast.xml`.)
+4. **Sanity-check the feed** (optional but cheap):
+   ```sh
+   curl -sL https://github.com/nabeelhyatt/whistle/releases/latest/download/appcast.xml \
+     | xmllint --format -        # want: one <item> with the version you just tagged
+   ```
 
-   **Since v1.0.14, `appcast.xml` is the safety net for a stale `index.html` too.** On its
-   very first launch (from `/Applications`, not the mounted DMG) the app silently probes the
-   feed and, if something newer is there, shows the update prompt *before* the onboarding
-   wizard — so a new user who downloaded last release's DMG is offered the current one within
-   seconds instead of a day later. See `apps/macos/Whistle/Updates/UpdateCoordinator.swift`.
-   Two consequences for this step: a forgotten `index.html` bump is now self-correcting, but a
-   stale `appcast.xml` prevents the app from discovering the newer build. A broken, offline, or
-   slow probe does not retire the check: it stays eligible to retry on later launches, up to the
-   three-attempt backstop.
+### Rolling back a bad release
 
-## Gotchas (learned the hard way, v1.0.9)
+`gh release delete vX.Y.Z` — because the feed is resolved through `latest`, deleting the
+release rolls the update feed back to the previous release atomically. Nothing else to undo.
+
+## Gotchas (learned the hard way)
 
 - **Green ≠ signed.** See step 3. The first v1.0.9 run "succeeded" but shipped an ad-hoc,
   Gatekeeper-rejected DMG because a secret was empty. Always run the spctl check.
@@ -94,4 +105,11 @@ A release spans **three** places. Getting them out of sync is the main failure m
   cert secrets, sanity-check: `base64 -i <file>.p12 | wc -c` should be thousands of chars.
 - **Fresh secrets + immediate tag.** Setting a secret and tagging within ~2 minutes can race
   propagation. Set secrets, confirm `gh secret list`, then tag.
+- **Brief 404 window.** For the few seconds while `gh release create` uploads assets, the feed
+  URL 404s. Harmless: Sparkle treats it as a failed check and retries on schedule, and the
+  first-launch probe in `UpdateCoordinator.swift` does not retire a check on fetch failure.
 - **App is arm64-only, macOS 14+.** State this on the download page — Intel Macs can't run it.
+- **Pre-v1.0.15 installs are stranded.** Builds up to v1.0.14 baked in the old
+  `nabeelhyatt.com/experiments/whistle/appcast.xml` feed URL, which is no longer maintained.
+  There were no real users at cutover, so this was accepted rather than migrated; any such
+  install must be replaced by re-downloading.

@@ -295,9 +295,10 @@ the box when you've personally observed the expected outcome.
   not "can't be opened because Apple cannot check it for malicious
   software"). No security warning requiring manual override.
 - [ ] **Action:** Ship a build at version N, then a build at version
-  N+1 with a real signed appcast entry (`apps/web/public/appcast.xml`),
-  and let the running vN app check for updates (Sparkle "Check for
-  Updates" from the right-click menu, or automatic background check).
+  N+1 (each tagged release publishes its own signed `appcast.xml` asset,
+  which is the live feed — see `docs/RELEASING.md`), and let the running
+  vN app check for updates (Sparkle "Check for Updates" from the
+  right-click menu, or automatic background check).
   **Expected outcome:** vN discovers vN+1, downloads, verifies the
   Sparkle EdDSA signature, installs, and relaunches as vN+1 — a real
   update round-trip, not just a dry-run against the appcast XML.

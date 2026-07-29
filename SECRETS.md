@@ -63,8 +63,10 @@ gh secret set SPARKLE_ED_PRIVATE_KEY < sparkle_ed_key
 rm sparkle_ed_key                          # don't leave the key on disk
 ```
 
-Without this secret, `release.yml` still publishes a DMG but cannot sign
-an appcast entry — existing installs won't be offered the update.
+This secret is REQUIRED: `release.yml` fails without it, because the
+signed `appcast.xml` it produces *is* the live update feed (served from
+`/releases/latest/download/appcast.xml`). A release missing that asset
+would 404 the feed for every install. See `docs/RELEASING.md`.
 
 ## 4. Convex deploy key (backend-deploy.yml)
 
@@ -160,7 +162,7 @@ gh secret list
 
 Then push a `v*` tag whose version matches `MARKETING_VERSION` in
 `apps/macos/project.yml`; `release.yml` builds, signs, notarizes,
-staples, signs the appcast entry, and uploads everything to a GitHub
-Release. Merge the generated `appcast-item.xml` into
-`apps/web/public/appcast.xml` and deploy the web app to offer the update
-to existing installs.
+staples, signs the appcast entry, assembles `appcast.xml`, and uploads
+everything to a GitHub Release. That's the whole release — the published
+`appcast.xml` asset is the live Sparkle feed, so existing installs are
+offered the update with no further steps.
