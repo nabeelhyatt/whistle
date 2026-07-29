@@ -60,15 +60,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var onboardingWindowController: OnboardingWindowController?
     private var cancellables: Set<AnyCancellable> = []
 
-    /// Sparkle 2 auto-updater (U11, TECH-SPEC §10). The standard updater
-    /// controller drives scheduled background checks (SUScheduledCheckInterval
-    /// in Info.plist) and the user-initiated "Check for Updates…" menu item.
-    /// Feed URL + EdDSA public key come from Info.plist (SUFeedURL /
-    /// SUPublicEDKey, injected via Config/Sparkle.xcconfig). `startingUpdater:
-    /// true` is safe even though the feed URL is a placeholder domain — a
-    /// failed feed fetch is a silent no-op for scheduled checks and a normal
-    /// error sheet for manual ones.
-    private var updaterController: SPUStandardUpdaterController?
+    /// Sparkle 2 auto-updater (U11, TECH-SPEC §10), wrapped by
+    /// `UpdateCoordinator`: scheduled background checks
+    /// (SUScheduledCheckInterval / SUEnableAutomaticChecks in Info.plist), the
+    /// user-initiated "Check for Updates…" menu item, and the one-time
+    /// first-launch check that keeps a new user who downloaded a stale DMG from
+    /// running it for a day. Feed URL + EdDSA public key come from Info.plist
+    /// (SUFeedURL / SUPublicEDKey, injected via Config/Sparkle.xcconfig).
+    private var updateCoordinator: UpdateCoordinator?
 
     /// Convex deployment URL — read from Info.plist (`CONVEX_URL`, injected
     /// via xcconfig, see project.yml), never hardcoded. Falls back to the
@@ -112,19 +111,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         )
         self.authController = auth
 
-        let updaterController = SPUStandardUpdaterController(
-            startingUpdater: true,
-            updaterDelegate: nil,
-            userDriverDelegate: nil
-        )
-        self.updaterController = updaterController
+        // Started here, before the capture panel exists, so the first-launch
+        // feed probe overlaps `auth.resolveInitialState()` below rather than
+        // adding its own latency. `isIdle` is a closure for the same reason:
+        // installing an update relaunches the app, and `capturePanelController`
+        // (whose open panel holds unsubmitted text) is built further down.
+        let updateCoordinator = UpdateCoordinator()
+        updateCoordinator.isIdle = { [weak self] in
+            guard let self else { return false }
+            return capturePanelController?.isPanelOpen != true
+                && capturePanelController?.hasPreservedDraft != true
+                && onboardingWindowController?.isWindowVisible != true
+                && settingsWindowController?.isWindowVisible != true
+                && historyWindowController?.isWindowVisible != true
+        }
+        self.updateCoordinator = updateCoordinator
+        updateCoordinator.start()
 
         let statusItem = StatusItemController(authController: auth)
         statusItem.onSettingsRequested = { [weak self] in self?.showSettings() }
         // Real Sparkle updater (U11) — replaces the U6 placeholder that only
         // logged the request.
-        statusItem.onCheckForUpdatesRequested = { [weak updaterController] in
-            updaterController?.checkForUpdates(nil)
+        statusItem.onCheckForUpdatesRequested = { [weak updateCoordinator] in
+            updateCoordinator?.checkForUpdates()
         }
         self.statusItemController = statusItem
 
@@ -328,6 +337,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         Task {
             await auth.resolveInitialState()
+            // Hold the wizard until the first-launch update check settles: a new
+            // user who installed a stale DMG should be offered the current
+            // version BEFORE they spend minutes on onboarding (and before we
+            // pop a modal over a wizard they've already started). No-ops on
+            // every launch after the check has retired.
+            await updateCoordinator.waitUntilFirstLaunchCheckSettles()
             self.showOnboardingIfNeeded()
         }
     }

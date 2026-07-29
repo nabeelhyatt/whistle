@@ -1,7 +1,8 @@
 import { convexTest } from "convex-test";
 import { describe, expect, test } from "vitest";
-import { api } from "../_generated/api";
+import { api, internal } from "../_generated/api";
 import schema from "../schema";
+import { credsFromSettings } from "../settings";
 
 const modules = import.meta.glob("../**/*.ts");
 
@@ -23,19 +24,22 @@ describe("settings.get", () => {
     expect(settings.lastFour).toBeUndefined();
   });
 
-  test("never includes the raw key, even right after setConductorKey", async () => {
+  test("never includes the raw key, even right after setConductorKeyInternal", async () => {
     const t = convexTest(schema, modules);
     const asUser = withMockUser(t, "auth0|settings-mask");
-    await asUser.mutation(api.users.ensure, {});
+    const userId = await asUser.mutation(api.users.ensure, {});
 
-    await asUser.mutation(api.settings.setConductorKey, {
+    await t.mutation(internal.settings.setConductorKeyInternal, {
+      userId,
       conductorApiKey: "sk-super-secret-key-12345678",
+      conductorEnvironment: "prod",
     });
 
     const settings = await asUser.query(api.settings.get, {});
 
     expect(settings.hasKey).toBe(true);
     expect(settings.lastFour).toBe("5678");
+    expect(settings.environment).toBe("prod");
     // Assert the masked shape doesn't leak the raw key under any field name.
     const serialized = JSON.stringify(settings);
     expect(serialized).not.toContain("sk-super-secret-key");
@@ -149,9 +153,11 @@ describe("cross-user denial", () => {
     const userA = withMockUser(t, "auth0|cross-user-a");
     const userB = withMockUser(t, "auth0|cross-user-b");
 
-    await userA.mutation(api.users.ensure, {});
-    await userA.mutation(api.settings.setConductorKey, {
+    const userAId = await userA.mutation(api.users.ensure, {});
+    await t.mutation(internal.settings.setConductorKeyInternal, {
+      userId: userAId,
       conductorApiKey: "sk-user-a-secret-0000",
+      conductorEnvironment: "prod",
     });
 
     await userB.mutation(api.users.ensure, {});
@@ -174,5 +180,47 @@ describe("cross-user denial", () => {
 
     const settingsB = await userB.query(api.settings.get, {});
     expect(settingsB.agent).toBe("claude"); // default, unaffected by userA's update
+  });
+});
+
+describe("credsFromSettings (KTD5 — default-to-prod lives in one place)", () => {
+  test("legacy row (key, no conductorEnvironment) defaults to prod creds", () => {
+    const creds = credsFromSettings({ conductorApiKey: "sk-legacy-0000" });
+    expect(creds).toEqual({ apiKey: "sk-legacy-0000", environment: "prod" });
+  });
+
+  test("staging row builds staging creds", () => {
+    const creds = credsFromSettings({
+      conductorApiKey: "sk-staging-0000",
+      conductorEnvironment: "staging",
+    });
+    expect(creds).toEqual({ apiKey: "sk-staging-0000", environment: "staging" });
+  });
+
+  test("no key -> undefined", () => {
+    expect(credsFromSettings({ conductorApiKey: undefined })).toBeUndefined();
+    expect(credsFromSettings(undefined)).toBeUndefined();
+    expect(credsFromSettings(null)).toBeUndefined();
+  });
+});
+
+describe("settings.get exposes environment (R5)", () => {
+  test("a staging user's row includes environment: staging and still omits the raw key", async () => {
+    const t = convexTest(schema, modules);
+    const asUser = withMockUser(t, "auth0|settings-staging");
+    const userId = await asUser.mutation(api.users.ensure, {});
+
+    await t.mutation(internal.settings.setConductorKeyInternal, {
+      userId,
+      conductorApiKey: "sk-staging-secret-9999",
+      conductorEnvironment: "staging",
+    });
+
+    const settings = await asUser.query(api.settings.get, {});
+    expect(settings.environment).toBe("staging");
+    expect(settings.hasKey).toBe(true);
+    const serialized = JSON.stringify(settings);
+    expect(serialized).not.toContain("sk-staging-secret-9999");
+    expect(serialized).not.toContain("conductorApiKey");
   });
 });
