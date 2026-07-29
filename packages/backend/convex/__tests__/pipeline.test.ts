@@ -55,6 +55,13 @@ class MockConductor {
     { id: "proj-1", name: "Whistle", gitRemote: "https://github.com/org/whistle.git" },
   ];
 
+  /** Which host this mock's key is valid against — every other host 401s
+   * every endpoint (mirrors the live behavior: an identical 401 envelope on
+   * the wrong-environment host). Defaults to "prod" so the existing
+   * prod-default test suite is unaffected; staging-routing tests set this
+   * to "staging" and drive a staging settings row. */
+  acceptedEnvironment: "prod" | "staging" = "prod";
+
   createWorkspaceCount = 0;
   sendMessageCalls: Array<{ sessionId: string; messageId: string }> = [];
 
@@ -99,7 +106,14 @@ class MockConductor {
 
   handle = async (url: string, init?: RequestInit): Promise<Response> => {
     const method = init?.method ?? "GET";
-    const path = url.replace("https://api.conductor.build", "");
+    const requestEnv: "prod" | "staging" = url.startsWith(
+      "https://stage-api.conductor.build",
+    )
+      ? "staging"
+      : "prod";
+    const path = url
+      .replace("https://stage-api.conductor.build", "")
+      .replace("https://api.conductor.build", "");
     const bodyStr = typeof init?.body === "string" ? init.body : undefined;
     const body = bodyStr ? JSON.parse(bodyStr) : undefined;
 
@@ -108,6 +122,12 @@ class MockConductor {
         status,
         headers: { "content-type": "application/json" },
       });
+
+    // Wrong-environment host: identical 401 envelope regardless of endpoint
+    // (verified live — this is the probe's discriminator, KTD1/KTD4).
+    if (requestEnv !== this.acceptedEnvironment) {
+      return json(401, { code: "UNAUTHORIZED", userMessage: "Invalid API key" });
+    }
 
     // POST /v0/workspaces
     if (method === "POST" && path === "/v0/workspaces") {
@@ -282,20 +302,23 @@ async function setupUserWithCapture(
   subject: string,
   overrides: Partial<Record<string, unknown>> = {},
 ) {
+  const { conductorEnvironment, ...captureOverrides } = overrides;
   const asUser = withMockUser(t, subject);
-  await asUser.mutation(api.users.ensure, {});
-  await asUser.mutation(api.settings.setConductorKey, {
+  const userId = await asUser.mutation(api.users.ensure, {});
+  await t.mutation(internal.settings.setConductorKeyInternal, {
+    userId,
     conductorApiKey: "sk-test-key-00001234",
+    conductorEnvironment: (conductorEnvironment as "prod" | "staging") ?? "prod",
   });
   const captureId = await asUser.mutation(api.captures.create, {
-    clientId: overrides.clientId as string ?? "client-001",
-    transcript: overrides.transcript as string ?? "add dark mode toggle",
-    notes: (overrides.notes as string) ?? "",
-    projectId: (overrides.projectId as string) ?? "proj-1",
-    projectName: (overrides.projectName as string) ?? "Whistle",
-    agent: (overrides.agent as string) ?? "claude",
-    capturedAt: (overrides.capturedAt as number) ?? Date.now(),
-    ...overrides,
+    clientId: captureOverrides.clientId as string ?? "client-001",
+    transcript: captureOverrides.transcript as string ?? "add dark mode toggle",
+    notes: (captureOverrides.notes as string) ?? "",
+    projectId: (captureOverrides.projectId as string) ?? "proj-1",
+    projectName: (captureOverrides.projectName as string) ?? "Whistle",
+    agent: (captureOverrides.agent as string) ?? "claude",
+    capturedAt: (captureOverrides.capturedAt as number) ?? Date.now(),
+    ...captureOverrides,
   });
   return { asUser, captureId };
 }
@@ -631,9 +654,11 @@ describe("happy path", () => {
   test("message queued during init still proceeds to agentWorking", async () => {
     const t = convexTest(schema, modules);
     const asUser = withMockUser(t, "auth0|pipeline-queued-init");
-    await asUser.mutation(api.users.ensure, {});
-    await asUser.mutation(api.settings.setConductorKey, {
+    const userId = await asUser.mutation(api.users.ensure, {});
+    await t.mutation(internal.settings.setConductorKeyInternal, {
+      userId,
       conductorApiKey: "sk-test-key-00001234",
+      conductorEnvironment: "prod",
     });
 
     mock.createWorkspaceResponder = () => {
@@ -674,6 +699,42 @@ describe("happy path", () => {
     const capture = await asUser.query(api.captures.get, { captureId });
     expect(capture?.status).toBe("agentWorking");
     expect(mock.sendMessageCalls).toHaveLength(1);
+  });
+});
+
+describe("staging environment routing (U4)", () => {
+  test("a staging-environment settings row drives a full submit through stage-api routes", async () => {
+    const t = convexTest(schema, modules);
+    mock.acceptedEnvironment = "staging";
+    const { asUser, captureId } = await setupUserWithCapture(
+      t,
+      "auth0|pipeline-staging-route",
+      { clientId: "client-staging-route", conductorEnvironment: "staging" },
+    );
+
+    await tick(t);
+
+    // Every Conductor call the pipeline made had to land on stage-api (the
+    // mock 401s every endpoint on the wrong host), so reaching agentWorking
+    // proves the whole submit path — project-visibility guard, create,
+    // send — was routed against staging.
+    let capture = await asUser.query(api.captures.get, { captureId });
+    expect(capture?.status).toBe("agentWorking");
+    expect(mock.createWorkspaceCount).toBe(1);
+
+    const sessionId = capture!.sessionId!;
+    mock.sessions.get(sessionId)!.status = "idle";
+    mock.addAgentMessage(sessionId, {
+      id: "agent-reply-staging",
+      sessionIndex: 1,
+      type: "agent",
+      content: { userMessageId: "client-staging-route", text: "Done via staging." },
+    });
+
+    await tick(t, 30_000);
+
+    capture = await asUser.query(api.captures.get, { captureId });
+    expect(capture?.status).toBe("ready");
   });
 });
 
@@ -742,9 +803,11 @@ describe("awaitWorkspaceReady handoff", () => {
   test("send hits not-ready 4xx -> awaitWorkspaceReady reschedules -> ready -> resumes submit -> sends", async () => {
     const t = convexTest(schema, modules);
     const asUser = withMockUser(t, "auth0|pipeline-await-ready");
-    await asUser.mutation(api.users.ensure, {});
-    await asUser.mutation(api.settings.setConductorKey, {
+    const userId = await asUser.mutation(api.users.ensure, {});
+    await t.mutation(internal.settings.setConductorKeyInternal, {
+      userId,
       conductorApiKey: "sk-test-key-00001234",
+      conductorEnvironment: "prod",
     });
 
     let sendAttempts = 0;
@@ -791,9 +854,11 @@ describe("error: 5xx on create", () => {
   test("backoff reschedule x2 -> success; attempt increments; exactly one workspace created", async () => {
     const t = convexTest(schema, modules);
     const asUser = withMockUser(t, "auth0|pipeline-5xx-create");
-    await asUser.mutation(api.users.ensure, {});
-    await asUser.mutation(api.settings.setConductorKey, {
+    const userId = await asUser.mutation(api.users.ensure, {});
+    await t.mutation(internal.settings.setConductorKeyInternal, {
+      userId,
       conductorApiKey: "sk-test-key-00001234",
+      conductorEnvironment: "prod",
     });
 
     let createAttempts = 0;
@@ -865,9 +930,11 @@ describe("error: create succeeded but action died pre-patch", () => {
   test("rerun adopts orphan via name tag; no second workspace", async () => {
     const t = convexTest(schema, modules);
     const asUser = withMockUser(t, "auth0|pipeline-orphan");
-    await asUser.mutation(api.users.ensure, {});
-    await asUser.mutation(api.settings.setConductorKey, {
+    const userId = await asUser.mutation(api.users.ensure, {});
+    await t.mutation(internal.settings.setConductorKeyInternal, {
+      userId,
       conductorApiKey: "sk-test-key-00001234",
+      conductorEnvironment: "prod",
     });
 
     const captureId = await asUser.mutation(api.captures.create, {
@@ -918,9 +985,11 @@ describe("error: send re-run with messageId already present", () => {
   test("skipped; no duplicate prompt", async () => {
     const t = convexTest(schema, modules);
     const asUser = withMockUser(t, "auth0|pipeline-send-already-present");
-    await asUser.mutation(api.users.ensure, {});
-    await asUser.mutation(api.settings.setConductorKey, {
+    const userId = await asUser.mutation(api.users.ensure, {});
+    await t.mutation(internal.settings.setConductorKeyInternal, {
+      userId,
       conductorApiKey: "sk-test-key-00001234",
+      conductorEnvironment: "prod",
     });
 
     const captureId = await asUser.mutation(api.captures.create, {
@@ -964,9 +1033,11 @@ describe("error: 401 anywhere -> failed/auth, no retry scheduled", () => {
   test("create returns 401", async () => {
     const t = convexTest(schema, modules);
     const asUser = withMockUser(t, "auth0|pipeline-401");
-    await asUser.mutation(api.users.ensure, {});
-    await asUser.mutation(api.settings.setConductorKey, {
+    const userId = await asUser.mutation(api.users.ensure, {});
+    await t.mutation(internal.settings.setConductorKeyInternal, {
+      userId,
       conductorApiKey: "sk-bad-key-00000000",
+      conductorEnvironment: "prod",
     });
 
     mock.createWorkspaceResponder = () => ({
@@ -1192,9 +1263,11 @@ describe("captures.create idempotency", () => {
   test("twice with same clientId -> one row", async () => {
     const t = convexTest(schema, modules);
     const asUser = withMockUser(t, "auth0|pipeline-create-dedupe");
-    await asUser.mutation(api.users.ensure, {});
-    await asUser.mutation(api.settings.setConductorKey, {
+    const userId = await asUser.mutation(api.users.ensure, {});
+    await t.mutation(internal.settings.setConductorKeyInternal, {
+      userId,
       conductorApiKey: "sk-test-key-00001234",
+      conductorEnvironment: "prod",
     });
 
     const args = {
@@ -1222,9 +1295,11 @@ describe("finding 1+3: send 500-with-23505 -> re-check finds message -> proceeds
   test("duplicate-send 500 is treated as a successful send, not a retry", async () => {
     const t = convexTest(schema, modules);
     const asUser = withMockUser(t, "auth0|pipeline-23505");
-    await asUser.mutation(api.users.ensure, {});
-    await asUser.mutation(api.settings.setConductorKey, {
+    const userId = await asUser.mutation(api.users.ensure, {});
+    await t.mutation(internal.settings.setConductorKeyInternal, {
+      userId,
       conductorApiKey: "sk-test-key-00001234",
+      conductorEnvironment: "prod",
     });
 
     const captureId = await asUser.mutation(api.captures.create, {
@@ -1302,9 +1377,11 @@ describe("finding 3: queued-send-then-empty-message-list -> no duplicate send af
   test("an empty message list post-send does not trigger a resend on the next submit run", async () => {
     const t = convexTest(schema, modules);
     const asUser = withMockUser(t, "auth0|pipeline-finding3");
-    await asUser.mutation(api.users.ensure, {});
-    await asUser.mutation(api.settings.setConductorKey, {
+    const userId = await asUser.mutation(api.users.ensure, {});
+    await t.mutation(internal.settings.setConductorKeyInternal, {
+      userId,
       conductorApiKey: "sk-test-key-00001234",
+      conductorEnvironment: "prod",
     });
 
     // The send succeeds (201 sent) but the message list stays empty
@@ -1431,9 +1508,11 @@ describe("terminal-state invariant", () => {
   test("every capture created across a representative run ends in ready/readyUnverified/failed", async () => {
     const t = convexTest(schema, modules);
     const asUser = withMockUser(t, "auth0|pipeline-invariant");
-    await asUser.mutation(api.users.ensure, {});
-    await asUser.mutation(api.settings.setConductorKey, {
+    const userId = await asUser.mutation(api.users.ensure, {});
+    await t.mutation(internal.settings.setConductorKeyInternal, {
+      userId,
       conductorApiKey: "sk-test-key-00001234",
+      conductorEnvironment: "prod",
     });
 
     const captureId = await asUser.mutation(api.captures.create, {

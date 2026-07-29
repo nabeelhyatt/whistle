@@ -75,7 +75,10 @@ export const accountReport = internalQuery({
               ? { present: false, hasKey: false, lastFour: undefined }
               : {
                   present: true,
-                  ...maskedKeyFields(settingsRow.conductorApiKey),
+                  ...maskedKeyFields(
+                    settingsRow.conductorApiKey,
+                    settingsRow.conductorEnvironment,
+                  ),
                 },
         };
       }),

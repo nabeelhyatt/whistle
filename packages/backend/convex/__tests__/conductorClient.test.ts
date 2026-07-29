@@ -27,7 +27,7 @@ describe("conductorFetch logging", () => {
 
     await expect(
       conductorFetch({
-        apiKey: "sk-should-never-be-logged",
+        creds: { apiKey: "sk-should-never-be-logged", environment: "prod" },
         method: "GET",
         path: "/v0/projects",
       }),
@@ -53,7 +53,7 @@ describe("conductorFetch logging", () => {
     let thrown: ConductorApiError | undefined;
     try {
       await conductorFetch({
-        apiKey: "sk-should-never-be-logged",
+        creds: { apiKey: "sk-should-never-be-logged", environment: "prod" },
         method: "GET",
         path: "/v0/projects",
       });
@@ -87,7 +87,7 @@ describe("conductorFetch logging", () => {
 
     await expect(
       conductorFetch({
-        apiKey: "sk-should-never-be-logged",
+        creds: { apiKey: "sk-should-never-be-logged", environment: "prod" },
         method: "POST",
         path: "/v0/workspaces",
         body: { secretPrompt: "should never be logged either" },
