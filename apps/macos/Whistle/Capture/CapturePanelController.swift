@@ -110,6 +110,13 @@ public final class CapturePanelController: NSObject, NSWindowDelegate {
     /// different app.
     private var previousFrontmostApp: NSRunningApplication?
 
+    /// The most recently started screenshot capture, if any. Cancelled
+    /// before a new one starts so rapid Clear -> dismiss -> reopen cycling
+    /// can't pile up unbounded concurrent captures for the same view
+    /// model -- the generation token already discards a stale *result*,
+    /// this bounds the *work in flight* to at most one tracked capture.
+    private var screenshotTask: Task<Void, Never>?
+
     public var onHistoryRequested: () -> Void = {}
     public var onSettingsRequested: () -> Void = {}
 
@@ -248,8 +255,10 @@ public final class CapturePanelController: NSObject, NSWindowDelegate {
     private func startScreenshotCapture(for viewModel: CaptureViewModel) {
         let requestGeneration = viewModel.beginScreenshotRequest()
         let screenshotService = screenshotService
-        Task { [weak viewModel] in
+        screenshotTask?.cancel()
+        screenshotTask = Task { [weak viewModel] in
             let data = await screenshotService.capture()
+            guard !Task.isCancelled else { return }
             await MainActor.run {
                 viewModel?.attachScreenshot(data, requestGeneration: requestGeneration)
             }

@@ -1483,7 +1483,7 @@ final class CapturePanelControllerTests: XCTestCase {
     }
 
     @MainActor
-    func testDuplicateAsNewPreservesItsSuppliedScreenshotWithoutRecapturing() throws {
+    func testDuplicateAsNewPreservesItsSuppliedScreenshotWithoutRecapturing() async throws {
         let (store, tempDir) = try makeStore()
         defer { try? FileManager.default.removeItem(at: tempDir) }
 
@@ -1502,6 +1502,14 @@ final class CapturePanelControllerTests: XCTestCase {
             notes: "original notes",
             screenshotData: screenshot
         ))
+
+        // Give an incorrectly-fired recapture Task a chance to run before
+        // asserting its absence -- a synchronous assertion right here would
+        // pass even if trigger() wrongly spawned one, since the Task hasn't
+        // had a turn on the run loop yet.
+        let expectation = expectation(description: "give an incorrect recapture Task a chance to fire if it wrongly does")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { expectation.fulfill() }
+        await fulfillment(of: [expectation], timeout: 1)
 
         XCTAssertEqual(controller.currentViewModel?.screenshotData, screenshot)
         XCTAssertEqual(counter.count, 0, "duplicate-as-new must retain its supplied screenshot")

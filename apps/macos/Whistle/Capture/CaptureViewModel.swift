@@ -225,7 +225,7 @@ public final class CaptureViewModel: ObservableObject {
     /// Screenshot capture itself happens in `CapturePanelController` BEFORE
     /// the panel is shown (TECH-SPEC §4.2 sequencing); this method receives
     /// the already-in-flight screenshot task's eventual result via
-    /// `attachScreenshot(_:)` rather than firing its own.
+    /// `attachScreenshot(_:requestGeneration:)` rather than firing its own.
     public func beginCapture(preFill: CapturePreFill? = nil) {
         captureBeganAt = Date()
         clientId = UUID().uuidString
@@ -322,10 +322,11 @@ public final class CaptureViewModel: ObservableObject {
         startTranscriptionIfPermitted()
     }
 
-    /// Called by `CapturePanelController` when the pre-panel screenshot
-    /// (fired before `beginCapture`, per §4.2) resolves. Never invoked
-    /// again for the same open (no re-screenshot on duplicate trigger).
-    public func attachScreenshot(_ data: Data?) {
+    /// Applies a resolved screenshot. Only reached via the generation-
+    /// checked `attachScreenshot(_:requestGeneration:)` overload below --
+    /// callers outside this file must go through that overload so a result
+    /// superseded by `clear()` can never land here.
+    func attachScreenshot(_ data: Data?) {
         guard let data else { return }
         screenshotData = data
     }
