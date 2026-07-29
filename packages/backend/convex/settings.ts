@@ -1,19 +1,55 @@
 import { v } from "convex/values";
-import { mutation, query } from "./_generated/server";
+import {
+  internalMutation,
+  mutation,
+  query,
+  type MutationCtx,
+} from "./_generated/server";
+import type { Id } from "./_generated/dataModel";
 import { requireUser } from "./lib/auth";
+import type { ConductorCreds, ConductorEnvironment } from "./conductorClient";
 
 const DEFAULT_AGENT = "claude";
 const DEFAULT_SCREENSHOTS_ENABLED = true;
 
-/** Exported for reuse by admin.ts's `accountReport` (masked lastFour). */
-export function maskedKeyFields(conductorApiKey: string | undefined) {
+function normalizedEnvironment(
+  conductorEnvironment: string | undefined,
+): ConductorEnvironment {
+  return conductorEnvironment === "staging" ? "staging" : "prod";
+}
+
+/** Exported for reuse by admin.ts's `accountReport` (masked lastFour). The
+ * base URL is not a secret, so `environment` is included alongside the
+ * masked key fields — only `conductorApiKey` itself stays stripped. */
+export function maskedKeyFields(
+  conductorApiKey: string | undefined,
+  conductorEnvironment?: string,
+) {
   return {
     hasKey: conductorApiKey !== undefined && conductorApiKey.length > 0,
     lastFour:
       conductorApiKey !== undefined && conductorApiKey.length > 0
         ? conductorApiKey.slice(-4)
         : undefined,
+    environment: normalizedEnvironment(conductorEnvironment),
   };
+}
+
+/**
+ * Builds `ConductorCreds` from a settings row, defaulting an absent
+ * `conductorEnvironment` to `"prod"` (KTD5 — the one place this default
+ * lives; every stored-key read path uses this instead of re-deriving it).
+ * Returns `undefined` when the row has no key at all.
+ */
+export function credsFromSettings(
+  row:
+    | { conductorApiKey?: string; conductorEnvironment?: string }
+    | null
+    | undefined,
+): ConductorCreds | undefined {
+  const apiKey = row?.conductorApiKey;
+  if (apiKey === undefined || apiKey.length === 0) return undefined;
+  return { apiKey, environment: normalizedEnvironment(row?.conductorEnvironment) };
 }
 
 /**
@@ -40,10 +76,15 @@ export const get = query({
       };
     }
 
-    const { conductorApiKey, userId: _userId, ...rest } = row;
+    const {
+      conductorApiKey,
+      conductorEnvironment,
+      userId: _userId,
+      ...rest
+    } = row;
     return {
       ...rest,
-      ...maskedKeyFields(conductorApiKey),
+      ...maskedKeyFields(conductorApiKey, conductorEnvironment),
     };
   },
 });
@@ -108,31 +149,74 @@ export const update = mutation({
   },
 });
 
+async function patchConductorKey(
+  ctx: MutationCtx,
+  userId: Id<"users">,
+  conductorApiKey: string,
+  conductorEnvironment: ConductorEnvironment,
+): Promise<void> {
+  const existing = await ctx.db
+    .query("settings")
+    .withIndex("by_user", (q) => q.eq("userId", userId))
+    .unique();
+
+  if (existing === null) {
+    await ctx.db.insert("settings", {
+      userId,
+      conductorApiKey,
+      conductorEnvironment,
+      agent: DEFAULT_AGENT,
+      screenshotsEnabled: DEFAULT_SCREENSHOTS_ENABLED,
+    });
+    return;
+  }
+
+  await ctx.db.patch(existing._id, {
+    conductorApiKey,
+    conductorEnvironment,
+  });
+}
+
 /**
- * Stores (or replaces) the caller's Conductor API key. Creates the settings
- * row with defaults if one doesn't exist yet.
+ * Stores (or replaces) the caller's Conductor API key and the environment it
+ * was probed against. Creates the settings row with defaults if one doesn't
+ * exist yet. Key and environment are always patched together (KTD3) — there
+ * is no tolerant/optional-environment variant (clean break, KTD6); this is
+ * effectively internal-only now, called from `projects.setAndValidateKey`.
  */
 export const setConductorKey = mutation({
-  args: { conductorApiKey: v.string() },
+  args: {
+    conductorApiKey: v.string(),
+    conductorEnvironment: v.union(v.literal("prod"), v.literal("staging")),
+  },
   handler: async (ctx, args) => {
     const user = await requireUser(ctx);
-    const existing = await ctx.db
-      .query("settings")
-      .withIndex("by_user", (q) => q.eq("userId", user._id))
-      .unique();
+    await patchConductorKey(
+      ctx,
+      user._id,
+      args.conductorApiKey,
+      args.conductorEnvironment,
+    );
+  },
+});
 
-    if (existing === null) {
-      await ctx.db.insert("settings", {
-        userId: user._id,
-        conductorApiKey: args.conductorApiKey,
-        agent: DEFAULT_AGENT,
-        screenshotsEnabled: DEFAULT_SCREENSHOTS_ENABLED,
-      });
-      return;
-    }
-
-    await ctx.db.patch(existing._id, {
-      conductorApiKey: args.conductorApiKey,
-    });
+/**
+ * Internal, userId-keyed twin of `setConductorKey` — used by
+ * `projects.setAndValidateKey` (an action, which has no direct `ctx.db`) to
+ * store the key + environment atomically with the probe result (KTD3).
+ */
+export const setConductorKeyInternal = internalMutation({
+  args: {
+    userId: v.id("users"),
+    conductorApiKey: v.string(),
+    conductorEnvironment: v.union(v.literal("prod"), v.literal("staging")),
+  },
+  handler: async (ctx, args) => {
+    await patchConductorKey(
+      ctx,
+      args.userId,
+      args.conductorApiKey,
+      args.conductorEnvironment,
+    );
   },
 });

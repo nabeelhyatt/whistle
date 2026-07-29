@@ -6,7 +6,24 @@
 // one place. See docs/CONDUCTOR-API.md for the endpoint reference and the
 // empirically-verified behavior this file encodes (U4 findings).
 
-const API_BASE = "https://api.conductor.build";
+/** The two Conductor API deployments. Keys carry no environment marker —
+ * WorkOS-minted, each Roundhouse deployment validates against its own WorkOS
+ * environment — so the environment is discovered by probing (see
+ * `resolveConductorEnvironment` below), never parsed from the key. */
+export type ConductorEnvironment = "prod" | "staging";
+
+export const CONDUCTOR_API_BASES: Record<ConductorEnvironment, string> = {
+  prod: "https://api.conductor.build",
+  staging: "https://stage-api.conductor.build",
+};
+
+/** A resolved key + the environment it was validated against. Every typed
+ * wrapper below takes this instead of a bare `apiKey` so the base URL always
+ * travels with the key that was probed against it (KTD2). */
+export interface ConductorCreds {
+  apiKey: string;
+  environment: ConductorEnvironment;
+}
 
 /** Conductor's error envelope (docs/CONDUCTOR-API.md "Auth" section). */
 export interface StructuredError {
@@ -112,7 +129,7 @@ function defaultUserMessage(status: number, rawText: string): string {
 }
 
 export interface ConductorFetchOptions {
-  apiKey: string;
+  creds: ConductorCreds;
   method: "GET" | "POST";
   path: string;
   body?: unknown;
@@ -135,15 +152,15 @@ export interface ConductorFetchOptions {
 export async function conductorFetch<T = unknown>(
   options: ConductorFetchOptions,
 ): Promise<T> {
-  const { apiKey, method, path, body, isSendEndpoint = false } = options;
-  const url = `${API_BASE}${path}`;
+  const { creds, method, path, body, isSendEndpoint = false } = options;
+  const url = `${CONDUCTOR_API_BASES[creds.environment]}${path}`;
 
   let res: Response;
   try {
     res = await fetch(url, {
       method,
       headers: {
-        Authorization: `Bearer ${apiKey}`,
+        Authorization: `Bearer ${creds.apiKey}`,
         "Content-Type": "application/json",
       },
       body: body !== undefined ? JSON.stringify(body) : undefined,
@@ -204,7 +221,7 @@ export interface ListProjectsResponse {
 }
 
 export async function listProjects(
-  apiKey: string,
+  creds: ConductorCreds,
   opts?: { limit?: number; offset?: number },
 ): Promise<ListProjectsResponse> {
   const params = new URLSearchParams();
@@ -212,14 +229,14 @@ export async function listProjects(
   if (opts?.offset !== undefined) params.set("offset", String(opts.offset));
   const qs = params.toString();
   return conductorFetch<ListProjectsResponse>({
-    apiKey,
+    creds,
     method: "GET",
     path: `/v0/projects${qs ? `?${qs}` : ""}`,
   });
 }
 
 export async function listAllProjects(
-  apiKey: string,
+  creds: ConductorCreds,
   opts?: { limit?: number },
 ): Promise<ConductorProject[]> {
   const limit = opts?.limit ?? 50;
@@ -227,7 +244,7 @@ export async function listAllProjects(
   let offset = 0;
 
   for (;;) {
-    const page = await listProjects(apiKey, { limit, offset });
+    const page = await listProjects(creds, { limit, offset });
     projects.push(...page.data);
 
     if (!page.hasMore) {
@@ -246,11 +263,11 @@ export interface CreateWorkspaceResponse {
 }
 
 export async function createWorkspace(
-  apiKey: string,
+  creds: ConductorCreds,
   args: { projectId: string; name: string; agent: string; model?: string },
 ): Promise<CreateWorkspaceResponse> {
   return conductorFetch<CreateWorkspaceResponse>({
-    apiKey,
+    creds,
     method: "POST",
     path: "/v0/workspaces",
     body: {
@@ -278,11 +295,11 @@ export interface WorkspaceStatusResponse {
 }
 
 export async function getWorkspaceStatus(
-  apiKey: string,
+  creds: ConductorCreds,
   workspaceId: string,
 ): Promise<WorkspaceStatusResponse> {
   return conductorFetch<WorkspaceStatusResponse>({
-    apiKey,
+    creds,
     method: "GET",
     path: `/v0/workspaces/${workspaceId}/status`,
   });
@@ -300,12 +317,12 @@ export interface SendMessageResponse {
  * than retrying (finding 1 / unknown #6).
  */
 export async function sendMessage(
-  apiKey: string,
+  creds: ConductorCreds,
   sessionId: string,
   args: { message: string; messageId: string },
 ): Promise<SendMessageResponse> {
   return conductorFetch<SendMessageResponse>({
-    apiKey,
+    creds,
     method: "POST",
     path: `/v0/sessions/${sessionId}/messages`,
     body: { message: args.message, messageId: args.messageId },
@@ -321,11 +338,11 @@ export interface SessionStatusResponse {
 }
 
 export async function getSessionStatus(
-  apiKey: string,
+  creds: ConductorCreds,
   sessionId: string,
 ): Promise<SessionStatusResponse> {
   return conductorFetch<SessionStatusResponse>({
-    apiKey,
+    creds,
     method: "GET",
     path: `/v0/sessions/${sessionId}/status`,
   });
@@ -353,11 +370,11 @@ export interface ListMessagesResponse {
 }
 
 export async function listMessages(
-  apiKey: string,
+  creds: ConductorCreds,
   sessionId: string,
 ): Promise<ListMessagesResponse> {
   return conductorFetch<ListMessagesResponse>({
-    apiKey,
+    creds,
     method: "GET",
     path: `/v0/sessions/${sessionId}/messages`,
   });
@@ -375,11 +392,11 @@ export interface ListProjectWorkspacesResponse {
 }
 
 export async function listProjectWorkspaces(
-  apiKey: string,
+  creds: ConductorCreds,
   projectId: string,
 ): Promise<ListProjectWorkspacesResponse> {
   return conductorFetch<ListProjectWorkspacesResponse>({
-    apiKey,
+    creds,
     method: "GET",
     path: `/v0/projects/${projectId}/workspaces`,
   });
@@ -395,12 +412,66 @@ export interface ListWorkspaceSessionsResponse {
 }
 
 export async function listWorkspaceSessions(
-  apiKey: string,
+  creds: ConductorCreds,
   workspaceId: string,
 ): Promise<ListWorkspaceSessionsResponse> {
   return conductorFetch<ListWorkspaceSessionsResponse>({
-    apiKey,
+    creds,
     method: "GET",
     path: `/v0/workspaces/${workspaceId}/sessions`,
   });
+}
+
+// ─── Environment resolution (probe, don't parse — KTD1) ─────────────────
+
+export type ResolveConductorEnvironmentResult =
+  | { ok: true; environment: ConductorEnvironment; projects: ConductorProject[] }
+  | { ok: false; reason: "invalid" | "network"; message: string };
+
+/**
+ * Discovers which Conductor deployment a key belongs to by probing prod then
+ * staging with the existing paginated `listAllProjects` helper — never a
+ * `limit: 1` probe, since the successful probe's full project list doubles
+ * as the `projectsCache` seed (KTD1). First success wins.
+ *
+ * Both hosts return an identical `401 {"code":"UNAUTHORIZED"}` for a
+ * wrong-environment key (verified live), so `errorClass === "auth"` from
+ * *both* attempts is the only thing that means "invalid key" (KTD4). If
+ * either attempt failed with `errorClass === "network"` (already covering
+ * 5xx and transport errors in `ConductorApiError`), that takes priority and
+ * is reported as `reason: "network"` — an outage must never masquerade as a
+ * bad key.
+ */
+export async function resolveConductorEnvironment(
+  apiKey: string,
+): Promise<ResolveConductorEnvironmentResult> {
+  const environments: ConductorEnvironment[] = ["prod", "staging"];
+  let allAuth = true;
+  let sawNetwork = false;
+  let lastMessage = "Conductor didn't accept that key.";
+
+  for (const environment of environments) {
+    try {
+      const projects = await listAllProjects({ apiKey, environment });
+      return { ok: true, environment, projects };
+    } catch (err) {
+      if (err instanceof ConductorApiError) {
+        if (err.errorClass !== "auth") allAuth = false;
+        if (err.errorClass === "network") sawNetwork = true;
+        lastMessage = err.userMessage;
+      } else {
+        allAuth = false;
+        sawNetwork = true;
+        lastMessage = err instanceof Error ? err.message : String(err);
+      }
+    }
+  }
+
+  if (sawNetwork) {
+    return { ok: false, reason: "network", message: lastMessage };
+  }
+  // allAuth is true whenever every attempt classified as "auth"; any other
+  // non-network classification (workspaceSetup/unknown) also surfaces here
+  // as "invalid" rather than inventing a third reason — no new error path.
+  return { ok: false, reason: "invalid", message: lastMessage };
 }

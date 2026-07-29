@@ -87,10 +87,20 @@ describe("admin.accountReport", () => {
     expect(july9Row.captureCount).toBe(1);
     expect(july9Row.promptTemplateCount).toBe(1);
     expect(july9Row.hasProjectsCache).toBe(true);
-    expect(july9Row.settings).toEqual({ present: true, hasKey: true, lastFour: "1234" });
+    expect(july9Row.settings).toEqual({
+      present: true,
+      hasKey: true,
+      lastFour: "1234",
+      environment: "prod",
+    });
     expect(july9Row.mergedInto).toBeUndefined();
 
-    expect(july17Row.settings).toEqual({ present: true, hasKey: true, lastFour: "5678" });
+    expect(july17Row.settings).toEqual({
+      present: true,
+      hasKey: true,
+      lastFour: "5678",
+      environment: "prod",
+    });
 
     // Never leaks the raw key.
     const serialized = JSON.stringify(report);

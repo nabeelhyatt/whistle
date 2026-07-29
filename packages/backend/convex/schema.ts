@@ -20,6 +20,9 @@ export default defineSchema({
   settings: defineTable({
     userId: v.id("users"),
     conductorApiKey: v.optional(v.string()), // sensitive; never returned unmasked (see §9)
+    // "prod" | "staging"; absent means prod (legacy rows, zero migration —
+    // see credsFromSettings in settings.ts).
+    conductorEnvironment: v.optional(v.string()),
     defaultProjectId: v.optional(v.string()),
     agent: v.string(), // "claude" | "codex" | "cursor"; default "claude"
     model: v.optional(v.string()),
