@@ -110,6 +110,15 @@ describe("resolveConductorEnvironment", () => {
     expect((result as { reason: string }).reason).toBe("network");
   });
 
+  test("prod 429 (workspaceSetup, not auth), staging 401 -> ok:false, reason network, never invalid (KTD4: invalid requires auth from BOTH hosts)", async () => {
+    prodProjects = undefined;
+    prodStatus = 429;
+    stagingProjects = undefined;
+    const result = await resolveConductorEnvironment("k1");
+    expect(result.ok).toBe(false);
+    expect((result as { reason: string }).reason).toBe("network");
+  });
+
   test("a wrapper called with staging creds issues its request against the stage-api host", async () => {
     stagingProjects = [
       { id: "s1", name: "Staging Alpha", gitRemote: "https://github.com/org/s-alpha.git" },

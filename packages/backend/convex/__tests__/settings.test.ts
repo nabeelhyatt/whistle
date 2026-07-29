@@ -1,6 +1,6 @@
 import { convexTest } from "convex-test";
 import { describe, expect, test } from "vitest";
-import { api } from "../_generated/api";
+import { api, internal } from "../_generated/api";
 import schema from "../schema";
 import { credsFromSettings } from "../settings";
 
@@ -24,12 +24,13 @@ describe("settings.get", () => {
     expect(settings.lastFour).toBeUndefined();
   });
 
-  test("never includes the raw key, even right after setConductorKey", async () => {
+  test("never includes the raw key, even right after setConductorKeyInternal", async () => {
     const t = convexTest(schema, modules);
     const asUser = withMockUser(t, "auth0|settings-mask");
-    await asUser.mutation(api.users.ensure, {});
+    const userId = await asUser.mutation(api.users.ensure, {});
 
-    await asUser.mutation(api.settings.setConductorKey, {
+    await t.mutation(internal.settings.setConductorKeyInternal, {
+      userId,
       conductorApiKey: "sk-super-secret-key-12345678",
       conductorEnvironment: "prod",
     });
@@ -152,8 +153,9 @@ describe("cross-user denial", () => {
     const userA = withMockUser(t, "auth0|cross-user-a");
     const userB = withMockUser(t, "auth0|cross-user-b");
 
-    await userA.mutation(api.users.ensure, {});
-    await userA.mutation(api.settings.setConductorKey, {
+    const userAId = await userA.mutation(api.users.ensure, {});
+    await t.mutation(internal.settings.setConductorKeyInternal, {
+      userId: userAId,
       conductorApiKey: "sk-user-a-secret-0000",
       conductorEnvironment: "prod",
     });
@@ -206,9 +208,10 @@ describe("settings.get exposes environment (R5)", () => {
   test("a staging user's row includes environment: staging and still omits the raw key", async () => {
     const t = convexTest(schema, modules);
     const asUser = withMockUser(t, "auth0|settings-staging");
-    await asUser.mutation(api.users.ensure, {});
+    const userId = await asUser.mutation(api.users.ensure, {});
 
-    await asUser.mutation(api.settings.setConductorKey, {
+    await t.mutation(internal.settings.setConductorKeyInternal, {
+      userId,
       conductorApiKey: "sk-staging-secret-9999",
       conductorEnvironment: "staging",
     });

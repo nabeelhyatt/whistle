@@ -149,7 +149,11 @@ export const update = mutation({
   },
 });
 
-async function patchConductorKey(
+/** Exported for reuse by `projects.setAndValidateKey`'s single atomic
+ * mutation, which patches settings + upserts projectsCache in one
+ * transaction (KTD3) and so needs direct `ctx.db` access to this rather than
+ * a separate `ctx.runMutation`. */
+export async function patchConductorKey(
   ctx: MutationCtx,
   userId: Id<"users">,
   conductorApiKey: string,
@@ -179,31 +183,12 @@ async function patchConductorKey(
 
 /**
  * Stores (or replaces) the caller's Conductor API key and the environment it
- * was probed against. Creates the settings row with defaults if one doesn't
- * exist yet. Key and environment are always patched together (KTD3) — there
- * is no tolerant/optional-environment variant (clean break, KTD6); this is
- * effectively internal-only now, called from `projects.setAndValidateKey`.
- */
-export const setConductorKey = mutation({
-  args: {
-    conductorApiKey: v.string(),
-    conductorEnvironment: v.union(v.literal("prod"), v.literal("staging")),
-  },
-  handler: async (ctx, args) => {
-    const user = await requireUser(ctx);
-    await patchConductorKey(
-      ctx,
-      user._id,
-      args.conductorApiKey,
-      args.conductorEnvironment,
-    );
-  },
-});
-
-/**
- * Internal, userId-keyed twin of `setConductorKey` — used by
- * `projects.setAndValidateKey` (an action, which has no direct `ctx.db`) to
- * store the key + environment atomically with the probe result (KTD3).
+ * was probed against, keyed by `userId` — used from `projects.setAndValidateKey`
+ * (which folds this into its single atomic mutation, KTD3) and by tests that
+ * need to seed a key directly. There is deliberately no public mutation for
+ * this: entering/replacing a key must go through the probe-before-store path
+ * in `projects.setAndValidateKey`, never write the key straight to storage
+ * (clean break, KTD6).
  */
 export const setConductorKeyInternal = internalMutation({
   args: {

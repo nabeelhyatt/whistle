@@ -140,7 +140,6 @@ public protocol ConvexServiceProtocol: Sendable {
     // MARK: settings
     func settingsGet() async throws -> SettingsSnapshot
     func settingsUpdate(_ patch: SettingsPatch) async throws
-    func settingsSetConductorKey(_ key: String) async throws
 
     // MARK: conductor
 
@@ -1104,10 +1103,6 @@ final class ConvexAuthAttachmentGate: @unchecked Sendable {
             case nil:
                 break
             }
-        }
-
-        public func settingsSetConductorKey(_ key: String) async throws {
-            try await authedMutation("settings:setConductorKey", with: ["conductorApiKey": key])
         }
 
         // MARK: conductor

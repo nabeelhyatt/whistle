@@ -15,7 +15,7 @@ import {
   ConductorApiError,
   type ConductorEnvironment,
 } from "./conductorClient";
-import { credsFromSettings } from "./settings";
+import { credsFromSettings, patchConductorKey } from "./settings";
 
 /** Both actions below resolve the caller via `users.getSelfInternal` since
  * actions don't have direct `ctx.db` access and `requireUser` is a
@@ -97,6 +97,59 @@ export const writeProjectsCacheInternal = internalMutation({
         fetchedAt: Date.now(),
       });
     }
+  },
+});
+
+/**
+ * The single transactional write behind `setAndValidateKey` (KTD3): patches
+ * `settings` (key + environment) and upserts `projectsCache` from the
+ * already-probed project list in one Convex mutation, so both writes commit
+ * or fail together. `projectsChanged` is computed against the prior cache
+ * *inside* this mutation (not read-then-decided in the calling action)
+ * specifically so a concurrent write to the same user's cache can't race
+ * between "read previous" and "write new" — the comparison and the write
+ * share one transaction.
+ */
+export const commitValidatedKeyInternal = internalMutation({
+  args: {
+    userId: v.id("users"),
+    conductorApiKey: v.string(),
+    conductorEnvironment: v.union(v.literal("prod"), v.literal("staging")),
+    projects: v.array(
+      v.object({ id: v.string(), name: v.string(), gitRemote: v.string() }),
+    ),
+  },
+  handler: async (ctx, args): Promise<{ projectsChanged: boolean }> => {
+    const existingCache = await ctx.db
+      .query("projectsCache")
+      .withIndex("by_user", (q) => q.eq("userId", args.userId))
+      .unique();
+    const projectsChanged = projectSetChanged(
+      existingCache?.projects,
+      args.projects,
+    );
+
+    await patchConductorKey(
+      ctx,
+      args.userId,
+      args.conductorApiKey,
+      args.conductorEnvironment,
+    );
+
+    if (existingCache === null) {
+      await ctx.db.insert("projectsCache", {
+        userId: args.userId,
+        projects: args.projects,
+        fetchedAt: Date.now(),
+      });
+    } else {
+      await ctx.db.patch(existingCache._id, {
+        projects: args.projects,
+        fetchedAt: Date.now(),
+      });
+    }
+
+    return { projectsChanged };
   },
 });
 
@@ -199,12 +252,16 @@ const NETWORK_UNREACHABLE_MESSAGE =
   "Couldn't reach Conductor. Check your connection and try again.";
 
 /**
- * One atomic action (KTD3): probes both Conductor hosts for `apiKey`
- * (`resolveConductorEnvironment`), and only on success stores the key +
- * detected environment together with a single mutation, seeding
- * `projectsCache` from the probe's own already-fetched project list (no
- * second projects fetch). On failure, nothing is stored — the previously
- * working key (if any) is left exactly as it was.
+ * Probes both Conductor hosts for `apiKey` (`resolveConductorEnvironment`),
+ * and only on success commits the detected environment + key together with
+ * `projectsCache` via a *single* internal mutation
+ * (`commitValidatedKeyInternal`, KTD3) — actions can't run multiple
+ * `ctx.runMutation` calls transactionally, so the settings patch and the
+ * cache upsert (plus the race-free `projectsChanged` comparison) all live in
+ * that one mutation rather than here. `projectsCache` is seeded from the
+ * probe's own already-fetched project list (no second projects fetch). On
+ * failure, nothing is stored — the previously working key (if any) is left
+ * exactly as it was.
  */
 export const setAndValidateKey = action({
   args: { apiKey: v.string() },
@@ -235,24 +292,15 @@ export const setAndValidateKey = action({
       };
     }
 
-    // Capture the prior project set before overwriting the cache, same
-    // cross-account signal validateKey has always carried
-    // (`projectSetChanged`/`ConductorValidateResult.projectsChanged`).
-    const previous = await ctx.runQuery(
-      internal.projects.getProjectsCacheForUserInternal,
-      { userId: user._id },
+    const { projectsChanged } = await ctx.runMutation(
+      internal.projects.commitValidatedKeyInternal,
+      {
+        userId: user._id,
+        conductorApiKey: args.apiKey,
+        conductorEnvironment: resolved.environment,
+        projects: resolved.projects,
+      },
     );
-    const projectsChanged = projectSetChanged(previous?.projects, resolved.projects);
-
-    await ctx.runMutation(internal.settings.setConductorKeyInternal, {
-      userId: user._id,
-      conductorApiKey: args.apiKey,
-      conductorEnvironment: resolved.environment,
-    });
-    await ctx.runMutation(internal.projects.writeProjectsCacheInternal, {
-      userId: user._id,
-      projects: resolved.projects,
-    });
 
     return { ok: true, environment: resolved.environment, projectsChanged };
   },

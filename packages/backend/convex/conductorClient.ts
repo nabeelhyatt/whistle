@@ -436,11 +436,13 @@ export type ResolveConductorEnvironmentResult =
  *
  * Both hosts return an identical `401 {"code":"UNAUTHORIZED"}` for a
  * wrong-environment key (verified live), so `errorClass === "auth"` from
- * *both* attempts is the only thing that means "invalid key" (KTD4). If
- * either attempt failed with `errorClass === "network"` (already covering
- * 5xx and transport errors in `ConductorApiError`), that takes priority and
- * is reported as `reason: "network"` — an outage must never masquerade as a
- * bad key.
+ * *both* attempts is the only thing that means "invalid key" (KTD4). Any
+ * other non-network failure (workspaceSetup/unknown — e.g. a 429/400) is
+ * NOT auth-from-both, so it must not be reported as "invalid" either: it's
+ * surfaced as `reason: "network"` too, since we can't distinguish "this key
+ * is bad" from "Conductor rejected the probe for some other reason" without
+ * both hosts agreeing it's an auth failure. An outage — or any ambiguous
+ * failure — must never masquerade as a bad key.
  */
 export async function resolveConductorEnvironment(
   apiKey: string,
@@ -467,11 +469,13 @@ export async function resolveConductorEnvironment(
     }
   }
 
-  if (sawNetwork) {
+  // "invalid" is only earned when BOTH hosts classified the failure as auth
+  // (KTD4). Anything else — an explicit network failure, or a non-auth,
+  // non-network failure like workspaceSetup (429/400) — is reported as
+  // "network" so the caller never tells the user their key is wrong when we
+  // don't actually know that.
+  if (sawNetwork || !allAuth) {
     return { ok: false, reason: "network", message: lastMessage };
   }
-  // allAuth is true whenever every attempt classified as "auth"; any other
-  // non-network classification (workspaceSetup/unknown) also surfaces here
-  // as "invalid" rather than inventing a third reason — no new error path.
   return { ok: false, reason: "invalid", message: lastMessage };
 }

@@ -53,7 +53,6 @@ private final class FakeConvexService: ConvexServiceProtocol, @unchecked Sendabl
         SettingsSnapshot(defaultProjectId: nil, agent: "claude", model: nil, screenshotsEnabled: true, hasKey: false, lastFour: nil)
     }
     func settingsUpdate(_ patch: SettingsPatch) async throws {}
-    func settingsSetConductorKey(_ key: String) async throws {}
 
     // MARK: conductor
 

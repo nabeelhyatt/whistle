@@ -44,7 +44,6 @@ private final class FakeHistoryConvexService: ConvexServiceProtocol, @unchecked 
         SettingsSnapshot(defaultProjectId: nil, agent: "claude", model: nil, screenshotsEnabled: true, hasKey: false, lastFour: nil)
     }
     func settingsUpdate(_ patch: SettingsPatch) async throws {}
-    func settingsSetConductorKey(_ key: String) async throws {}
     func conductorValidateKey() async throws -> Bool { true }
     func conductorSetAndValidateKey(key: String) async throws -> ConductorSetAndValidateResult {
         ConductorSetAndValidateResult(ok: true, environment: .prod, projectsChanged: false, error: nil)

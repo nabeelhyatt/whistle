@@ -50,7 +50,6 @@ private final class FakeOnboardingConvexService: ConvexServiceProtocol, @uncheck
     var setAndValidateKeyResult: Result<ConductorSetAndValidateResult, Error>?
 
     // Call tracking
-    private(set) var setConductorKeyCalls: [String] = []
     private(set) var setAndValidateKeyCalls: [String] = []
     private(set) var settingsUpdateCalls: [SettingsPatch] = []
     private(set) var templatesUpdateCalls: [String] = []
@@ -76,14 +75,6 @@ private final class FakeOnboardingConvexService: ConvexServiceProtocol, @uncheck
 
     func settingsUpdate(_ patch: SettingsPatch) async throws {
         lock.lock(); settingsUpdateCalls.append(patch); lock.unlock()
-    }
-
-    func settingsSetConductorKey(_ key: String) async throws {
-        lock.lock()
-        setConductorKeyCalls.append(key)
-        settingsSnapshot.hasKey = true
-        settingsSnapshot.lastFour = String(key.suffix(4))
-        lock.unlock()
     }
 
     // MARK: conductor
