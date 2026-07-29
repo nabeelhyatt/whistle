@@ -122,23 +122,7 @@ import XCTest
             XCTAssertEqual(try? modelValue.convexEncode(), "\"opus-4.8\"")
         }
 
-        // MARK: projects:validateKey — nil-key encoding
-
-        func testConductorValidateKeyArgsOmitsKeyEntirelyWhenNil() {
-            XCTAssertNil(
-                LiveConvexService.conductorValidateKeyArgs(nil),
-                "a nil key must omit the args dict entirely, not send apiKey as JSON null "
-                    + "(the backend falls back to the stored key when the arg is absent, "
-                    + "but v.optional(v.string()) rejects an explicit null)"
-            )
-        }
-
-        func testConductorValidateKeyArgsIncludesApiKeyWhenSet() {
-            guard let args = LiveConvexService.conductorValidateKeyArgs("ck_x") else {
-                return XCTFail("expected a non-nil args dict when key is set")
-            }
-            XCTAssertTrue(args.keys.contains("apiKey"), "a set key must be sent under the 'apiKey' arg name")
-        }
+        // MARK: settings:update — tri-state clear (explicit null)
 
         func testSettingsUpdateTriStateFieldsSendExplicitNullWhenCleared() {
             let args = LiveConvexService.settingsUpdateArgs(

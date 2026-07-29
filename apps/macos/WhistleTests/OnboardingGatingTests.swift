@@ -41,9 +41,18 @@ private final class FakeOnboardingConvexService: ConvexServiceProtocol, @uncheck
     var templateBody = FakeOnboardingConvexService.defaultTemplateBody
     private let defaultTemplateBody = FakeOnboardingConvexService.defaultTemplateBody
 
+    /// Scripted result for `conductorSetAndValidateKey` (staging-keys plan
+    /// U5) — the single atomic call both key-entry flows now make. `nil`
+    /// (the default) derives a result from `validateKeyResult` above so
+    /// existing scenarios that only script the plain bool keep working
+    /// unchanged; set this explicitly to also control `environment` /
+    /// `projectsChanged` / `error`.
+    var setAndValidateKeyResult: Result<ConductorSetAndValidateResult, Error>?
+
     // Call tracking
     private(set) var validateKeyCalls: [String?] = []
     private(set) var setConductorKeyCalls: [String] = []
+    private(set) var setAndValidateKeyCalls: [String] = []
     private(set) var settingsUpdateCalls: [SettingsPatch] = []
     private(set) var templatesUpdateCalls: [String] = []
     private(set) var templatesResetCallCount = 0
@@ -80,18 +89,51 @@ private final class FakeOnboardingConvexService: ConvexServiceProtocol, @uncheck
 
     // MARK: conductor
 
-    func conductorValidateKey(key: String?) async throws -> Bool {
-        lock.lock(); validateKeyCalls.append(key); lock.unlock()
+    func conductorValidateKey() async throws -> Bool {
+        lock.lock(); validateKeyCalls.append(nil); lock.unlock()
         return try validateKeyResult.get()
     }
 
     var validateKeyDetailedResult: Result<ConductorValidateResult, Error>?
-    func conductorValidateKeyDetailed(key: String?) async throws -> ConductorValidateResult {
-        lock.lock(); validateKeyCalls.append(key); let detailed = validateKeyDetailedResult; lock.unlock()
+    func conductorValidateKeyDetailed() async throws -> ConductorValidateResult {
+        lock.lock(); validateKeyCalls.append(nil); let detailed = validateKeyDetailedResult; lock.unlock()
         if let detailed {
             return try detailed.get()
         }
         return ConductorValidateResult(ok: try validateKeyResult.get(), projectsChanged: false)
+    }
+
+    /// The atomic action both Onboarding and Settings now call. Server-side
+    /// atomicity (KTD3) means a rejected key never reaches a separate
+    /// "save" call — there is none — so this fake stores the key/environment
+    /// into `settingsSnapshot` itself, only on `ok == true`.
+    func conductorSetAndValidateKey(key: String) async throws -> ConductorSetAndValidateResult {
+        lock.lock()
+        setAndValidateKeyCalls.append(key)
+        let scripted = setAndValidateKeyResult
+        lock.unlock()
+
+        let result: ConductorSetAndValidateResult
+        if let scripted {
+            result = try scripted.get()
+        } else {
+            let ok = try validateKeyResult.get()
+            result = ok
+                ? ConductorSetAndValidateResult(ok: true, environment: .prod, projectsChanged: false, error: nil)
+                : ConductorSetAndValidateResult(
+                    ok: false, environment: nil, projectsChanged: false,
+                    error: "Conductor didn't accept that key. Check that you copied the whole key."
+                )
+        }
+
+        if result.ok {
+            lock.lock()
+            settingsSnapshot.hasKey = true
+            settingsSnapshot.lastFour = String(key.suffix(4))
+            settingsSnapshot.environment = result.environment ?? .prod
+            lock.unlock()
+        }
+        return result
     }
 
     func conductorRefreshProjects() async throws {}
@@ -233,11 +275,10 @@ final class OnboardingGatingTests: XCTestCase {
         viewModel.continueFromPermissions()
         XCTAssertEqual(viewModel.step, .apiKey)
 
-        // (3) API key — validated inline, stored only when valid
+        // (3) API key — one atomic probe-and-store call (KTD3)
         viewModel.apiKeyInput = "ck_valid_key_1234"
         await viewModel.submitApiKey()
-        XCTAssertEqual(convex.validateKeyCalls, ["ck_valid_key_1234"])
-        XCTAssertEqual(convex.setConductorKeyCalls, ["ck_valid_key_1234"])
+        XCTAssertEqual(convex.setAndValidateKeyCalls, ["ck_valid_key_1234"])
 
         // (4) exactly one project -> auto-selected, NO picker step: we land
         // directly on the test capture.
@@ -418,7 +459,12 @@ final class OnboardingGatingTests: XCTestCase {
 
     func testInvalidKeyShowsInlineErrorAndDoesNotAdvanceOrStoreKey() async throws {
         let convex = FakeOnboardingConvexService()
-        convex.validateKeyResult = .success(false)
+        convex.setAndValidateKeyResult = .success(
+            ConductorSetAndValidateResult(
+                ok: false, environment: nil, projectsChanged: false,
+                error: "Conductor didn't accept that key. Check that you copied the whole key."
+            )
+        )
         let (viewModel, _, _, _) = OnboardingTestSupport.makeViewModel(convex: convex)
 
         await viewModel.signIn()
@@ -428,13 +474,14 @@ final class OnboardingGatingTests: XCTestCase {
         await viewModel.submitApiKey()
 
         XCTAssertEqual(viewModel.step, .apiKey, "invalid key must not advance")
-        XCTAssertNotNil(viewModel.apiKeyError)
-        XCTAssertTrue(convex.setConductorKeyCalls.isEmpty, "an invalid key must never be stored")
+        XCTAssertEqual(viewModel.apiKeyError, "Conductor didn't accept that key. Check that you copied the whole key.")
+        XCTAssertEqual(convex.setAndValidateKeyCalls, ["ck_bad_key"], "the atomic action is still called")
+        XCTAssertFalse(convex.settingsSnapshot.hasKey, "a rejected key must never be stored — there is no separate client-side save call to make")
     }
 
     func testValidateKeyNetworkErrorShowsInlineErrorAndDoesNotAdvance() async throws {
         let convex = FakeOnboardingConvexService()
-        convex.validateKeyResult = .failure(StubError())
+        convex.setAndValidateKeyResult = .failure(StubError())
         let (viewModel, _, _, _) = OnboardingTestSupport.makeViewModel(convex: convex)
 
         await viewModel.signIn()
@@ -444,8 +491,8 @@ final class OnboardingGatingTests: XCTestCase {
         await viewModel.submitApiKey()
 
         XCTAssertEqual(viewModel.step, .apiKey)
-        XCTAssertNotNil(viewModel.apiKeyError)
-        XCTAssertTrue(convex.setConductorKeyCalls.isEmpty)
+        XCTAssertEqual(viewModel.apiKeyError, "Couldn't reach Conductor. Check your connection and try again.")
+        XCTAssertFalse(convex.settingsSnapshot.hasKey)
     }
 
     func testEmptyKeyShowsInlineErrorWithoutCallingValidate() async throws {
@@ -459,7 +506,39 @@ final class OnboardingGatingTests: XCTestCase {
 
         XCTAssertEqual(viewModel.step, .apiKey)
         XCTAssertNotNil(viewModel.apiKeyError)
-        XCTAssertTrue(convex.validateKeyCalls.isEmpty)
+        XCTAssertTrue(convex.setAndValidateKeyCalls.isEmpty)
+    }
+
+    // MARK: Happy: successful staging key entry surfaces the staging confirmation
+
+    func testSuccessfulStagingKeyEntrySetsStagingConfirmationState() async throws {
+        let convex = FakeOnboardingConvexService()
+        convex.setAndValidateKeyResult = .success(
+            ConductorSetAndValidateResult(ok: true, environment: .staging, projectsChanged: false, error: nil)
+        )
+        let (viewModel, _, _, _) = OnboardingTestSupport.makeViewModel(convex: convex)
+
+        await viewModel.signIn()
+        viewModel.continueFromPermissions()
+
+        viewModel.apiKeyInput = "ck_staging_key"
+        await viewModel.submitApiKey()
+
+        XCTAssertEqual(viewModel.connectedEnvironment, .staging)
+        XCTAssertNil(viewModel.apiKeyError)
+        XCTAssertEqual(viewModel.step, .testCapture, "a successful key still advances the wizard")
+    }
+
+    func testSuccessfulProdKeyEntryDoesNotSetStagingConfirmationState() async throws {
+        let (viewModel, _, _, _) = OnboardingTestSupport.makeViewModel()
+
+        await viewModel.signIn()
+        viewModel.continueFromPermissions()
+
+        viewModel.apiKeyInput = "ck_prod_key"
+        await viewModel.submitApiKey()
+
+        XCTAssertNil(viewModel.connectedEnvironment)
     }
 
     // MARK: Happy: exactly one project -> step skipped, auto-selected
@@ -682,7 +761,27 @@ final class SettingsViewModelTests: XCTestCase {
         XCTAssertEqual(viewModel.maskedKeyDisplay, "••••••••••••9xyz")
     }
 
-    func testReplaceKeyFlowCallsSetConductorKeyThenValidateAndRefreshesMask() async throws {
+    func testMaskedKeyDisplayShowsStagingSuffixForStagingAndPlainForProd() async throws {
+        let stagingConvex = FakeOnboardingConvexService()
+        stagingConvex.settingsSnapshot = SettingsSnapshot(
+            defaultProjectId: nil, agent: "claude", model: nil,
+            screenshotsEnabled: true, hasKey: true, lastFour: "9xyz", environment: .staging
+        )
+        let (stagingViewModel, _, _) = makeViewModel(convex: stagingConvex)
+        await stagingViewModel.load()
+        XCTAssertEqual(stagingViewModel.maskedKeyDisplay, "••••••••••••9xyz · Staging")
+
+        let prodConvex = FakeOnboardingConvexService()
+        prodConvex.settingsSnapshot = SettingsSnapshot(
+            defaultProjectId: nil, agent: "claude", model: nil,
+            screenshotsEnabled: true, hasKey: true, lastFour: "9xyz", environment: .prod
+        )
+        let (prodViewModel, _, _) = makeViewModel(convex: prodConvex)
+        await prodViewModel.load()
+        XCTAssertEqual(prodViewModel.maskedKeyDisplay, "••••••••••••9xyz", "prod shows nothing extra")
+    }
+
+    func testReplaceKeyFlowCallsTheAtomicActionOnceAndRefreshesMask() async throws {
         let (viewModel, convex, _) = makeViewModel()
         await viewModel.load()
         XCTAssertEqual(viewModel.maskedKeyDisplay, "No key on file")
@@ -690,10 +789,9 @@ final class SettingsViewModelTests: XCTestCase {
         viewModel.newKeyInput = "ck_new_key_7890"
         await viewModel.replaceKey()
 
-        // Replace flow order per plan U10: validate the candidate first, then
-        // store it only after Conductor accepts it.
-        XCTAssertEqual(convex.setConductorKeyCalls, ["ck_new_key_7890"])
-        XCTAssertEqual(convex.validateKeyCalls, ["ck_new_key_7890"])
+        // Single atomic call (staging-keys plan KTD3) replaces the previous
+        // validate-then-save two-step.
+        XCTAssertEqual(convex.setAndValidateKeyCalls, ["ck_new_key_7890"])
         XCTAssertEqual(viewModel.keyReplaceSucceeded, true)
         XCTAssertTrue(viewModel.newKeyInput.isEmpty, "input clears after a successful replace")
         XCTAssertEqual(viewModel.maskedKeyDisplay, "••••••••••••7890")
@@ -701,7 +799,9 @@ final class SettingsViewModelTests: XCTestCase {
 
     func testSuccessfulReplaceCanWarnWhenProjectSetChanged() async throws {
         let convex = FakeOnboardingConvexService()
-        convex.validateKeyDetailedResult = .success(ConductorValidateResult(ok: true, projectsChanged: true))
+        convex.setAndValidateKeyResult = .success(
+            ConductorSetAndValidateResult(ok: true, environment: .prod, projectsChanged: true, error: nil)
+        )
         let (viewModel, _, _) = makeViewModel(convex: convex)
         await viewModel.load()
 
@@ -715,7 +815,12 @@ final class SettingsViewModelTests: XCTestCase {
 
     func testReplaceKeyRejectedByConductorSurfacesInlineWarning() async throws {
         let convex = FakeOnboardingConvexService()
-        convex.validateKeyResult = .success(false)
+        convex.setAndValidateKeyResult = .success(
+            ConductorSetAndValidateResult(
+                ok: false, environment: nil, projectsChanged: false,
+                error: "Conductor didn't accept that key. Check that you copied the whole key."
+            )
+        )
         let (viewModel, _, _) = makeViewModel(convex: convex)
         await viewModel.load()
 
@@ -723,8 +828,8 @@ final class SettingsViewModelTests: XCTestCase {
         await viewModel.replaceKey()
 
         XCTAssertEqual(viewModel.keyReplaceSucceeded, false)
-        XCTAssertNotNil(viewModel.keyStatusMessage)
-        XCTAssertTrue(convex.setConductorKeyCalls.isEmpty, "a rejected replacement key must never be stored")
+        XCTAssertEqual(viewModel.keyStatusMessage, "Conductor didn't accept that key. Check that you copied the whole key.")
+        XCTAssertFalse(convex.settingsSnapshot.hasKey, "a rejected replacement key must never be stored")
     }
 
     func testRejectedStoredKeyReplacementDoesNotReplaceTheCurrentKeyOrCache() async throws {
@@ -736,7 +841,9 @@ final class SettingsViewModelTests: XCTestCase {
         convex.projectsToYield = [
             Project(id: "old-project", name: "Old Account Project", gitRemote: "git@example.com:old.git")
         ]
-        convex.validateKeyDetailedResult = .success(ConductorValidateResult(ok: false, projectsChanged: false))
+        convex.setAndValidateKeyResult = .success(
+            ConductorSetAndValidateResult(ok: false, environment: nil, projectsChanged: false, error: "Conductor didn't accept that key.")
+        )
         let (viewModel, _, _) = makeViewModel(convex: convex)
         await viewModel.load()
 
@@ -747,7 +854,7 @@ final class SettingsViewModelTests: XCTestCase {
         await viewModel.replaceKey()
 
         XCTAssertEqual(viewModel.keyReplaceSucceeded, false)
-        XCTAssertTrue(convex.setConductorKeyCalls.isEmpty, "the rejected key must not become the stored key")
+        XCTAssertEqual(convex.settingsSnapshot.lastFour, "old1", "the rejected key must not become the stored key")
         XCTAssertTrue(viewModel.keyProjectsAvailable)
         XCTAssertEqual(viewModel.maskedKeyDisplay, "••••••••••••old1")
         XCTAssertEqual(viewModel.projects.map(\.id), ["old-project"])

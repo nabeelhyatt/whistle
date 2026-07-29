@@ -45,7 +45,10 @@ private final class FakeHistoryConvexService: ConvexServiceProtocol, @unchecked 
     }
     func settingsUpdate(_ patch: SettingsPatch) async throws {}
     func settingsSetConductorKey(_ key: String) async throws {}
-    func conductorValidateKey(key: String?) async throws -> Bool { true }
+    func conductorValidateKey() async throws -> Bool { true }
+    func conductorSetAndValidateKey(key: String) async throws -> ConductorSetAndValidateResult {
+        ConductorSetAndValidateResult(ok: true, environment: .prod, projectsChanged: false, error: nil)
+    }
     func conductorRefreshProjects() async throws {}
     func projectsList() -> AsyncStream<[Project]> { AsyncStream { _ in } }
     func templatesGet() async throws -> TemplateSnapshot {

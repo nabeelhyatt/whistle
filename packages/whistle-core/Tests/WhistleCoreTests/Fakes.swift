@@ -58,7 +58,18 @@ final class FakeConvexService: ConvexServiceProtocol, @unchecked Sendable {
     // MARK: conductor
 
     var validateKeyResult = true
-    func conductorValidateKey(key: String?) async throws -> Bool { validateKeyResult }
+    func conductorValidateKey() async throws -> Bool { validateKeyResult }
+
+    /// Scripted result for `conductorSetAndValidateKey` — defaults to a
+    /// successful prod validation with no project-set change.
+    var setAndValidateKeyResult: Result<ConductorSetAndValidateResult, Error> = .success(
+        ConductorSetAndValidateResult(ok: true, environment: .prod, projectsChanged: false, error: nil)
+    )
+    private(set) var setAndValidateKeyCalls: [String] = []
+    func conductorSetAndValidateKey(key: String) async throws -> ConductorSetAndValidateResult {
+        _ = record { setAndValidateKeyCalls.append(key) }
+        return try setAndValidateKeyResult.get()
+    }
 
     private(set) var refreshProjectsCallCount = 0
     func conductorRefreshProjects() async throws {

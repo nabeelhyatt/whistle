@@ -120,6 +120,11 @@ public final class OnboardingViewModel: ObservableObject {
     @Published public var apiKeyInput: String = ""
     @Published public private(set) var isValidatingKey = false
     @Published public private(set) var apiKeyError: String?
+    /// Set on a successful `staging`-environment key entry (staging-keys plan
+    /// R5); drives the inline "Connected to Conductor staging." confirmation
+    /// under the field. `nil` before any successful entry, or after a prod
+    /// entry.
+    @Published public private(set) var connectedEnvironment: ConductorEnvironment?
 
     // Step 4 (project)
     @Published public private(set) var projects: [Project] = []
@@ -269,21 +274,30 @@ public final class OnboardingViewModel: ObservableObject {
         guard !isValidatingKey else { return }
         isValidatingKey = true
         apiKeyError = nil
+        connectedEnvironment = nil
         defer { isValidatingKey = false }
 
+        let result: ConductorSetAndValidateResult
         do {
-            // Validate the pasted key directly (conductor.validateKey also
-            // refreshes projectsCache server-side, TECH-SPEC §7) and only
-            // store it once it's known-good.
-            let valid = try await convex.conductorValidateKey(key: key)
-            guard valid else {
-                apiKeyError = "That key wasn't accepted by Conductor. Check it at app.conductor.build/users/api-keys."
-                return
-            }
-            try await convex.settingsSetConductorKey(key)
+            // Single atomic call (staging-keys plan KTD3): probes the key
+            // against both Conductor hosts and, only on acceptance, stores
+            // the key + detected environment and seeds the projects cache
+            // server-side — replacing the previous validate-then-save
+            // two-step. A rejected key changes nothing server-side, so
+            // there is no separate client "save" call to make here.
+            result = try await convex.conductorSetAndValidateKey(key: key)
         } catch {
-            apiKeyError = "Couldn't validate the key (network or server error). Please try again."
+            apiKeyError = "Couldn't reach Conductor. Check your connection and try again."
             return
+        }
+
+        guard result.ok else {
+            apiKeyError = result.error ?? "Conductor didn't accept that key. Check that you copied the whole key."
+            return
+        }
+
+        if result.environment == .staging {
+            connectedEnvironment = .staging
         }
 
         await loadProjectsAndAdvance()
@@ -505,8 +519,8 @@ struct OnboardingView: View {
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
             Link(
-                "Get your key at app.conductor.build/users/api-keys",
-                destination: URL(string: "https://app.conductor.build/users/api-keys")!
+                "Get your key at \(ConductorDashboardLink.apiKeysLabel(environment: viewModel.connectedEnvironment))",
+                destination: ConductorDashboardLink.apiKeysURL(environment: viewModel.connectedEnvironment)
             )
             .font(.callout)
 
@@ -517,6 +531,12 @@ struct OnboardingView: View {
             if let error = viewModel.apiKeyError {
                 Label(error, systemImage: "exclamationmark.triangle")
                     .foregroundStyle(.red)
+                    .font(.callout)
+            }
+
+            if viewModel.connectedEnvironment == .staging {
+                Label("Connected to Conductor staging.", systemImage: "checkmark.circle")
+                    .foregroundStyle(.secondary)
                     .font(.callout)
             }
 

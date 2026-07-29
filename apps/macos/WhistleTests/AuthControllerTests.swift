@@ -57,7 +57,10 @@ private final class FakeConvexService: ConvexServiceProtocol, @unchecked Sendabl
 
     // MARK: conductor
 
-    func conductorValidateKey(key: String?) async throws -> Bool { true }
+    func conductorValidateKey() async throws -> Bool { true }
+    func conductorSetAndValidateKey(key: String) async throws -> ConductorSetAndValidateResult {
+        ConductorSetAndValidateResult(ok: true, environment: .prod, projectsChanged: false, error: nil)
+    }
     func conductorRefreshProjects() async throws {}
 
     // MARK: projects
