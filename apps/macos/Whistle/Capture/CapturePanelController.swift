@@ -228,9 +228,14 @@ public final class CapturePanelController: NSObject, NSWindowDelegate {
         self.viewModel = viewModel
 
         viewModel.updateSubmissionAuthState(authStateProvider())
-        // Screenshot fires BEFORE panel show (§4.2): async, never blocks
-        // panel display -- the thumbnail fades in once it resolves.
-        startScreenshotCapture(for: viewModel)
+        // A duplicate can carry the source capture's screenshot. Preserve
+        // those bytes rather than replacing them with a screenshot of the
+        // current desktop.
+        if preFill?.screenshotData == nil {
+            // Screenshot fires BEFORE panel show (§4.2): async, never blocks
+            // panel display -- the thumbnail fades in once it resolves.
+            startScreenshotCapture(for: viewModel)
+        }
         viewModel.beginCapture(preFill: preFill)
         showPanel(panel)
 

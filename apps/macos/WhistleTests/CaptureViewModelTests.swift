@@ -1482,6 +1482,31 @@ final class CapturePanelControllerTests: XCTestCase {
         }
     }
 
+    @MainActor
+    func testDuplicateAsNewPreservesItsSuppliedScreenshotWithoutRecapturing() throws {
+        let (store, tempDir) = try makeStore()
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let counter = CaptureCounter()
+        let controller = CapturePanelController(
+            store: store,
+            screenshotService: makeCountingScreenshotService(counter: counter),
+            micPermissionStatus: { .granted },
+            speechPermissionStatus: { .granted },
+            transcriptionServiceFactory: { FakeTranscriptionService() }
+        )
+        let screenshot = TestSupport.sampleScreenshot
+
+        controller.trigger(preFill: CapturePreFill(
+            transcript: "original transcript",
+            notes: "original notes",
+            screenshotData: screenshot
+        ))
+
+        XCTAssertEqual(controller.currentViewModel?.screenshotData, screenshot)
+        XCTAssertEqual(counter.count, 0, "duplicate-as-new must retain its supplied screenshot")
+    }
+
     // MARK: Fix #4b/c: dismissing (Esc / losing key) preserves the draft;
     // reopening restores it without retaking the screenshot.
 
