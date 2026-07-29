@@ -4,6 +4,32 @@
 This version has breaking changes — APIs, conventions, and file structure may all differ from your training data. Read the relevant guide in `node_modules/next/dist/docs/` before writing any code. Heed deprecation notices.
 <!-- END:nextjs-agent-rules -->
 
+## Testing
+
+Three suites, one command each, run in sequence by `pnpm test`:
+
+```bash
+pnpm test:backend   # vitest + convex-test, packages/backend
+pnpm test:core      # swift test --package-path packages/whistle-core
+pnpm test:app       # xcodegen + xcodebuild, apps/macos
+```
+
+`test:app` regenerates `Whistle.xcodeproj` first — it's gitignored, generated from `apps/macos/project.yml`, and doesn't exist until xcodegen runs. The `-derivedDataPath` flag is not cosmetic: without it `xcodebuild` uses Xcode's shared DerivedData, which in this multi-workspace setup carries a stale SPM package checkout and fails the whole suite from a cold start.
+
+`test:app` also prunes `Logs/Test` and passes `-collect-test-diagnostics never`: xcodebuild otherwise captures a ~144 MB symbolicated process diagnostic *per failing run* and never removes old ones, which snowballs fast when you're iterating on a red test. CI keeps full diagnostics (ephemeral runners, and that's where you want them). DerivedData still settles around 1.6 GB per workspace — mostly SPM checkouts and module cache, not growth — so `pnpm clean:derived` reclaims it; a cold rebuild is only ~38s vs ~9s warm, so cleaning an idle workspace is cheap.
+
+Two harmless-but-confusing artifacts, so you don't chase either: `test:app` rewrites `packages/whistle-core/Package.resolved` with app-level pins (Auth0, Sparkle, KeyboardShortcuts) because Xcode unions the whole dependency graph into the local package's resolve file — whistle-core doesn't depend on those, so `git checkout` that file rather than committing it. And `test:core` prints `Test run with 0 tests in 0 suites passed` from the swift-testing runner before the real XCTest results; the count that matters is the `Executed N tests` line. These suites are all XCTest.
+
+Run the suite matching what you touched before declaring done — a backend change without `pnpm test:backend` isn't done, same for whistle-core and `swift test`, same for apps/macos and the app suite. `pnpm lint` passing is not evidence the tests pass.
+
+`docs/TECH-SPEC.md` §2a is the definition of done, §11 is the testing strategy. `docs/MANUAL-QA.md` is the deliberate human/hardware complement — anything needing a real mic, TCC permission dialogs, live Auth0, or a specific macOS version lives there, not in an automated suite.
+
+Async tests must wait on the observable condition, never a fixed sleep — a hand-rolled `Task.sleep` poll is the documented flake (`docs/solutions/test-failures/async-fake-sleep-race-flaky-tests.md`; one such race failed 6 CI runs across 4 PRs in a day). Use the poll-based `Whistle_waitUntil` helper (`apps/macos/WhistleTests/CaptureViewModelTests.swift:206`) or a continuation-based waiter on the fake (e.g. `waitForStartTaskCallCount`). Prove a flake fix by looping the single test 20+ times with `xcodebuild test-without-building`, not one green run.
+
+Target observable behavior, not implementation. Don't write tests that assert SwiftUI rendering or exercise composition roots (`apps/macos/Whistle/WhistleApp.swift`) — that's MANUAL-QA's job. Observable behavior in onboarding, the status item, etc. is fair game when it's genuinely observable. The repo's pattern is protocol fakes over real hardware — 16 injected protocols exist for this (`TranscriptionService`, `AudioTapping`, `ConvexServiceProtocol`, `SpeechAnalyzerResultsEngine`, and others); add a fake before reaching for the real thing.
+
+Partial gap worth knowing: the queue/convert half of `LiveSpeechAnalyzerEngine`'s macOS 26 audio path is now pinned by `AnalyzerAudioFeed` + `AnalyzerAudioFeedTests` (FIFO, bounded drop-oldest, and the invariant that every yielded buffer is already in the activated Int16 format — that last one is the guard against the SIGTRAP crash v1.0.9 shipped). Still uncovered inside `apps/macos/Whistle/Services/SpeechAnalyzerTranscriber.swift`: setup orchestration, readiness, and the `AssetInventory` reserve/install handshake — those need the injectable seam described in `docs/BACKLOG.md` and `docs/plans/2026-07-28-001-typewhisper-speech-roadmap.md`. Changing that file still warrants a manual mic capture on macOS 26; a green suite is not sufficient evidence there.
+
 ## Version Bumping
 
 Bump `MARKETING_VERSION` in `apps/macos/project.yml` by one patch increment (e.g. `1.0.0` → `1.0.1`) with every PR that changes app behavior. Docs-only or CI-only changes don't need a bump. Commit the bump in the same PR, not as a separate PR.

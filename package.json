@@ -6,6 +6,11 @@
   "scripts": {
     "dev": "pnpm --filter web dev",
     "build": "pnpm --filter web build",
-    "lint": "pnpm -r lint"
+    "lint": "pnpm -r lint",
+    "test": "pnpm test:backend && pnpm test:core && pnpm test:app",
+    "test:backend": "pnpm --filter backend test",
+    "test:core": "swift test --package-path packages/whistle-core",
+    "test:app": "cd apps/macos && export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer && xcodegen generate && rm -rf .build/DerivedData/Logs/Test && xcodebuild test -project Whistle.xcodeproj -scheme Whistle -destination 'platform=macOS' -derivedDataPath .build/DerivedData -collect-test-diagnostics never COMPILER_INDEX_STORE_ENABLE=NO",
+    "clean:derived": "rm -rf apps/macos/.build/DerivedData"
   }
 }

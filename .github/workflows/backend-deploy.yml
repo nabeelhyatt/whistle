@@ -38,6 +38,12 @@ jobs:
           cache: pnpm
       - run: pnpm install --frozen-lockfile
 
+      # Runs unconditionally (outside the HAS_DEPLOY_KEY gate below) so a
+      # broken backend fails this workflow even while deploys are still
+      # skipped for lack of a provisioned secret — otherwise a red backend
+      # would sit silently until the key showed up.
+      - run: pnpm --filter backend test
+
       - name: Deploy to Convex
         if: env.HAS_DEPLOY_KEY == 'true'
         working-directory: packages/backend
