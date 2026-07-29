@@ -23,6 +23,13 @@
 //      "Cannot use modules with unallocated locales ... This will be an
 //      error in a future release!" — now reserved once per session before
 //      `analyzer.start(inputSequence:)`.
+//   3. reserve()'s Bool misread as a success flag (fixed): it returns
+//      `false` when the locale "was already reserved" — reservations
+//      persist per app across launches, so from the second session on this
+//      machine ever ran, every capture got `false`, was treated as fatal,
+//      and died ~50ms in with the mic stopped ("no voice input at all"
+//      bug). Only a throw is fatal; the Bool is informational (it's
+//      @discardableResult in the SDK for exactly this reason).
 // The macOS 26.2 SDK (present in this Xcode install) is used to compile
 // this file behind `#available(macOS 26, *)`, and the API surface below
 // was read directly from the SDK's Speech.swiftinterface
@@ -43,19 +50,13 @@
 //     locale's assets for use; must be awaited before `analyzer.start`.
 //   - `SpeechTranscriber.results` is `AsyncSequence<SpeechTranscriber.Result, Error>`.
 //     Each `Result` carries `range: CMTimeRange`, `resultsFinalizationTime: CMTime`,
-//     and `text: AttributedString` — there is no `isFinal` boolean on the
-//     result itself. Finality is determined by comparing a result's
-//     `range` against the analyzer's `volatileRange` (nil/empty once a
-//     range has been finalized) — the WWDC24/25 sample pattern: results
-//     are volatile while inside `volatileRange` and finalized once that
-//     range moves past them (see the classification in `startAnalysis`
-//     below). `CMTimeRange` is a plain C struct bridged into Swift with
-//     only `start`/`duration` fields — it has no `.end` property or
-//     comparison operators, so the end time and comparison both go
-//     through `CMTimeRangeGetEnd`/`CMTimeCompare` (verified against
-//     CoreMedia's CMTimeRange.h/CMTime.h and CoreMedia.apinotes' Swift
-//     name mappings, since the .swiftinterface for the ObjC/C-based
-//     CoreMedia framework doesn't itself list Swift-visible symbols).
+//     and `text: AttributedString`, and — via the `SpeechModuleResult`
+//     protocol extension in Speech.swiftinterface — an `isFinal: Bool`.
+//     `isFinal` is the authoritative finality signal; an earlier version
+//     of this file classified finality by hand (comparing `range` against
+//     `analyzer.volatileRange` at delivery time), which raced the
+//     analyzer's range bookkeeping and mis-filed finalized utterances as
+//     volatile — the "pausing wipes the transcript" bug.
 //   - `AssetInventory.status(forModules:)` / `assetInstallationRequest(supporting:)`
 //     is the in-app model-download surface (§4.1b macOS 26+ path).
 //
@@ -67,10 +68,17 @@
 // macOS 26) no macOS 26 requirement to run the tests.
 
 import Foundation
+import os
 
 #if canImport(Speech)
     import Speech
 #endif
+
+/// Unified-log destination for this file's diagnostics. NSLog content is
+/// privacy-redacted to "<private>" in `log show` on modern macOS, which made
+/// every message here unreadable in the field -- os.Logger with explicit
+/// `privacy: .public` interpolations is the only way these stay legible.
+private let speechLog = Logger(subsystem: "build.conductor.whistle.app", category: "transcription")
 
 // MARK: - Injectable results layer
 
@@ -137,9 +145,9 @@ enum LiveSpeechAnalyzerEngineError: Error {
     /// nil — there is no format this analyzer/transcriber combination can
     /// accept, so analysis cannot start at all.
     case noCompatibleAudioFormat
-    /// `AssetInventory.reserve(locale:)` declined the reservation without
-    /// throwing, so the analyzer must not start against that locale.
-    case localeReservationFailed
+    /// The locale's assets are absent, but Speech cannot create a request
+    /// to install the transcriber's required model.
+    case assetInstallationUnavailable
 }
 
 @available(macOS 26, *)
@@ -225,7 +233,7 @@ final class LiveSpeechAnalyzerEngine: SpeechAnalyzerResultsEngine, @unchecked Se
         } catch {
             if !didLogConversionFailure {
                 didLogConversionFailure = true
-                NSLog("LiveSpeechAnalyzerEngine: dropping audio buffer(s) after conversion failure: \(error)")
+                speechLog.error("LiveSpeechAnalyzerEngine: dropping audio buffer(s) after conversion failure: \(String(describing: error), privacy: .public)")
             }
         }
     }
@@ -248,20 +256,23 @@ final class LiveSpeechAnalyzerEngine: SpeechAnalyzerResultsEngine, @unchecked Se
             let setupTask = Task {
                 // (a) Reserve the locale's assets before starting analysis
                 // -- fixes the "Cannot use modules with unallocated
-                // locales" warning (see file header). A throw here means
-                // the session can't proceed; end gracefully (committed
-                // text is preserved by the existing `.error` handling in
-                // `SpeechAnalyzerTranscriber.handle`) rather than starting
-                // the analyzer against an unreserved locale.
+                // locales" warning (see file header). Only a THROW is
+                // fatal. The returned Bool is NOT a success flag: per the
+                // AssetInventory docs it is `false` when "the locale was
+                // already reserved" (reservations persist per app across
+                // launches), and the API is @discardableResult for exactly
+                // that reason. Treating `false` as fatal -- as this code
+                // originally did -- killed every session after the app's
+                // first-ever SpeechAnalyzer run on the machine: reserve
+                // came back `false` (still reserved from last time), we
+                // yielded `.error`, and `handle(.error)` stopped the mic
+                // ~50ms after it opened. That was the "no voice input at
+                // all since macOS 26" bug.
                 do {
-                    guard try await AssetInventory.reserve(locale: self.locale) else {
-                        NSLog("LiveSpeechAnalyzerEngine: AssetInventory.reserve(locale:) returned false — session cannot start")
-                        continuation.yield(.error(LiveSpeechAnalyzerEngineError.localeReservationFailed))
-                        continuation.finish()
-                        return
-                    }
+                    let newlyReserved = try await AssetInventory.reserve(locale: self.locale)
+                    speechLog.notice("LiveSpeechAnalyzerEngine: locale reserved (newlyReserved: \(newlyReserved, privacy: .public))")
                 } catch {
-                    NSLog("LiveSpeechAnalyzerEngine: AssetInventory.reserve(locale:) threw — session cannot start: \(error)")
+                    speechLog.error("LiveSpeechAnalyzerEngine: AssetInventory.reserve(locale:) threw — session cannot start: \(String(describing: error), privacy: .public)")
                     continuation.yield(.error(error))
                     continuation.finish()
                     return
@@ -274,11 +285,46 @@ final class LiveSpeechAnalyzerEngine: SpeechAnalyzerResultsEngine, @unchecked Se
                     return
                 }
 
+                // (a2) Make sure the SpeechTranscriber model assets are
+                // actually installed for this locale before starting.
+                // System dictation working is NOT evidence they are:
+                // `DictationTranscriber` (system dictation) and
+                // `SpeechTranscriber` are separate modules with separate
+                // installed-asset sets. Without this, a host that has
+                // never installed the SpeechTranscriber model gets a
+                // session that dies immediately and silently.
+                do {
+                    let installed = await SpeechTranscriber.installedLocales
+                    let wanted = self.locale.identifier(.bcp47)
+                    if !installed.contains(where: { $0.identifier(.bcp47) == wanted }) {
+                        speechLog.notice("LiveSpeechAnalyzerEngine: SpeechTranscriber assets for \(wanted, privacy: .public) not installed — downloading")
+                        guard let request = try await AssetInventory.assetInstallationRequest(supporting: [transcriber]) else {
+                            speechLog.error("LiveSpeechAnalyzerEngine: SpeechTranscriber assets are missing and no installation request is available")
+                            continuation.yield(.error(LiveSpeechAnalyzerEngineError.assetInstallationUnavailable))
+                            continuation.finish()
+                            await self.releaseReservedLocale()
+                            return
+                        }
+                        try await request.downloadAndInstall()
+                        speechLog.notice("LiveSpeechAnalyzerEngine: SpeechTranscriber asset download complete")
+                    }
+                } catch {
+                    speechLog.error("LiveSpeechAnalyzerEngine: asset install failed — session cannot start: \(String(describing: error), privacy: .public)")
+                    continuation.yield(.error(error))
+                    continuation.finish()
+                    await self.releaseReservedLocale()
+                    return
+                }
+                guard !Task.isCancelled, !self.checkIsClosed() else {
+                    await self.releaseReservedLocale()
+                    return
+                }
+
                 // (b) THE ROOT-CAUSE FIX: discover the Int16 format the
                 // analyzer's precondition requires (see file header)
                 // before any buffer is allowed to reach `AnalyzerInput`.
                 guard let format = await SpeechAnalyzer.bestAvailableAudioFormat(compatibleWith: [transcriber]) else {
-                    NSLog("LiveSpeechAnalyzerEngine: bestAvailableAudioFormat returned nil — session cannot start")
+                    speechLog.error("LiveSpeechAnalyzerEngine: bestAvailableAudioFormat returned nil — session cannot start")
                     continuation.yield(.error(LiveSpeechAnalyzerEngineError.noCompatibleAudioFormat))
                     continuation.finish()
                     await self.releaseReservedLocale()
@@ -318,7 +364,7 @@ final class LiveSpeechAnalyzerEngine: SpeechAnalyzerResultsEngine, @unchecked Se
                 do {
                     try await analyzer.start(inputSequence: inputStream)
                 } catch {
-                    NSLog("LiveSpeechAnalyzerEngine: analyzer.start(inputSequence:) threw: \(error)")
+                    speechLog.error("LiveSpeechAnalyzerEngine: analyzer.start(inputSequence:) threw: \(String(describing: error), privacy: .public)")
                     continuation.yield(.error(error))
                     continuation.finish()
                 }
@@ -335,34 +381,29 @@ final class LiveSpeechAnalyzerEngine: SpeechAnalyzerResultsEngine, @unchecked Se
             let resultsTask = Task {
                 do {
                     for try await result in transcriber.results {
-                        // No `isFinal` field on `SpeechTranscriber.Result`
-                        // (per the SDK surface above); a result is
-                        // finalized once it no longer overlaps the
-                        // analyzer's current volatile range. `CMTimeRange`
-                        // is a plain C struct (start/duration only, no
-                        // `.end` computed property in the Swift overlay —
-                        // verified against the macOS 26.2 SDK's
-                        // CMTimeRange.h) — the end time and the comparison
-                        // both go through the C functions
-                        // (`CMTimeRangeGetEnd`, `CMTimeCompare`) rather than
-                        // Swift operators.
-                        let volatileRange = await analyzer.volatileRange
-                        let isFinalized: Bool
-                        if let volatileRange {
-                            let resultEnd = CMTimeRangeGetEnd(result.range)
-                            isFinalized = CMTimeCompare(resultEnd, volatileRange.start) <= 0
-                        } else {
-                            isFinalized = true
-                        }
+                        // Finality comes straight from the SDK:
+                        // `SpeechModuleResult.isFinal` (an extension
+                        // property in Speech.swiftinterface). The previous
+                        // hand-rolled classification -- comparing
+                        // `result.range` against `analyzer.volatileRange`
+                        // at delivery time -- raced the analyzer's own
+                        // range bookkeeping: when a pause finalized an
+                        // utterance, the FINAL result could still be
+                        // classified volatile (the volatile range hadn't
+                        // advanced yet when we sampled it), so the
+                        // finalized text landed in `liveSegment` instead of
+                        // `committedTranscript` -- and the next utterance's
+                        // first volatile result then REPLACED it, wiping
+                        // everything before the pause from the display.
                         let event = SpeechAnalyzerResultEvent(
                             text: String(result.text.characters),
-                            isFinalized: isFinalized
+                            isFinalized: result.isFinal
                         )
                         continuation.yield(.event(event))
                     }
                     continuation.finish()
                 } catch {
-                    NSLog("LiveSpeechAnalyzerEngine: transcriber.results stream threw: \(error)")
+                    speechLog.error("LiveSpeechAnalyzerEngine: transcriber.results stream threw: \(String(describing: error), privacy: .public)")
                     continuation.yield(.error(error))
                     continuation.finish()
                 }
@@ -395,7 +436,7 @@ final class LiveSpeechAnalyzerEngine: SpeechAnalyzerResultsEngine, @unchecked Se
             } catch {
                 if !didLogConversionFailure {
                     didLogConversionFailure = true
-                    NSLog("LiveSpeechAnalyzerEngine: dropping converter tail after conversion failure: \(error)")
+                    speechLog.error("LiveSpeechAnalyzerEngine: dropping converter tail after conversion failure: \(String(describing: error), privacy: .public)")
                 }
             }
         }
@@ -445,7 +486,17 @@ final class LiveSpeechAnalyzerEngine: SpeechAnalyzerResultsEngine, @unchecked Se
         hasReservedLocale = false
         stateLock.unlock()
         if shouldReleaseLocale {
-            _ = await AssetInventory.release(reservedLocale: locale)
+            // Release by enumerating `reservedLocales` rather than passing
+            // our constructed `locale`: the docs warn the reserved locales
+            // "may be variants of the locales provided", and
+            // `release(reservedLocale:)` silently no-ops (returns false)
+            // on anything that isn't an exact member of that list -- so a
+            // constructed-locale release can leak the reservation.
+            let wanted = locale.identifier(.bcp47)
+            for reserved in await AssetInventory.reservedLocales
+                where reserved.identifier(.bcp47) == wanted {
+                _ = await AssetInventory.release(reservedLocale: reserved)
+            }
         }
     }
 }
@@ -512,7 +563,7 @@ public actor SpeechAnalyzerTranscriber: TranscriptionService {
                 Task { await self.feed(buffer) }
             }
         } catch {
-            NSLog("SpeechAnalyzerTranscriber: audioTap.start threw — no mic input this session: \(error)")
+            speechLog.error("SpeechAnalyzerTranscriber: audioTap.start threw — no mic input this session: \(String(describing: error), privacy: .public)")
             continuation.yield(TranscriptUpdate(committed: committedTranscript, live: liveSegment))
             continuation.finish()
             return stream
@@ -561,7 +612,7 @@ public actor SpeechAnalyzerTranscriber: TranscriptionService {
             // SpeechAnalyzer sessions don't need task-cycling (§4.1b), so
             // an error here ends the session rather than spawning a new
             // segment; committed text is preserved and surfaced as-is.
-            NSLog("SpeechAnalyzerTranscriber: engine error — ending session and stopping the mic: \(error)")
+            speechLog.error("SpeechAnalyzerTranscriber: engine error — ending session and stopping the mic: \(String(describing: error), privacy: .public)")
             liveSegment = ""
             continuation?.yield(TranscriptUpdate(committed: committedTranscript, live: liveSegment))
             continuation?.finish()
