@@ -54,6 +54,11 @@ public final class SettingsViewModel: ObservableObject {
     /// that it may belong to a different Conductor account (canonical-accounts).
     @Published public private(set) var keyProjectsChanged = false
     @Published public private(set) var keyProjectsAvailable = false
+    /// The stored key's environment (`settings:get`'s `environment` field,
+    /// R4: absent/legacy rows read back as `.prod`). Drives the `· Staging`
+    /// suffix on `maskedKeyDisplay` and the environment-aware dashboard
+    /// links (R6).
+    @Published public private(set) var environment: ConductorEnvironment = .prod
 
     @Published public private(set) var loadError: String?
     @Published public private(set) var authState: AuthState
@@ -101,6 +106,7 @@ public final class SettingsViewModel: ObservableObject {
             hasKey = snapshot.hasKey
             keyProjectsAvailable = snapshot.hasKey
             keyLastFour = snapshot.lastFour
+            environment = snapshot.environment
             loadError = nil
         } catch {
             loadError = "Couldn't load settings. Check your connection."
@@ -187,14 +193,27 @@ public final class SettingsViewModel: ObservableObject {
     /// (TECH-SPEC §9) — only `hasKey` + last-4.
     public var maskedKeyDisplay: String {
         guard hasKey else { return "No key on file" }
+        let base: String
         if let last = keyLastFour, !last.isEmpty {
-            return "••••••••••••\(last)"
+            base = "••••••••••••\(last)"
+        } else {
+            base = "•••••••••••• (on file)"
         }
-        return "•••••••••••• (on file)"
+        return environment == .staging ? "\(base) · Staging" : base
     }
 
-    /// Replace flow per plan U10: validate the pasted key first, then persist
-    /// it only after Conductor accepts it.
+    /// The dashboard URL to send the user to for key management — staging
+    /// when the stored key's environment is staging, prod otherwise (R6).
+    public var dashboardKeysURL: URL {
+        ConductorDashboardLink.apiKeysURL(environment: environment)
+    }
+
+    /// Replace flow (staging-keys plan KTD3): one atomic call probes the
+    /// pasted key against both Conductor hosts and, only on acceptance,
+    /// stores it + the detected environment and seeds the projects cache
+    /// server-side — replacing the previous validate-then-`settingsSetConductorKey`
+    /// two-step. The different-project-set warning is preserved, now driven
+    /// by the action's own `projectsChanged` signal.
     public func replaceKey() async {
         let key = newKeyInput.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !key.isEmpty else {
@@ -206,40 +225,36 @@ public final class SettingsViewModel: ObservableObject {
         isReplacingKey = true
         defer { isReplacingKey = false }
 
-        let result: ConductorValidateResult
+        let result: ConductorSetAndValidateResult
         do {
-            result = try await convex.conductorValidateKeyDetailed(key: key)
+            result = try await convex.conductorSetAndValidateKey(key: key)
         } catch {
-            keyStatusMessage = "Couldn't save/validate the key (network or server error)."
+            keyStatusMessage = "Couldn't reach Conductor. Check your connection and try again."
             keyReplaceSucceeded = false
             keyProjectsChanged = false
             return
         }
 
         guard result.ok else {
-            keyStatusMessage = "Conductor rejected this key. Double-check it at app.conductor.build/users/api-keys."
+            keyStatusMessage = result.error ?? "Conductor didn't accept that key. Check that you copied the whole key."
             keyReplaceSucceeded = false
             keyProjectsChanged = false
             return
         }
 
-        do {
-            try await convex.settingsSetConductorKey(key)
-            keyStatusMessage = "Key saved and validated."
-            keyReplaceSucceeded = true
-            keyProjectsChanged = result.projectsChanged
-            keyProjectsAvailable = true
-            newKeyInput = ""
-            // Refresh masked display (hasKey / last-4).
-            if let snapshot = try? await convex.settingsGet() {
-                hasKey = snapshot.hasKey
-                keyLastFour = snapshot.lastFour
-            }
-        } catch {
-            keyStatusMessage = "Couldn't save/validate the key (network or server error)."
-            keyReplaceSucceeded = false
-            keyProjectsChanged = false
-            keyProjectsAvailable = false
+        keyStatusMessage = "Key saved and validated."
+        keyReplaceSucceeded = true
+        keyProjectsChanged = result.projectsChanged
+        keyProjectsAvailable = true
+        environment = result.environment ?? .prod
+        hasKey = true
+        keyLastFour = String(key.suffix(4))
+        newKeyInput = ""
+        // Refresh masked display (hasKey / last-4 / environment).
+        if let snapshot = try? await convex.settingsGet() {
+            hasKey = snapshot.hasKey
+            keyLastFour = snapshot.lastFour
+            environment = snapshot.environment
         }
     }
 
@@ -366,8 +381,8 @@ struct SettingsView: View {
 
                 HStack {
                     Link(
-                        "app.conductor.build/users/api-keys",
-                        destination: URL(string: "https://app.conductor.build/users/api-keys")!
+                        ConductorDashboardLink.apiKeysLabel(environment: viewModel.environment),
+                        destination: viewModel.dashboardKeysURL
                     )
                     .font(.callout)
                     Spacer()

@@ -9,7 +9,13 @@ import { action, query } from "./_generated/server";
 import { internal } from "./_generated/api";
 import { internalMutation, internalQuery } from "./_generated/server";
 import { requireUser } from "./lib/auth";
-import { listAllProjects, ConductorApiError } from "./conductorClient";
+import {
+  listAllProjects,
+  resolveConductorEnvironment,
+  ConductorApiError,
+  type ConductorEnvironment,
+} from "./conductorClient";
+import { credsFromSettings, patchConductorKey } from "./settings";
 
 /** Both actions below resolve the caller via `users.getSelfInternal` since
  * actions don't have direct `ctx.db` access and `requireUser` is a
@@ -95,30 +101,82 @@ export const writeProjectsCacheInternal = internalMutation({
 });
 
 /**
- * Validates a Conductor API key via `GET /v0/projects` and, on success,
- * refreshes `projectsCache`. Accepts an explicit key (for the onboarding
- * "validate before saving" flow) or falls back to the caller's stored key.
+ * The single transactional write behind `setAndValidateKey` (KTD3): patches
+ * `settings` (key + environment) and upserts `projectsCache` from the
+ * already-probed project list in one Convex mutation, so both writes commit
+ * or fail together. `projectsChanged` is computed against the prior cache
+ * *inside* this mutation (not read-then-decided in the calling action)
+ * specifically so a concurrent write to the same user's cache can't race
+ * between "read previous" and "write new" — the comparison and the write
+ * share one transaction.
+ */
+export const commitValidatedKeyInternal = internalMutation({
+  args: {
+    userId: v.id("users"),
+    conductorApiKey: v.string(),
+    conductorEnvironment: v.union(v.literal("prod"), v.literal("staging")),
+    projects: v.array(
+      v.object({ id: v.string(), name: v.string(), gitRemote: v.string() }),
+    ),
+  },
+  handler: async (ctx, args): Promise<{ projectsChanged: boolean }> => {
+    const existingCache = await ctx.db
+      .query("projectsCache")
+      .withIndex("by_user", (q) => q.eq("userId", args.userId))
+      .unique();
+    const projectsChanged = projectSetChanged(
+      existingCache?.projects,
+      args.projects,
+    );
+
+    await patchConductorKey(
+      ctx,
+      args.userId,
+      args.conductorApiKey,
+      args.conductorEnvironment,
+    );
+
+    if (existingCache === null) {
+      await ctx.db.insert("projectsCache", {
+        userId: args.userId,
+        projects: args.projects,
+        fetchedAt: Date.now(),
+      });
+    } else {
+      await ctx.db.patch(existingCache._id, {
+        projects: args.projects,
+        fetchedAt: Date.now(),
+      });
+    }
+
+    return { projectsChanged };
+  },
+});
+
+/**
+ * Re-checks the caller's *stored* Conductor key via `GET /v0/projects`
+ * against its stored environment (`credsFromSettings`) and, on success,
+ * refreshes `projectsCache`. Drops the old `apiKey` arg (KTD6, clean break)
+ * — entering/replacing a key now goes through `setAndValidateKey` below,
+ * which is the only path that can change what's stored.
  */
 export const validateKey = action({
-  args: { apiKey: v.optional(v.string()) },
+  args: {},
   handler: async (
     ctx,
-    args,
   ): Promise<{ ok: boolean; error?: string; changedFromPrevious?: boolean }> => {
     const user = await ctx.runQuery(internal.users.getSelfInternal, {});
     if (user === null) {
       return { ok: false, error: "Not authenticated" };
     }
 
-    let apiKey = args.apiKey;
-    if (apiKey === undefined) {
-      const settings = await ctx.runQuery(internal.projects.getSettingsForUserInternal, {
-        userId: user._id,
-      });
-      apiKey = settings?.conductorApiKey;
-    }
+    const settingsRow = await ctx.runQuery(
+      internal.projects.getSettingsForUserInternal,
+      { userId: user._id },
+    );
+    const creds = credsFromSettings(settingsRow ?? undefined);
 
-    if (apiKey === undefined || apiKey.length === 0) {
+    if (creds === undefined) {
       return { ok: false, error: "No API key provided or stored." };
     }
 
@@ -131,7 +189,7 @@ export const validateKey = action({
         internal.projects.getProjectsCacheForUserInternal,
         { userId: user._id },
       );
-      const projects = await listAllProjects(apiKey, { limit: 50 });
+      const projects = await listAllProjects(creds, { limit: 50 });
       const changedFromPrevious = projectSetChanged(
         previous?.projects,
         projects,
@@ -150,7 +208,7 @@ export const validateKey = action({
   },
 });
 
-/** Refreshes the project cache using the caller's stored key. */
+/** Refreshes the project cache using the caller's stored key + environment. */
 export const refreshProjects = action({
   args: {},
   handler: async (ctx): Promise<{ ok: boolean; error?: string }> => {
@@ -159,16 +217,17 @@ export const refreshProjects = action({
       return { ok: false, error: "Not authenticated" };
     }
 
-    const settings = await ctx.runQuery(internal.projects.getSettingsForUserInternal, {
-      userId: user._id,
-    });
-    const apiKey = settings?.conductorApiKey;
-    if (apiKey === undefined || apiKey.length === 0) {
+    const settingsRow = await ctx.runQuery(
+      internal.projects.getSettingsForUserInternal,
+      { userId: user._id },
+    );
+    const creds = credsFromSettings(settingsRow ?? undefined);
+    if (creds === undefined) {
       return { ok: false, error: "No API key configured." };
     }
 
     try {
-      const projects = await listAllProjects(apiKey, { limit: 50 });
+      const projects = await listAllProjects(creds, { limit: 50 });
       await ctx.runMutation(internal.projects.writeProjectsCacheInternal, {
         userId: user._id,
         projects,
@@ -180,5 +239,69 @@ export const refreshProjects = action({
       }
       return { ok: false, error: (err as Error).message };
     }
+  },
+});
+
+/**
+ * Copy for setAndValidateKey's failure result (R7) — distinguishes a
+ * rejected key from an unreachable host.
+ */
+const INVALID_KEY_MESSAGE =
+  "Conductor didn't accept that key. Check that you copied the whole key.";
+const NETWORK_UNREACHABLE_MESSAGE =
+  "Couldn't reach Conductor. Check your connection and try again.";
+
+/**
+ * Probes both Conductor hosts for `apiKey` (`resolveConductorEnvironment`),
+ * and only on success commits the detected environment + key together with
+ * `projectsCache` via a *single* internal mutation
+ * (`commitValidatedKeyInternal`, KTD3) — actions can't run multiple
+ * `ctx.runMutation` calls transactionally, so the settings patch and the
+ * cache upsert (plus the race-free `projectsChanged` comparison) all live in
+ * that one mutation rather than here. `projectsCache` is seeded from the
+ * probe's own already-fetched project list (no second projects fetch). On
+ * failure, nothing is stored — the previously working key (if any) is left
+ * exactly as it was.
+ */
+export const setAndValidateKey = action({
+  args: { apiKey: v.string() },
+  handler: async (
+    ctx,
+    args,
+  ): Promise<
+    | { ok: true; environment: ConductorEnvironment; projectsChanged: boolean }
+    | { ok: false; error: string }
+  > => {
+    const user = await ctx.runQuery(internal.users.getSelfInternal, {});
+    if (user === null) {
+      return { ok: false, error: "Not authenticated" };
+    }
+
+    if (args.apiKey.length === 0) {
+      return { ok: false, error: INVALID_KEY_MESSAGE };
+    }
+
+    const resolved = await resolveConductorEnvironment(args.apiKey);
+    if (!resolved.ok) {
+      return {
+        ok: false,
+        error:
+          resolved.reason === "network"
+            ? NETWORK_UNREACHABLE_MESSAGE
+            : INVALID_KEY_MESSAGE,
+      };
+    }
+
+    const { projectsChanged } = await ctx.runMutation(
+      internal.projects.commitValidatedKeyInternal,
+      {
+        userId: user._id,
+        conductorApiKey: args.apiKey,
+        conductorEnvironment: resolved.environment,
+        projects: resolved.projects,
+      },
+    );
+
+    return { ok: true, environment: resolved.environment, projectsChanged };
   },
 });

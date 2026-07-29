@@ -2,10 +2,21 @@
 
 Verified against the live OpenAPI spec (`https://api.conductor.build/v0/openapi.json`, fetched 2026-07-04; title "Roundhouse public API" v0.0.1). All endpoints are marked `x-conductor-stability: experimental` — expect drift; keep every call inside `conductorClient.ts`.
 
+## Hosts and environments
+
+There are exactly two Conductor API deployments (verified against the Conductor repo, 2026-07-28):
+
+| Environment | API host | Dashboard | Who uses it |
+|---|---|---|---|
+| prod | `https://api.conductor.build` | `https://app.conductor.build` | Regular Conductor desktop app |
+| staging | `https://stage-api.conductor.build` | `https://stage-app.conductor.build` | Alpha, alpha-chromium, beta, and dev desktop builds |
+
+API keys carry **no environment marker** — they're WorkOS-minted, and each Roundhouse deployment validates a bearer token against its own WorkOS environment. A key sent to the wrong host just 401s with the same `{"code":"UNAUTHORIZED"}` envelope a bogus key gets, so the environment cannot be parsed from the key string. Whistle therefore **probes on key entry**: `resolveConductorEnvironment` in `conductorClient.ts` tries `GET /v0/projects` against prod, then staging; the first host that accepts the key wins, and the resolved environment is stored in settings alongside the key (`conductorEnvironment`; absent = prod for legacy rows) and used to build every subsequent URL. Only both-hosts-401 means "invalid key" — any network/5xx failure during the probe reports "couldn't reach Conductor" instead. The dashboard host follows Roundhouse's own `api.` → `app.` / `stage-api.` → `stage-app.` mapping.
+
 ## Auth
 
 - Bearer token: `Authorization: Bearer <api-key>`.
-- Users create keys at `https://app.conductor.build/users/api-keys`.
+- Users create keys at `https://app.conductor.build/users/api-keys` (staging: `https://stage-app.conductor.build/users/api-keys`).
 - Errors return a `StructuredError`: `{ code?, userMessage (required), debugMessage?, retryable?, source?, details?, underlying? }`. Honor `retryable` in the pipeline's backoff decision.
 
 ## Endpoints Whistle uses
