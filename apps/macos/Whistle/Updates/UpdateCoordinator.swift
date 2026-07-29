@@ -101,7 +101,7 @@ final class FirstLaunchUpdateGate {
     }
 
     private let store: FirstLaunchUpdateCheckStore
-    private let bundlePath: String
+    private let isReadOnlyVolume: () -> Bool
     private let timeout: Duration
     private let isEnabled: Bool
     private let probe: () -> Void
@@ -119,14 +119,16 @@ final class FirstLaunchUpdateGate {
 
     init(
         store: FirstLaunchUpdateCheckStore,
-        bundlePath: String = Bundle.main.bundleURL.path,
+        isReadOnlyVolume: @escaping () -> Bool = {
+            (try? Bundle.main.bundleURL.resourceValues(forKeys: [.volumeIsReadOnlyKey]))?.volumeIsReadOnly == true
+        },
         timeout: Duration = .seconds(10),
         isEnabled: Bool = true,
         probe: @escaping () -> Void,
         showInteractiveUpdateUI: @escaping () -> Void
     ) {
         self.store = store
-        self.bundlePath = bundlePath
+        self.isReadOnlyVolume = isReadOnlyVolume
         self.timeout = timeout
         self.isEnabled = isEnabled
         self.probe = probe
@@ -157,7 +159,7 @@ final class FirstLaunchUpdateGate {
         // would be the new user's first impression of the app -- so stay quiet
         // and let the check happen on the first launch from /Applications.
         // Deliberately does NOT consume an attempt.
-        if bundlePath.hasPrefix("/Volumes/") {
+        if isReadOnlyVolume() {
             updateLog.info("First-launch update check skipped: running from a read-only volume")
             settle()
             return
@@ -385,7 +387,6 @@ final class UpdateCoordinator: NSObject {
             }
 
             self.checkForUpdates()
-            gate.noteEscalationShown()
         }
     }
 
@@ -492,6 +493,9 @@ extension UpdateCoordinator: SPUStandardUserDriverDelegate {
         state: SPUUserUpdateState
     ) {
         MainActor.assumeIsolated {
+            if handleShowingUpdate {
+                gate?.noteEscalationShown()
+            }
             guard handleShowingUpdate, !state.userInitiated, isIdle() else { return }
             NSApp.activate(ignoringOtherApps: true)
         }

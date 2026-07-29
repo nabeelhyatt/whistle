@@ -81,7 +81,9 @@ A release spans **three** places. Getting them out of sync is the main failure m
    wizard — so a new user who downloaded last release's DMG is offered the current one within
    seconds instead of a day later. See `apps/macos/Whistle/Updates/UpdateCoordinator.swift`.
    Two consequences for this step: a forgotten `index.html` bump is now self-correcting, but a
-   broken or stale `appcast.xml` silently costs every new user their first-launch upgrade.
+   stale `appcast.xml` prevents the app from discovering the newer build. A broken, offline, or
+   slow probe does not retire the check: it stays eligible to retry on later launches, up to the
+   three-attempt backstop.
 
 ## Gotchas (learned the hard way, v1.0.9)
 

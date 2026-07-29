@@ -458,6 +458,7 @@ struct HistoryWindow: View {
 @MainActor
 public final class HistoryWindowController: NSObject, NSWindowDelegate {
     private var window: NSWindow?
+    var isWindowVisible: Bool { window?.isVisible == true }
     private let viewModel: HistoryViewModel
 
     /// Invoked when the user chooses "Duplicate as new capture" on a row.

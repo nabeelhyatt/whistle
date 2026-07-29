@@ -39,14 +39,14 @@ final class FirstLaunchUpdateGateTests: XCTestCase {
     }
 
     private func makeGate(
-        bundlePath: String = "/Applications/Whistle.app",
+        isReadOnlyVolume: Bool = false,
         timeout: Duration = .seconds(60),
         isEnabled: Bool = true,
         effects: Effects
     ) -> FirstLaunchUpdateGate {
         FirstLaunchUpdateGate(
             store: FirstLaunchUpdateCheckStore(defaults: defaults),
-            bundlePath: bundlePath,
+            isReadOnlyVolume: { isReadOnlyVolume },
             timeout: timeout,
             isEnabled: isEnabled,
             probe: { effects.probeCount += 1 },
@@ -80,7 +80,7 @@ final class FirstLaunchUpdateGateTests: XCTestCase {
 
     func testRunningFromReadOnlyVolumeSkipsWithoutConsumingAnAttempt() async {
         let effects = Effects()
-        let gate = makeGate(bundlePath: "/Volumes/Whistle 1.0.9/Whistle.app", effects: effects)
+        let gate = makeGate(isReadOnlyVolume: true, effects: effects)
 
         gate.start()
 
@@ -97,6 +97,18 @@ final class FirstLaunchUpdateGateTests: XCTestCase {
         gate.start()
 
         XCTAssertEqual(effects.probeCount, 0)
+        await assertSettles(gate)
+    }
+
+    func testWritableExternalVolumeStillProbes() async {
+        let effects = Effects()
+        let gate = makeGate(isReadOnlyVolume: false, effects: effects)
+
+        gate.start()
+
+        XCTAssertEqual(effects.probeCount, 1, "writable external volumes can accept Sparkle updates")
+        gate.noteFailure()
+        gate.noteCycleFinished(error: URLError(.cannotConnectToHost))
         await assertSettles(gate)
     }
 
@@ -192,6 +204,22 @@ final class FirstLaunchUpdateGateTests: XCTestCase {
         gate.noteEscalationFailed()
 
         XCTAssertFalse(isRetired, "the user never saw a prompt, so this must be retried")
+        await assertSettles(gate)
+    }
+
+    func testInteractiveCycleFailureBeforeShowingPromptKeepsTheCheckArmed() async {
+        let gate = makeGate(effects: Effects())
+
+        gate.start()
+        gate.noteFoundUpdate()
+        gate.noteCycleFinished(error: nil)
+
+        // The first probe found an update, but the interactive re-check then
+        // failed before Sparkle's user driver began presenting the prompt.
+        // This launch may continue, but the next one must still retry.
+        gate.noteCycleFinished(error: URLError(.cannotConnectToHost))
+
+        XCTAssertFalse(isRetired, "a prompt that never began presenting must not consume the check")
         await assertSettles(gate)
     }
 

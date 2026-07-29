@@ -118,7 +118,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // (whose open panel holds unsubmitted text) is built further down.
         let updateCoordinator = UpdateCoordinator()
         updateCoordinator.isIdle = { [weak self] in
-            self?.capturePanelController?.isPanelOpen != true
+            guard let self else { return false }
+            return capturePanelController?.isPanelOpen != true
+                && capturePanelController?.hasPreservedDraft != true
+                && onboardingWindowController?.isWindowVisible != true
+                && settingsWindowController?.isWindowVisible != true
+                && historyWindowController?.isWindowVisible != true
         }
         self.updateCoordinator = updateCoordinator
         updateCoordinator.start()

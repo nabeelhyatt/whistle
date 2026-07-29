@@ -669,6 +669,7 @@ struct OnboardingView: View {
 @MainActor
 public final class OnboardingWindowController: NSObject, NSWindowDelegate {
     private var window: NSWindow?
+    var isWindowVisible: Bool { window?.isVisible == true }
     public let viewModel: OnboardingViewModel
 
     public init(viewModel: OnboardingViewModel) {
