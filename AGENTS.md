@@ -20,6 +20,8 @@ pnpm test:app       # xcodegen + xcodebuild, apps/macos
 
 Two harmless-but-confusing artifacts, so you don't chase either: `test:app` rewrites `packages/whistle-core/Package.resolved` with app-level pins (Auth0, Sparkle, KeyboardShortcuts) because Xcode unions the whole dependency graph into the local package's resolve file — whistle-core doesn't depend on those, so `git checkout` that file rather than committing it. And `test:core` prints `Test run with 0 tests in 0 suites passed` from the swift-testing runner before the real XCTest results; the count that matters is the `Executed N tests` line. These suites are all XCTest.
 
+One false-positive to know about: `pnpm --filter backend typecheck` can pass locally and fail in CI, because `tsc` walks *past* the repo root looking for `node_modules/@types` and can pick up a stray global install (a `~/node_modules/@types/node` did exactly this). Every type a Convex function relies on must be a declared dependency of `packages/backend` — a green local typecheck is not proof that it is.
+
 Run the suite matching what you touched before declaring done — a backend change without `pnpm test:backend` isn't done, same for whistle-core and `swift test`, same for apps/macos and the app suite. `pnpm lint` passing is not evidence the tests pass.
 
 `docs/TECH-SPEC.md` §2a is the definition of done, §11 is the testing strategy. `docs/MANUAL-QA.md` is the deliberate human/hardware complement — anything needing a real mic, TCC permission dialogs, live Auth0, or a specific macOS version lives there, not in an automated suite.
