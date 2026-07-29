@@ -84,7 +84,7 @@ targets:
         CODE_SIGN_ENTITLEMENTS: Whistle/Whistle.entitlements
         GENERATE_INFOPLIST_FILE: NO
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
-        MARKETING_VERSION: "1.0.15"
+        MARKETING_VERSION: "1.0.16"
         # CFBundleVersion tracks MARKETING_VERSION so it increases with
         # every release. Sparkle compares appcast items by sparkle:version
         # (= CFBundleVersion, per release.yml's PlistBuddy read) -- a

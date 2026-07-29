@@ -1,6 +1,6 @@
 # Releasing Whistle
 
-How to cut a public release. Since v1.0.15 the whole release lives in **this repo** —
+How to cut a public release. Since v1.0.16 the whole release lives in **this repo** —
 pushing a tag is the entire process. Read this before tagging. First-time CI provisioning
 is in [`SECRETS.md`](../SECRETS.md).
 
@@ -111,7 +111,9 @@ previous release, so this rollback path remains valid across the migration.
   URL 404s. Harmless: Sparkle treats it as a failed check and retries on schedule, and the
   first-launch probe in `UpdateCoordinator.swift` does not retire a check on fetch failure.
 - **App is arm64-only, macOS 14+.** State this on the download page — Intel Macs can't run it.
-- **Pre-v1.0.15 installs are stranded.** Builds up to v1.0.14 baked in the old
+- **Pre-v1.0.16 installs are stranded.** Builds up to and including v1.0.15 baked in the old
   `nabeelhyatt.com/experiments/whistle/appcast.xml` feed URL, which is no longer maintained.
   There were no real users at cutover, so this was accepted rather than migrated; any such
-  install must be replaced by re-downloading.
+  install must be replaced by re-downloading. v1.0.16's run backfills a complete feed asset
+  onto v1.0.15 anyway, but only so the rollback path below works — no v1.0.15 install ever
+  reads it.
