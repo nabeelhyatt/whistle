@@ -201,7 +201,18 @@ final class AnalyzerAudioFeedTests: XCTestCase {
 
     // MARK: - closeDrainingTail()
 
-    func testCloseDrainingTailYieldsResamplerTailInActivatedFormat() {
+    // NOTE on what this does and does NOT pin. It asserts that everything the
+    // tail path emits is in the activated format, and that the feed is closed
+    // afterwards. It does NOT assert that a tail buffer was emitted at all:
+    // whether 44.1kHz -> 16kHz leaves resampler-delay frames is an
+    // `AVAudioConverter` implementation detail, so a test demanding a non-empty
+    // tail would be asserting Apple's behavior, not ours. Pinning the tail
+    // yield itself needs a seam -- `AnalyzerAudioFeed`'s `converter:` init
+    // parameter already exists, but `AudioBufferConverter` is a concrete
+    // `final class`, so a fake can't be substituted yet. Until then the
+    // deterministic half is asserted below rather than left to a vacuous
+    // `allSatisfy` over a possibly-empty array.
+    func testCloseDrainingTailKeepsEveryYieldedBufferInActivatedFormatAndCloses() {
         let feed = AnalyzerAudioFeed()
         let sink = RecordingSink()
         feed.setSink { sink.record($0) }
@@ -213,9 +224,25 @@ final class AnalyzerAudioFeedTests: XCTestCase {
         // -- this is what can leave resampler-delay frames for the tail to drain.
         feed.append(makeFloat32Buffer(sampleRate: 44100, frameCount: 4096))
 
+        let countBeforeClose = sink.received.count
+        XCTAssertEqual(countBeforeClose, 1, "the post-activation append should have yielded one converted buffer")
+
         feed.closeDrainingTail()
 
-        XCTAssertTrue(sink.received.allSatisfy { $0.format.commonFormat == .pcmFormatInt16 })
+        let afterClose = sink.received
+        XCTAssertFalse(afterClose.isEmpty, "non-empty is required or the format assertion below passes vacuously")
+        XCTAssertGreaterThanOrEqual(afterClose.count, countBeforeClose, "the tail path must never drop already-yielded buffers")
+        for buffer in afterClose {
+            XCTAssertEqual(
+                buffer.format, outputFormat,
+                "every buffer the tail path emits must already be in the activated format"
+            )
+        }
+
+        // closeDrainingTail() must leave the feed closed, not merely drained.
+        XCTAssertFalse(feed.activate(format: outputFormat), "the feed must be closed after closeDrainingTail()")
+        feed.append(makeFloat32Buffer(sampleRate: 16000, frameCount: 128))
+        XCTAssertEqual(sink.received.count, afterClose.count, "no buffer may be accepted after closeDrainingTail()")
 
         // A plain close() (no prior activation) must never drain a tail.
         let neverActivatedFeed = AnalyzerAudioFeed()

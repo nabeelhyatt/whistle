@@ -47,6 +47,14 @@ final class AnalyzerAudioFeed: @unchecked Sendable {
     private var isClosed = false
     private var didReportConversionFailure = false
 
+    /// `maxPendingBuffers` bounds how many pre-format-discovery buffers get
+    /// queued before the oldest is dropped. `AudioEngineTap` installs its tap
+    /// with a bufferSize of 4096 frames (~85ms at the typical 48kHz native
+    /// rate), so the default 64 is ~5.5s of audio — comfortably longer than
+    /// analyzer setup (locale reservation + format lookup) should ever take,
+    /// while still bounding memory if setup stalls. Two open `docs/BACKLOG.md`
+    /// items reason from that ~5.5s figure; keep this derivation with the
+    /// number.
     init(
         maxPendingBuffers: Int = 64,
         converter: AudioBufferConverter = AudioBufferConverter(),

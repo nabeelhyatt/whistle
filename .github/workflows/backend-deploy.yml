@@ -41,8 +41,14 @@ jobs:
       # Runs unconditionally (outside the HAS_DEPLOY_KEY gate below) so a
       # broken backend fails this workflow even while deploys are still
       # skipped for lack of a provisioned secret — otherwise a red backend
-      # would sit silently until the key showed up.
-      - run: pnpm --filter backend test
+      # would sit silently until the key showed up. The deploy step below
+      # still can't run past a failure here: its `if:` carries no status
+      # function, so Actions keeps the implicit `success()` check.
+      #
+      # -C form, not --filter: `pnpm --filter <pkg> <script>` exits 0 when the
+      # script or package doesn't match, which would turn this pre-deploy gate
+      # into a silent no-op if the script were ever renamed.
+      - run: pnpm -C packages/backend run test
 
       - name: Deploy to Convex
         if: env.HAS_DEPLOY_KEY == 'true'

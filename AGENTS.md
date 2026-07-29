@@ -10,15 +10,18 @@ Three suites, one command each, run in sequence by `pnpm test`:
 
 ```bash
 pnpm test:backend   # vitest + convex-test, packages/backend
+pnpm test:types     # backend tsc --noEmit + apps/web production build
 pnpm test:core      # swift test --package-path packages/whistle-core
 pnpm test:app       # xcodegen + xcodebuild, apps/macos
 ```
+
+`test:types` is in `pnpm test` because CI gates on it too — the point of `pnpm test` is that passing it means CI will pass, so anything CI checks belongs here. Scripts invoke `pnpm -C <dir> run <script>`, never `pnpm --filter <pkg> <script>`: `--filter` exits 0 when the script or package doesn't match, so a rename would silently turn a gate into a no-op that still reports green.
 
 `test:app` regenerates `Whistle.xcodeproj` first — it's gitignored, generated from `apps/macos/project.yml`, and doesn't exist until xcodegen runs. The `-derivedDataPath` flag is not cosmetic: without it `xcodebuild` uses Xcode's shared DerivedData, which in this multi-workspace setup carries a stale SPM package checkout and fails the whole suite from a cold start.
 
 `test:app` also prunes `Logs/Test` and passes `-collect-test-diagnostics never`: xcodebuild otherwise captures a ~144 MB symbolicated process diagnostic *per failing run* and never removes old ones, which snowballs fast when you're iterating on a red test. CI keeps full diagnostics (ephemeral runners, and that's where you want them). DerivedData still settles around 1.6 GB per workspace — mostly SPM checkouts and module cache, not growth — so `pnpm clean:derived` reclaims it; a cold rebuild is only ~38s vs ~9s warm, so cleaning an idle workspace is cheap.
 
-Two harmless-but-confusing artifacts, so you don't chase either: `test:app` rewrites `packages/whistle-core/Package.resolved` with app-level pins (Auth0, Sparkle, KeyboardShortcuts) because Xcode unions the whole dependency graph into the local package's resolve file — whistle-core doesn't depend on those, so `git checkout` that file rather than committing it. And `test:core` prints `Test run with 0 tests in 0 suites passed` from the swift-testing runner before the real XCTest results; the count that matters is the `Executed N tests` line. These suites are all XCTest.
+Two harmless-but-confusing artifacts, so you don't chase either: `test:app` rewrites `packages/whistle-core/Package.resolved` with app-level pins (Auth0, Sparkle, KeyboardShortcuts) because Xcode unions the whole dependency graph into the local package's resolve file — whistle-core doesn't depend on those, so `git checkout` that file rather than committing it. And `test:core` prints `Test run with 0 tests in 0 suites passed` from the swift-testing runner as the *last* line, after the real XCTest results — so the final line of a green run reads like nothing ran. The count that matters is the `Executed N tests` line above it. These suites are all XCTest.
 
 One false-positive to know about: `pnpm --filter backend typecheck` can pass locally and fail in CI, because `tsc` walks *past* the repo root looking for `node_modules/@types` and can pick up a stray global install (a `~/node_modules/@types/node` did exactly this). Every type a Convex function relies on must be a declared dependency of `packages/backend` — a green local typecheck is not proof that it is.
 

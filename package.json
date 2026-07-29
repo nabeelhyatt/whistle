@@ -4,11 +4,12 @@
   "packageManager": "pnpm@10.26.0",
   "private": true,
   "scripts": {
-    "dev": "pnpm --filter web dev",
-    "build": "pnpm --filter web build",
+    "dev": "pnpm -C apps/web run dev",
+    "build": "pnpm -C apps/web run build",
     "lint": "pnpm -r lint",
-    "test": "pnpm test:backend && pnpm test:core && pnpm test:app",
-    "test:backend": "pnpm --filter backend test",
+    "test": "pnpm test:backend && pnpm test:types && pnpm test:core && pnpm test:app",
+    "test:backend": "pnpm -C packages/backend run test",
+    "test:types": "pnpm -C packages/backend run typecheck && pnpm -C apps/web run build",
     "test:core": "swift test --package-path packages/whistle-core",
     "test:app": "cd apps/macos && export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer && xcodegen generate && rm -rf .build/DerivedData/Logs/Test && xcodebuild test -project Whistle.xcodeproj -scheme Whistle -destination 'platform=macOS' -derivedDataPath .build/DerivedData -collect-test-diagnostics never COMPILER_INDEX_STORE_ENABLE=NO",
     "clean:derived": "rm -rf apps/macos/.build/DerivedData"

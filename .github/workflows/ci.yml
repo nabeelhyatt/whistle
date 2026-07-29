@@ -52,14 +52,19 @@ jobs:
           node-version: 22
           cache: pnpm
       - run: pnpm install --frozen-lockfile
-      - run: pnpm --filter backend test
+      # `pnpm -C <dir> run <script>` rather than `pnpm --filter <pkg> <script>`:
+      # --filter exits 0 when the script (or the package) doesn't match, so a
+      # renamed script or moved package would turn these gates into silent
+      # no-ops that still report green. The -C form exits 1 on a missing
+      # script — a gate that can't fail is worse than no gate.
+      - run: pnpm -C packages/backend run test
       # Cheap type-level gates: these have no unit tests of their own but
       # catch type-level breakage in convex/files.ts, convex/lib/auth.ts,
       # convex/defaultTemplate.ts (backend typecheck) and in apps/web,
       # which hosts the download page (production build), for near-zero
       # CI cost.
-      - run: pnpm --filter backend typecheck
-      - run: pnpm --filter web build
+      - run: pnpm -C packages/backend run typecheck
+      - run: pnpm -C apps/web run build
 
   macos:
     name: macOS (swift test + xcodebuild test)
@@ -102,6 +107,15 @@ jobs:
         if: failure()
         working-directory: apps/macos
         run: |
+          # `if: failure()` fires for a failure in ANY earlier step — swift
+          # test, brew, xcodegen — in which case xcodebuild never ran and the
+          # log doesn't exist. Without this guard `tail` exits 1 and this
+          # diagnostic step fails too, adding noise to the failure it exists
+          # to explain.
+          if [ ! -f /tmp/xcodebuild.log ]; then
+            echo "No /tmp/xcodebuild.log — the failure was before the xcodebuild step; see that step's own output."
+            exit 0
+          fi
           echo "=== Lines matching error/fail/BUILD FAILED ==="
           grep -n -i -E "error:|fatal error|BUILD FAILED|failing tests?|Fatal error" /tmp/xcodebuild.log || true
           echo ""
