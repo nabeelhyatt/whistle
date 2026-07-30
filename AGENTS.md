@@ -6,7 +6,7 @@ This version has breaking changes — APIs, conventions, and file structure may 
 
 ## Testing
 
-Three suites, one command each, run in sequence by `pnpm test`:
+Three test suites plus a type/build gate, one command each, run in sequence by `pnpm test`:
 
 ```bash
 pnpm test:backend   # vitest + convex-test, packages/backend

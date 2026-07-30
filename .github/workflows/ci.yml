@@ -35,6 +35,14 @@ on:
     branches: [main]
   pull_request:
 
+# Without an explicit block, GITHUB_TOKEN inherits the repository default,
+# which is broader than anything here needs — this repo is public, and the
+# macos job now uploads a log/.xcresult artifact on failure. Checkout and
+# upload-artifact both work with read-only contents; release.yml sets its
+# own `contents: write` because it actually creates releases.
+permissions:
+  contents: read
+
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
