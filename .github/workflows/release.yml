@@ -107,6 +107,8 @@ jobs:
       # package-dmg.sh verifies the imported Developer ID identity and submits
       # the DMG using the notarization credentials prepared above.
       - name: Package DMG
+        env:
+          REQUIRE_DISTRIBUTION: "true"
         run: ./apps/macos/Scripts/package-dmg.sh
 
       - name: Locate artifact
@@ -186,8 +188,23 @@ jobs:
             gh release download "$PRIOR_TAG" --pattern appcast-item.xml \
               --output "$RUNNER_TEMP/prior-item.xml"
             PRIOR="$(grep -o '<sparkle:version>[^<]*' "$RUNNER_TEMP/prior-item.xml" | sed 's/.*>//')"
-            if [[ "$BUILD_NUMBER" == "$PRIOR" || \
-                  "$(printf '%s\n%s\n' "$PRIOR" "$BUILD_NUMBER" | sort -V | tail -1)" != "$BUILD_NUMBER" ]]; then
+            version_is_greater() {
+              local candidate="$1"
+              local prior="$2"
+              local i candidate_part prior_part
+              local -a candidate_parts prior_parts
+              IFS=. read -r -a candidate_parts <<< "$candidate"
+              IFS=. read -r -a prior_parts <<< "$prior"
+              for ((i = 0; i < ${#candidate_parts[@]} || i < ${#prior_parts[@]}; i++)); do
+                candidate_part="${candidate_parts[i]:-0}"
+                prior_part="${prior_parts[i]:-0}"
+                [[ "$candidate_part" =~ ^[0-9]+$ && "$prior_part" =~ ^[0-9]+$ ]] || return 2
+                if ((10#$candidate_part > 10#$prior_part)); then return 0; fi
+                if ((10#$candidate_part < 10#$prior_part)); then return 1; fi
+              done
+              return 1
+            }
+            if ! version_is_greater "$BUILD_NUMBER" "$PRIOR"; then
               echo "ERROR: sparkle:version $BUILD_NUMBER does not exceed $PRIOR_TAG's $PRIOR —" >&2
               echo "Sparkle would never offer this update. Bump MARKETING_VERSION." >&2
               exit 1
@@ -236,7 +253,13 @@ jobs:
           cp "$DMG" apps/macos/dist/Whistle.dmg
           # A draft is invisible to `/releases/latest`. If an upload fails,
           # delete it so a rerun can safely publish the complete asset set.
-          trap 'gh release delete "$GITHUB_REF_NAME" --yes 2>/dev/null || true' ERR
+          release_created=false
+          cleanup_draft() {
+            if [[ "$release_created" == true ]]; then
+              gh release delete "$GITHUB_REF_NAME" --yes 2>/dev/null || true
+            fi
+          }
+          trap cleanup_draft ERR INT TERM
           gh release create "$GITHUB_REF_NAME" --draft \
             --title "Whistle $GITHUB_REF_NAME" \
             --generate-notes \
@@ -244,5 +267,6 @@ jobs:
             apps/macos/dist/Whistle.dmg \
             apps/macos/dist/appcast.xml \
             apps/macos/dist/appcast-item.xml
+          release_created=true
           gh release edit "$GITHUB_REF_NAME" --draft=false
-          trap - ERR
+          trap - ERR INT TERM
