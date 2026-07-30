@@ -26,6 +26,11 @@
 import { existsSync, readFileSync, mkdirSync, writeFileSync } from "node:fs";
 import { resolve, dirname } from "node:path";
 
+import {
+  CONDUCTOR_API_BASES,
+  resolveConductorEnvironment,
+} from "../convex/conductorClient";
+
 // ─── .env.local parsing ──────────────────────────────────────────────────
 
 function findRepoRoot(startDir: string): string {
@@ -66,7 +71,9 @@ const envLocal = parseEnvLocal(ENV_LOCAL_PATH);
 const CONDUCTOR_API_KEY = envLocal.CONDUCTOR_API_KEY;
 const CONDUCTOR_SCRATCH_PROJECT_ID = envLocal.CONDUCTOR_SCRATCH_PROJECT_ID;
 
-const API_BASE = "https://api.conductor.build";
+/** Resolved by probing both Conductor deployments at startup (see main),
+ * so this script works with a prod or a staging key alike. */
+let API_BASE = CONDUCTOR_API_BASES.prod;
 
 // ─── logging ─────────────────────────────────────────────────────────────
 
@@ -146,17 +153,20 @@ async function main() {
     return;
   }
 
-  log(`Using scratch project: ${CONDUCTOR_SCRATCH_PROJECT_ID}`);
-  log("Sanity check: GET /v0/projects");
-  const projectsResp = await conductorFetch("GET", "/v0/projects?limit=50");
-  log(`  -> status ${projectsResp.status}`);
-  if (!projectsResp.ok) {
+  log("Resolving Conductor environment (probing prod, then staging)...");
+  const resolved = await resolveConductorEnvironment(CONDUCTOR_API_KEY);
+  if (!resolved.ok) {
     throw new Error(
-      `GET /v0/projects failed unexpectedly (status ${projectsResp.status}): ${projectsResp.rawText}`
+      `Could not resolve Conductor environment (${resolved.reason}): ${resolved.message}`
     );
   }
-  const projectMatch = (projectsResp.body as any)?.data?.find(
-    (p: any) => p.id === CONDUCTOR_SCRATCH_PROJECT_ID
+  API_BASE = CONDUCTOR_API_BASES[resolved.environment];
+  log(`  -> environment: ${resolved.environment} (${API_BASE})`);
+
+  log(`Using scratch project: ${CONDUCTOR_SCRATCH_PROJECT_ID}`);
+  // The probe already fetched the full project list — no second call needed.
+  const projectMatch = resolved.projects.find(
+    (p) => p.id === CONDUCTOR_SCRATCH_PROJECT_ID
   );
   if (!projectMatch) {
     log(

@@ -44,5 +44,16 @@
 	<true/>
 	<key>SUScheduledCheckInterval</key>
 	<integer>86400</integer>
+	<!-- Automatic checks are declared here rather than left to Sparkle's
+	     first-launch "check for updates automatically?" permission prompt:
+	     this is an LSUIElement app, so that prompt can appear behind other
+	     windows and never get answered, leaving updates off forever.
+	     SUAutomaticallyUpdate downloads and installs without further
+	     interaction; UpdateCoordinator is what makes the install actually
+	     happen on an app that is rarely quit. -->
+	<key>SUEnableAutomaticChecks</key>
+	<true/>
+	<key>SUAutomaticallyUpdate</key>
+	<true/>
 </dict>
 </plist>

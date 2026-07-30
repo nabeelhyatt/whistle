@@ -27,8 +27,10 @@ import {
   listProjectWorkspaces,
   listWorkspaceSessions,
   sendMessage,
+  type ConductorCreds,
   type ConductorMessage,
 } from "./conductorClient";
+import { credsFromSettings } from "./settings";
 import { renderTemplate } from "./promptRenderer";
 
 // ─── Tunables (TECH-SPEC §6) ────────────────────────────────────────────
@@ -88,8 +90,8 @@ function orphanTag(clientId: string): string {
   return `#${clientId.slice(0, 6)}`;
 }
 
-async function projectVisibleToKey(apiKey: string, projectId: string): Promise<boolean> {
-  const visibleProjects = await listAllProjects(apiKey, { limit: 50 });
+async function projectVisibleToKey(creds: ConductorCreds, projectId: string): Promise<boolean> {
+  const visibleProjects = await listAllProjects(creds, { limit: 50 });
   return visibleProjects.some((p) => p.id === projectId);
 }
 
@@ -361,8 +363,8 @@ async function runSubmit(
     internal.pipelineInternal.getSettingsInternal,
     { userId: capture.userId },
   );
-  const apiKey = settings?.conductorApiKey;
-  if (apiKey === undefined || apiKey.length === 0) {
+  const creds = credsFromSettings(settings ?? undefined);
+  if (creds === undefined) {
     await patchCapture(ctx, captureId, {
       status: "failed",
       errorCode: "auth",
@@ -416,7 +418,7 @@ async function runSubmit(
     // working" pointing at a workspace the user can't open. Fail fast with a
     // Settings-routing message instead. Runs only on a fresh submit (no
     // workspaceId yet); adopted/created captures skip it on later passes.
-    if (!(await projectVisibleToKey(apiKey, capture.projectId))) {
+    if (!(await projectVisibleToKey(creds, capture.projectId))) {
       await patchCapture(ctx, captureId, {
         status: "failed",
         errorCode: "auth",
@@ -430,7 +432,7 @@ async function runSubmit(
     // clientId (a previous run created it but died before patching ids).
     const tag = orphanTag(capture.clientId);
     const existingWorkspaces = await listProjectWorkspaces(
-      apiKey,
+      creds,
       capture.projectId,
     );
     const orphan = existingWorkspaces.data.find(
@@ -442,7 +444,7 @@ async function runSubmit(
       if (orphanId === undefined) {
         throw new Error("Orphan workspace entry missing id");
       }
-      const sessions = await listWorkspaceSessions(apiKey, orphanId);
+      const sessions = await listWorkspaceSessions(creds, orphanId);
       const firstSession = sessions.data[0];
       const adoptedSessionId = firstSession?.id ?? firstSession?.sessionId;
       if (adoptedSessionId === undefined) {
@@ -453,7 +455,7 @@ async function runSubmit(
       deepLink = capture.deepLink; // unknown for an adopted orphan; leave as-is.
     } else {
       // 3b. No orphan found — create fresh.
-      const created = await createWorkspace(apiKey, {
+      const created = await createWorkspace(creds, {
         projectId: capture.projectId,
         name: workspaceName,
         agent: capture.agent,
@@ -489,7 +491,7 @@ async function runSubmit(
   // whether we need to attempt a send. If a send already truly happened,
   // the attempt below will hard-fail with the 23505 duplicate error
   // (finding 1), which we treat as success, not failure.
-  const existingMessages = await listMessages(apiKey, sessionId!);
+  const existingMessages = await listMessages(creds, sessionId!);
   const alreadySent = ourMessageAlreadySent(
     existingMessages.data,
     capture.clientId,
@@ -497,7 +499,7 @@ async function runSubmit(
 
   if (!alreadySent) {
     try {
-      await sendMessage(apiKey, sessionId!, {
+      await sendMessage(creds, sessionId!, {
         message: renderedPrompt,
         messageId: capture.clientId,
       });
@@ -509,7 +511,7 @@ async function runSubmit(
           // messageId — it hard-fails instead). Re-check the message list
           // to confirm, then proceed WITHOUT resending. Never blind-retry
           // this class of error.
-          const recheck = await listMessages(apiKey, sessionId!);
+          const recheck = await listMessages(creds, sessionId!);
           const nowPresent = ourMessageAlreadySent(
             recheck.data,
             capture.clientId,
@@ -645,8 +647,8 @@ export const awaitWorkspaceReady = internalAction({
         internal.pipelineInternal.getSettingsInternal,
         { userId: capture.userId },
       );
-      const apiKey = settings?.conductorApiKey;
-      if (apiKey === undefined || apiKey.length === 0) {
+      const creds = credsFromSettings(settings ?? undefined);
+      if (creds === undefined) {
         await patchCapture(ctx, args.captureId, {
           status: "failed",
           errorCode: "auth",
@@ -656,7 +658,7 @@ export const awaitWorkspaceReady = internalAction({
       }
 
       const elapsedMs = args.pollCount * AWAIT_READY_INITIAL_MS;
-      const status = await getWorkspaceStatus(apiKey, capture.workspaceId);
+      const status = await getWorkspaceStatus(creds, capture.workspaceId);
 
       if (elapsedMs >= AWAIT_READY_DEADLINE_MS) {
         await patchCapture(ctx, args.captureId, {
@@ -770,8 +772,8 @@ async function runWatch(
     internal.pipelineInternal.getSettingsInternal,
     { userId: capture.userId },
   );
-  const apiKey = settings?.conductorApiKey;
-  if (apiKey === undefined || apiKey.length === 0) {
+  const creds = credsFromSettings(settings ?? undefined);
+  if (creds === undefined) {
     await patchCapture(ctx, captureId, {
       status: "failed",
       errorCode: "auth",
@@ -780,7 +782,7 @@ async function runWatch(
     return;
   }
 
-  const sessionStatus = await getSessionStatus(apiKey, capture.sessionId!);
+  const sessionStatus = await getSessionStatus(creds, capture.sessionId!);
 
   if (sessionStatus.status === "working") {
     const nextBackoff = Math.min(backoffMs * 2, WATCH_MAX_MS);
@@ -811,7 +813,7 @@ async function runWatch(
   // this must fail/workspaceSetup, never drift to readyUnverified at the
   // deadline (finding 2).
   const workspaceStatus = capture.workspaceId
-    ? await getWorkspaceStatus(apiKey, capture.workspaceId)
+    ? await getWorkspaceStatus(creds, capture.workspaceId)
     : null;
 
   if (
@@ -838,7 +840,7 @@ async function runWatch(
     return;
   }
 
-  const messagesResp = await listMessages(apiKey, capture.sessionId!);
+  const messagesResp = await listMessages(creds, capture.sessionId!);
   const agentReply = findAgentReplyAfterOurs(
     messagesResp.data,
     capture.clientId,

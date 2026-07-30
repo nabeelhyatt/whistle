@@ -140,16 +140,30 @@ public protocol ConvexServiceProtocol: Sendable {
     // MARK: settings
     func settingsGet() async throws -> SettingsSnapshot
     func settingsUpdate(_ patch: SettingsPatch) async throws
-    func settingsSetConductorKey(_ key: String) async throws
 
     // MARK: conductor
-    func conductorValidateKey(key: String?) async throws -> Bool
+
+    /// Re-checks the CURRENTLY STORED key against its stored environment
+    /// (clean break, KTD6: the backend `projects:validateKey` action dropped
+    /// its `apiKey` arg entirely — there is no client-supplied-key variant
+    /// anymore; key entry now goes through `conductorSetAndValidateKey`
+    /// below instead).
+    func conductorValidateKey() async throws -> Bool
     /// Like `conductorValidateKey`, but also reports whether this key's project
     /// set differs from the previously-saved key (canonical-accounts). Has a
     /// default implementation so existing fakes/tests conform unchanged; only
     /// `LiveConvexService` decodes the extra signal.
-    func conductorValidateKeyDetailed(key: String?) async throws -> ConductorValidateResult
+    func conductorValidateKeyDetailed() async throws -> ConductorValidateResult
     func conductorRefreshProjects() async throws
+
+    /// Atomically probes `key` against both Conductor hosts (prod, then
+    /// staging), and — only on acceptance — stores the key plus whichever
+    /// environment accepted it and seeds `projectsCache`, all server-side in
+    /// one action (`projects:setAndValidateKey`, KTD3). Replaces the previous
+    /// client-side validate-then-save two-step in both key-entry flows
+    /// (Onboarding, Settings): a rejected key changes nothing server-side, so
+    /// there is no separate client "save" call to make on failure.
+    func conductorSetAndValidateKey(key: String) async throws -> ConductorSetAndValidateResult
 
     // MARK: projects
     func projectsList() -> AsyncStream<[Project]>
@@ -203,8 +217,8 @@ public extension ConvexServiceProtocol {
     /// Default: fall back to the plain bool validate and report no project-set
     /// change. `LiveConvexService` overrides this to decode the real signal;
     /// fakes/onboarding that only care about validity inherit this unchanged.
-    func conductorValidateKeyDetailed(key: String?) async throws -> ConductorValidateResult {
-        ConductorValidateResult(ok: try await conductorValidateKey(key: key), projectsChanged: false)
+    func conductorValidateKeyDetailed() async throws -> ConductorValidateResult {
+        ConductorValidateResult(ok: try await conductorValidateKey(), projectsChanged: false)
     }
 
     /// Default no-op storage-less accessor so pre-existing fakes/test doubles
@@ -253,6 +267,66 @@ public struct ConductorValidateResult: Equatable, Sendable {
     }
 }
 
+/// The two Conductor deployments a stored key can be validated against
+/// (staging-keys plan KTD2). Wire value is the lowercase raw string
+/// ("prod"/"staging"), matching the backend's `ConductorEnvironment` union.
+public enum ConductorEnvironment: String, Codable, Equatable, Sendable {
+    case prod
+    case staging
+}
+
+/// The result of `projects:setAndValidateKey` (staging-keys plan KTD3): probes
+/// `key` against both Conductor hosts and, only on acceptance, atomically
+/// stores the key + detected environment and seeds the projects cache
+/// server-side. `environment`/`projectsChanged` are only meaningful when `ok`
+/// is `true`; `error` only when `ok` is `false` — mirrors the action's own
+/// `{ ok, environment?, projectsChanged?, error? }` response shape, so callers
+/// never need to guess which fields are populated for which outcome.
+public struct ConductorSetAndValidateResult: Equatable, Sendable {
+    public let ok: Bool
+    public let environment: ConductorEnvironment?
+    public let projectsChanged: Bool
+    public let error: String?
+
+    public init(ok: Bool, environment: ConductorEnvironment?, projectsChanged: Bool, error: String?) {
+        self.ok = ok
+        self.environment = environment
+        self.projectsChanged = projectsChanged
+        self.error = error
+    }
+}
+
+/// Where a user manages their Conductor API keys — `app.conductor.build` for
+/// a prod-environment key, `stage-app.conductor.build` for staging
+/// (Roundhouse's own `api.` -> `app.` / `stage-api.` -> `stage-app.` host
+/// mapping, R6). Shared by every dashboard-link call site (Onboarding's link,
+/// Settings' link, Settings' rejected-key error text) so the environment-aware
+/// URL choice lives in one place, not three inline ternaries. `nil`
+/// environment (unknown yet, e.g. before a key has ever been accepted) falls
+/// back to the prod URL.
+public enum ConductorDashboardLink {
+    public static func apiKeysURL(environment: ConductorEnvironment?) -> URL {
+        switch environment {
+        case .staging:
+            URL(string: "https://stage-app.conductor.build/users/api-keys")!
+        case .prod, nil:
+            URL(string: "https://app.conductor.build/users/api-keys")!
+        }
+    }
+
+    /// Display text matching `apiKeysURL`'s host, so a staging user never
+    /// sees a link labeled "app.conductor.build" that actually opens
+    /// `stage-app.conductor.build` underneath.
+    public static func apiKeysLabel(environment: ConductorEnvironment?) -> String {
+        switch environment {
+        case .staging:
+            "stage-app.conductor.build/users/api-keys"
+        case .prod, nil:
+            "app.conductor.build/users/api-keys"
+        }
+    }
+}
+
 public struct SettingsSnapshot: Codable, Equatable, Sendable {
     public var defaultProjectId: String?
     public var agent: String
@@ -260,6 +334,12 @@ public struct SettingsSnapshot: Codable, Equatable, Sendable {
     public var screenshotsEnabled: Bool
     public var hasKey: Bool
     public var lastFour: String?
+    /// The environment the stored key was last validated against (R4:
+    /// absent/legacy rows default to prod). Non-optional here because the
+    /// backend's `settings:get` always includes it — but decoded leniently
+    /// (see `init(from:)`) so a client running slightly ahead of a backend
+    /// rollout still decodes instead of throwing.
+    public var environment: ConductorEnvironment
 
     public init(
         defaultProjectId: String?,
@@ -267,7 +347,8 @@ public struct SettingsSnapshot: Codable, Equatable, Sendable {
         model: String?,
         screenshotsEnabled: Bool,
         hasKey: Bool,
-        lastFour: String?
+        lastFour: String?,
+        environment: ConductorEnvironment = .prod
     ) {
         self.defaultProjectId = defaultProjectId
         self.agent = agent
@@ -275,6 +356,18 @@ public struct SettingsSnapshot: Codable, Equatable, Sendable {
         self.screenshotsEnabled = screenshotsEnabled
         self.hasKey = hasKey
         self.lastFour = lastFour
+        self.environment = environment
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        defaultProjectId = try container.decodeIfPresent(String.self, forKey: .defaultProjectId)
+        agent = try container.decode(String.self, forKey: .agent)
+        model = try container.decodeIfPresent(String.self, forKey: .model)
+        screenshotsEnabled = try container.decode(Bool.self, forKey: .screenshotsEnabled)
+        hasKey = try container.decode(Bool.self, forKey: .hasKey)
+        lastFour = try container.decodeIfPresent(String.self, forKey: .lastFour)
+        environment = try container.decodeIfPresent(ConductorEnvironment.self, forKey: .environment) ?? .prod
     }
 }
 
@@ -1012,52 +1105,48 @@ final class ConvexAuthAttachmentGate: @unchecked Sendable {
             }
         }
 
-        public func settingsSetConductorKey(_ key: String) async throws {
-            try await authedMutation("settings:setConductorKey", with: ["conductorApiKey": key])
-        }
-
         // MARK: conductor
 
-        public func conductorValidateKey(key: String?) async throws -> Bool {
+        public func conductorValidateKey() async throws -> Bool {
             // NOTE: this action lives in `projects.ts` on the backend (there
             // is no `conductor` Convex module — `conductorClient.ts` is a
             // plain helper, not a functions file), so the wire name is
             // "projects:validateKey", not "conductor:validateKey" (the
             // latter throws "Could not find function" on every call). The
-            // handler also returns `{ ok, error? }`, not a bare bool, and
-            // takes `apiKey`, not `key` — all three had to be fixed together
-            // for this call to actually reach and decode correctly.
-            let result: ConductorActionResult = try await authedAction(
-                "projects:validateKey", with: Self.conductorValidateKeyArgs(key)
-            )
+            // handler also returns `{ ok, error? }`, not a bare bool. Clean
+            // break (KTD6): `validateKey` no longer takes an `apiKey` arg at
+            // all — it re-checks whichever key is already stored, against
+            // its stored environment — so no args dict is sent.
+            let result: ConductorActionResult = try await authedAction("projects:validateKey")
             return result.ok
         }
 
-        public func conductorValidateKeyDetailed(key: String?) async throws -> ConductorValidateResult {
+        public func conductorValidateKeyDetailed() async throws -> ConductorValidateResult {
             // Same wire call as `conductorValidateKey` (see the note there), but
             // surfaces the `changedFromPrevious` field the Settings key flow
             // uses to warn about a possible different-account key.
-            let result: ConductorActionResult = try await authedAction(
-                "projects:validateKey", with: Self.conductorValidateKeyArgs(key)
-            )
+            let result: ConductorActionResult = try await authedAction("projects:validateKey")
             return ConductorValidateResult(
                 ok: result.ok,
                 projectsChanged: result.changedFromPrevious ?? false
             )
         }
 
-        /// Builds the `projects:validateKey` argument dict, omitting the
-        /// `apiKey` key entirely when `key` is `nil` rather than including it
-        /// with a `nil` value. The backend validator is `v.optional(v.string())`
-        /// and falls back to the stored key when the arg is absent, but (same
-        /// class of bug as `capturesCreateArgs`/`settingsUpdateArgs` above) a
-        /// nil-valued dict entry always serializes as literal JSON `null`,
-        /// which `v.optional(...)` rejects. Extracted as a pure, `internal`
-        /// static function so this is unit-testable without a live
-        /// `ConvexClient`; see `ConvexArgEncodingTests`.
-        static func conductorValidateKeyArgs(_ key: String?) -> [String: ConvexEncodable?]? {
-            guard let key else { return nil }
-            return ["apiKey": key]
+        /// Atomic probe-store-seed action (KTD3): probes `key` against prod
+        /// then staging and, only on acceptance, stores the key + detected
+        /// environment and seeds `projectsCache` server-side in one action —
+        /// replacing the old client-side validate-then-`settingsSetConductorKey`
+        /// two-step in both key-entry flows.
+        public func conductorSetAndValidateKey(key: String) async throws -> ConductorSetAndValidateResult {
+            let result: ConductorSetAndValidateActionResult = try await authedAction(
+                "projects:setAndValidateKey", with: ["apiKey": key]
+            )
+            return ConductorSetAndValidateResult(
+                ok: result.ok,
+                environment: result.environment,
+                projectsChanged: result.projectsChanged ?? false,
+                error: result.error
+            )
         }
 
         public func conductorRefreshProjects() async throws {
@@ -1473,6 +1562,18 @@ final class ConvexAuthAttachmentGate: @unchecked Sendable {
         /// on the `refreshProjects` response and on older backends — decode as
         /// optional and treat absence as "no change."
         let changedFromPrevious: Bool?
+    }
+
+    /// Decodes the `{ ok, environment?, projectsChanged?, error? }` shape
+    /// returned by the `projects:setAndValidateKey` action (see
+    /// `packages/backend/convex/projects.ts`). `environment`/`projectsChanged`
+    /// are only present when `ok` is `true`; `error` only when `ok` is
+    /// `false` — all three decode as optional so either shape succeeds.
+    struct ConductorSetAndValidateActionResult: Decodable, Sendable {
+        let ok: Bool
+        let environment: ConductorEnvironment?
+        let projectsChanged: Bool?
+        let error: String?
     }
 
     /// Bridges WhistleCore's pull-based `WhistleAuthProvider.currentIdToken()`

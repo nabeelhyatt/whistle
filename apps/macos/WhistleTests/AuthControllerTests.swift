@@ -53,11 +53,13 @@ private final class FakeConvexService: ConvexServiceProtocol, @unchecked Sendabl
         SettingsSnapshot(defaultProjectId: nil, agent: "claude", model: nil, screenshotsEnabled: true, hasKey: false, lastFour: nil)
     }
     func settingsUpdate(_ patch: SettingsPatch) async throws {}
-    func settingsSetConductorKey(_ key: String) async throws {}
 
     // MARK: conductor
 
-    func conductorValidateKey(key: String?) async throws -> Bool { true }
+    func conductorValidateKey() async throws -> Bool { true }
+    func conductorSetAndValidateKey(key: String) async throws -> ConductorSetAndValidateResult {
+        ConductorSetAndValidateResult(ok: true, environment: .prod, projectsChanged: false, error: nil)
+    }
     func conductorRefreshProjects() async throws {}
 
     // MARK: projects

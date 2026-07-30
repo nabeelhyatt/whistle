@@ -18,6 +18,7 @@ async function seedUserWithData(
   opts: {
     clientId?: string;
     conductorApiKey?: string;
+    conductorEnvironment?: "prod" | "staging";
     withProjectsCache?: boolean;
   } = {},
 ) {
@@ -54,6 +55,7 @@ async function seedUserWithData(
       await ctx.db.insert("settings", {
         userId,
         conductorApiKey: opts.conductorApiKey,
+        conductorEnvironment: opts.conductorEnvironment,
         agent: "claude",
         screenshotsEnabled: true,
       });
@@ -87,15 +89,45 @@ describe("admin.accountReport", () => {
     expect(july9Row.captureCount).toBe(1);
     expect(july9Row.promptTemplateCount).toBe(1);
     expect(july9Row.hasProjectsCache).toBe(true);
-    expect(july9Row.settings).toEqual({ present: true, hasKey: true, lastFour: "1234" });
+    expect(july9Row.settings).toEqual({
+      present: true,
+      hasKey: true,
+      lastFour: "1234",
+      environment: "prod",
+    });
     expect(july9Row.mergedInto).toBeUndefined();
 
-    expect(july17Row.settings).toEqual({ present: true, hasKey: true, lastFour: "5678" });
+    expect(july17Row.settings).toEqual({
+      present: true,
+      hasKey: true,
+      lastFour: "5678",
+      environment: "prod",
+    });
 
     // Never leaks the raw key.
     const serialized = JSON.stringify(report);
     expect(serialized).not.toContain("sk-original-key");
     expect(serialized).not.toContain("sk-pasted-key");
+  });
+
+  test("reports environment: staging for a settings row stored against staging (not hardcoded prod)", async () => {
+    const t = convexTest(schema, modules);
+    const email = "nabeel@sparkcapital.com";
+
+    const stagingUser = await seedUserWithData(t, "auth0|staging-report", email, {
+      conductorApiKey: "sk-staging-key-4321",
+      conductorEnvironment: "staging",
+    });
+
+    const report = await t.query(internal.admin.accountReport, { email });
+    const row = report.find((r) => r.userId === stagingUser)!;
+
+    expect(row.settings).toEqual({
+      present: true,
+      hasKey: true,
+      lastFour: "4321",
+      environment: "staging",
+    });
   });
 
   test("includes rows with no email at all (full-scan fallback)", async () => {
