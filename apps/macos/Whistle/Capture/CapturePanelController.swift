@@ -110,6 +110,13 @@ public final class CapturePanelController: NSObject, NSWindowDelegate {
     /// different app.
     private var previousFrontmostApp: NSRunningApplication?
 
+    /// The most recently started screenshot capture, if any. Cancelled
+    /// before a new one starts so rapid Clear -> dismiss -> reopen cycling
+    /// can't pile up unbounded concurrent captures for the same view
+    /// model -- the generation token already discards a stale *result*,
+    /// this bounds the *work in flight* to at most one tracked capture.
+    private var screenshotTask: Task<Void, Never>?
+
     public var onHistoryRequested: () -> Void = {}
     public var onSettingsRequested: () -> Void = {}
 
@@ -209,6 +216,9 @@ public final class CapturePanelController: NSObject, NSWindowDelegate {
 
         if preFill == nil, let panel, let viewModel {
             viewModel.updateSubmissionAuthState(authStateProvider())
+            if viewModel.needsFreshScreenshotOnNextOpen {
+                startScreenshotCapture(for: viewModel)
+            }
             viewModel.resumeDraft()
             showPanel(panel)
             onTimingMeasured(Date().timeIntervalSince(start))
@@ -220,24 +230,37 @@ public final class CapturePanelController: NSObject, NSWindowDelegate {
         // while a different draft is preserved).
         tearDownPanel()
 
-        // Screenshot fires BEFORE panel show (§4.2): async, never blocks
-        // panel display -- the thumbnail fades in once it resolves.
-        let screenshotTask = Task { await screenshotService.capture() }
-
         let (panel, viewModel) = makePanel()
         self.panel = panel
         self.viewModel = viewModel
 
         viewModel.updateSubmissionAuthState(authStateProvider())
+        // A duplicate can carry the source capture's screenshot. Preserve
+        // those bytes rather than replacing them with a screenshot of the
+        // current desktop.
+        if preFill?.screenshotData == nil {
+            // Screenshot fires BEFORE panel show (§4.2): async, never blocks
+            // panel display -- the thumbnail fades in once it resolves.
+            startScreenshotCapture(for: viewModel)
+        }
         viewModel.beginCapture(preFill: preFill)
         showPanel(panel)
 
         onTimingMeasured(Date().timeIntervalSince(start))
+    }
 
-        Task { [weak viewModel] in
-            let data = await screenshotTask.value
+    /// Starts a request before the panel is shown so it captures the app the
+    /// user was working in. The view model rejects a late result if Clear
+    /// began a newer capture while this request was in flight.
+    private func startScreenshotCapture(for viewModel: CaptureViewModel) {
+        let requestGeneration = viewModel.beginScreenshotRequest()
+        let screenshotService = screenshotService
+        screenshotTask?.cancel()
+        screenshotTask = Task { [weak viewModel] in
+            let data = await screenshotService.capture()
+            guard !Task.isCancelled else { return }
             await MainActor.run {
-                viewModel?.attachScreenshot(data)
+                viewModel?.attachScreenshot(data, requestGeneration: requestGeneration)
             }
         }
     }

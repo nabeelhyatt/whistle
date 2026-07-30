@@ -172,6 +172,13 @@ public final class CaptureViewModel: ObservableObject {
     /// Invalidates updates and completion callbacks from a stream that was
     /// stopped or superseded before they reach the main actor.
     private var transcriptionGeneration = 0
+    /// Each screenshot request gets an identity so a late result from before
+    /// Clear cannot repopulate the new capture with the old screenshot.
+    private var screenshotRequestGeneration = 0
+    /// Clear begins a new logical capture while leaving the panel open. Its
+    /// screenshot must be taken after the user next hides and reopens the
+    /// panel, so it captures the app they returned to rather than Whistle.
+    private(set) var needsFreshScreenshotOnNextOpen = false
 
     /// The transcription service's own running display text as of the last
     /// update, kept separately from `transcriptText` (the transcript field
@@ -218,7 +225,7 @@ public final class CaptureViewModel: ObservableObject {
     /// Screenshot capture itself happens in `CapturePanelController` BEFORE
     /// the panel is shown (TECH-SPEC §4.2 sequencing); this method receives
     /// the already-in-flight screenshot task's eventual result via
-    /// `attachScreenshot(_:)` rather than firing its own.
+    /// `attachScreenshot(_:requestGeneration:)` rather than firing its own.
     public func beginCapture(preFill: CapturePreFill? = nil) {
         captureBeganAt = Date()
         clientId = UUID().uuidString
@@ -307,18 +314,36 @@ public final class CaptureViewModel: ObservableObject {
         transcriptText = ""
         notesText = ""
         screenshotData = nil
+        screenshotRequestGeneration &+= 1
+        needsFreshScreenshotOnNextOpen = true
         lastServiceText = ""
         clientId = UUID().uuidString
         stopTranscription()
         startTranscriptionIfPermitted()
     }
 
-    /// Called by `CapturePanelController` when the pre-panel screenshot
-    /// (fired before `beginCapture`, per §4.2) resolves. Never invoked
-    /// again for the same open (no re-screenshot on duplicate trigger).
-    public func attachScreenshot(_ data: Data?) {
+    /// Applies a resolved screenshot. Only reached via the generation-
+    /// checked `attachScreenshot(_:requestGeneration:)` overload below --
+    /// callers outside this file must go through that overload so a result
+    /// superseded by `clear()` can never land here.
+    func attachScreenshot(_ data: Data?) {
         guard let data else { return }
         screenshotData = data
+    }
+
+    /// Starts a screenshot request for the current capture. The controller
+    /// calls this before it shows the panel, then returns the request token
+    /// when the asynchronous capture finishes.
+    func beginScreenshotRequest() -> Int {
+        screenshotRequestGeneration &+= 1
+        needsFreshScreenshotOnNextOpen = false
+        return screenshotRequestGeneration
+    }
+
+    /// Ignores a screenshot that belongs to a capture superseded by Clear.
+    func attachScreenshot(_ data: Data?, requestGeneration: Int) {
+        guard requestGeneration == screenshotRequestGeneration else { return }
+        attachScreenshot(data)
     }
 
     public func removeScreenshot() {
