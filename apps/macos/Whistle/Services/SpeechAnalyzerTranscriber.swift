@@ -372,6 +372,26 @@ final class LiveSpeechAnalyzerEngine: SpeechAnalyzerResultsEngine, @unchecked Se
     }
 
     func finish() async {
+        // Feed closure is the teardown linearization point, so it must happen
+        // FIRST — before `stateLock`, matching `cancel()` below.
+        //
+        // `appendAudio` takes only the feed's lock, never `stateLock`, and
+        // `SpeechAnalyzerTranscriber.stop()` reaches here through
+        // `await engine?.finish()`, which releases that actor — so a mic
+        // buffer can land concurrently with this prologue. Holding
+        // `stateLock` therefore does NOT exclude `appendAudio`: draining
+        // anywhere after `isClosed = true` leaves a window where a buffer
+        // acquires the feed lock, converts, and yields into the analyzer
+        // stream after teardown has begun. Closing the feed first is what
+        // actually shuts that path, because it is the lock `appendAudio`
+        // contends on.
+        //
+        // Still runs BEFORE `continuation?.finish()` below — the converter
+        // tail is yielded through the sink into that same continuation (the
+        // sink captured it directly in `startAnalysis()`, so clearing the
+        // `inputContinuation` field does not disturb it), and finishing the
+        // continuation first would silently drop the tail.
+        audioFeed.closeDrainingTail()
         stateLock.lock()
         isClosed = true
         let setupTask = setupTask
@@ -380,20 +400,6 @@ final class LiveSpeechAnalyzerEngine: SpeechAnalyzerResultsEngine, @unchecked Se
         self.resultsTask = nil
         let continuation = inputContinuation
         inputContinuation = nil
-        // Drained INSIDE the `stateLock` critical section, where the inline
-        // tail-drain used to live. `appendAudio` no longer consults this
-        // class's `isClosed` (the feed owns that decision now), so draining
-        // after the unlock would leave a window where a buffer arriving
-        // mid-teardown reaches the analyzer instead of being dropped —
-        // harmless in itself, but a behavior change on a crash-fix path.
-        // Nesting is safe: `AnalyzerAudioFeed` knows nothing about
-        // `stateLock`, and the sink only yields to the stream, so no path
-        // ever takes these two locks in the opposite order.
-        //
-        // Must also run BEFORE `continuation?.finish()` below — the
-        // converter tail is yielded through the sink into this same
-        // continuation, so finishing it first would silently drop the tail.
-        audioFeed.closeDrainingTail()
         stateLock.unlock()
         setupTask?.cancel()
         continuation?.finish()
