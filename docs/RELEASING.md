@@ -107,6 +107,14 @@ previous release, so this rollback path remains valid across the migration.
   cert secrets, sanity-check: `base64 -i <file>.p12 | wc -c` should be thousands of chars.
 - **Fresh secrets + immediate tag.** Setting a secret and tagging within ~2 minutes can race
   propagation. Set secrets, confirm `gh secret list`, then tag.
+- **A version bump on `main` does NOT mean the change you care about is on `main`.** Because
+  every PR bumps `MARKETING_VERSION` (AGENTS.md), concurrent PRs race for version numbers, and
+  whichever merges first claims the next one. Tagging then ships *that* PR, not yours. This
+  burned v1.0.15: an unrelated PR merged with the bump, the tag was cut from `main`, and the
+  release shipped without the change the version was meant to carry. Before tagging, confirm
+  the commit `main` points at actually contains your work — `git log origin/main --oneline -1`
+  plus a grep for something your change introduced — not just that the version number looks
+  right.
 - **Brief 404 window.** For the few seconds while `gh release create` uploads assets, the feed
   URL 404s. Harmless: Sparkle treats it as a failed check and retries on schedule, and the
   first-launch probe in `UpdateCoordinator.swift` does not retire a check on fetch failure.
