@@ -342,6 +342,37 @@ final class CaptureViewModelTests: XCTestCase {
         XCTAssertNotEqual(viewModel.clientId, clientIdBeforeClear, "Clear must mint a fresh clientId")
     }
 
+    @MainActor
+    func testClearRejectsScreenshotResultFromThePreviousCapture() throws {
+        let (store, tempDir) = try TestSupport.makeStore()
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let (viewModel, _) = TestSupport.makeViewModel(store: store)
+        viewModel.beginCapture()
+        let staleRequestGeneration = viewModel.beginScreenshotRequest()
+
+        viewModel.clear()
+        viewModel.attachScreenshot(TestSupport.sampleScreenshot, requestGeneration: staleRequestGeneration)
+
+        XCTAssertNil(viewModel.screenshotData)
+        XCTAssertTrue(viewModel.needsFreshScreenshotOnNextOpen)
+    }
+
+    @MainActor
+    func testCurrentScreenshotRequestAttachesItsResult() throws {
+        let (store, tempDir) = try TestSupport.makeStore()
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let (viewModel, _) = TestSupport.makeViewModel(store: store)
+        viewModel.beginCapture()
+        let requestGeneration = viewModel.beginScreenshotRequest()
+
+        viewModel.attachScreenshot(TestSupport.sampleScreenshot, requestGeneration: requestGeneration)
+
+        XCTAssertEqual(viewModel.screenshotData, TestSupport.sampleScreenshot)
+        XCTAssertFalse(viewModel.needsFreshScreenshotOnNextOpen)
+    }
+
     // MARK: Fix #4b/c: resumeDraft() restores an existing draft without
     // touching its content or re-fetching a screenshot.
 
@@ -1451,6 +1482,39 @@ final class CapturePanelControllerTests: XCTestCase {
         }
     }
 
+    @MainActor
+    func testDuplicateAsNewPreservesItsSuppliedScreenshotWithoutRecapturing() async throws {
+        let (store, tempDir) = try makeStore()
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let counter = CaptureCounter()
+        let controller = CapturePanelController(
+            store: store,
+            screenshotService: makeCountingScreenshotService(counter: counter),
+            micPermissionStatus: { .granted },
+            speechPermissionStatus: { .granted },
+            transcriptionServiceFactory: { FakeTranscriptionService() }
+        )
+        let screenshot = TestSupport.sampleScreenshot
+
+        controller.trigger(preFill: CapturePreFill(
+            transcript: "original transcript",
+            notes: "original notes",
+            screenshotData: screenshot
+        ))
+
+        // Give an incorrectly-fired recapture Task a chance to run before
+        // asserting its absence -- a synchronous assertion right here would
+        // pass even if trigger() wrongly spawned one, since the Task hasn't
+        // had a turn on the run loop yet.
+        let expectation = expectation(description: "give an incorrect recapture Task a chance to fire if it wrongly does")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { expectation.fulfill() }
+        await fulfillment(of: [expectation], timeout: 1)
+
+        XCTAssertEqual(controller.currentViewModel?.screenshotData, screenshot)
+        XCTAssertEqual(counter.count, 0, "duplicate-as-new must retain its supplied screenshot")
+    }
+
     // MARK: Fix #4b/c: dismissing (Esc / losing key) preserves the draft;
     // reopening restores it without retaking the screenshot.
 
@@ -1493,6 +1557,36 @@ final class CapturePanelControllerTests: XCTestCase {
                 "mode \(mode): reopening a preserved draft must not mint a new clientId"
             )
             XCTAssertEqual(counter.count, 1, "mode \(mode): reopening a preserved draft must not retake the screenshot")
+        }
+    }
+
+    @MainActor
+    func testClearThenDismissAndReopenCapturesANewScreenshot() async throws {
+        for mode in [CapturePanelMode.nonActivating, CapturePanelMode.activating] {
+            let (store, tempDir) = try makeStore()
+            defer { try? FileManager.default.removeItem(at: tempDir) }
+
+            let counter = CaptureCounter()
+            let controller = CapturePanelController(
+                store: store,
+                screenshotService: makeCountingScreenshotService(counter: counter),
+                mode: mode,
+                micPermissionStatus: { .granted },
+                speechPermissionStatus: { .granted },
+                transcriptionServiceFactory: { FakeTranscriptionService() }
+            )
+
+            controller.trigger()
+            try await waitForScreenshotCount(1, counter: counter)
+
+            controller.currentViewModel?.clear()
+            XCTAssertNil(controller.currentViewModel?.screenshotData, "clear must remove the previous screenshot")
+
+            controller.dismissPreservingDraftForTesting()
+            controller.trigger()
+
+            try await waitForScreenshotCount(2, counter: counter)
+            XCTAssertEqual(counter.count, 2, "mode \(mode): reopening after Clear must capture a new screenshot")
         }
     }
 
