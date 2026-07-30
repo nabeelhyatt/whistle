@@ -251,8 +251,19 @@ jobs:
           # the EdDSA signature binds to exact bytes, and this alias's contents
           # change every release.
           cp "$DMG" apps/macos/dist/Whistle.dmg
-          # A draft is invisible to `/releases/latest`. If an upload fails,
-          # delete it so a rerun can safely publish the complete asset set.
+          # Three-phase publish, so a failed run never wedges the tag and never
+          # deletes an already-published release:
+          #   1. create an EMPTY draft (invisible to `/releases/latest`);
+          #   2. arm cleanup only AFTER that draft exists;
+          #   3. upload the assets, then un-draft.
+          # `gh release create` uploads assets as a second step of the same
+          # command, so a mid-upload failure of a combined create+upload would
+          # leave a draft while the post-command `release_created=true` never
+          # ran — the trap would then skip cleanup and wedge the tag. Splitting
+          # create from upload lets the trap fire on an upload failure. And
+          # arming cleanup only after a successful create means a failed create
+          # (e.g. a release for this tag already exists on a rerun) leaves that
+          # existing release untouched.
           release_created=false
           cleanup_draft() {
             if [[ "$release_created" == true ]]; then
@@ -262,11 +273,12 @@ jobs:
           trap cleanup_draft ERR INT TERM
           gh release create "$GITHUB_REF_NAME" --draft \
             --title "Whistle $GITHUB_REF_NAME" \
-            --generate-notes \
+            --generate-notes
+          release_created=true
+          gh release upload "$GITHUB_REF_NAME" \
             "$DMG" \
             apps/macos/dist/Whistle.dmg \
             apps/macos/dist/appcast.xml \
             apps/macos/dist/appcast-item.xml
-          release_created=true
           gh release edit "$GITHUB_REF_NAME" --draft=false
           trap - ERR INT TERM
