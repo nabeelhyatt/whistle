@@ -19,6 +19,12 @@ on:
       - "packages/backend/**"
       - ".github/workflows/backend-deploy.yml"
 
+# Read-only GITHUB_TOKEN: this workflow only checks out and runs tests before
+# deploying, and the Convex deploy authenticates with CONVEX_DEPLOY_KEY rather
+# than the Actions token, so it needs nothing else.
+permissions:
+  contents: read
+
 concurrency:
   group: backend-deploy
   cancel-in-progress: false
@@ -37,6 +43,18 @@ jobs:
           node-version: 22
           cache: pnpm
       - run: pnpm install --frozen-lockfile
+
+      # Runs unconditionally (outside the HAS_DEPLOY_KEY gate below) so a
+      # broken backend fails this workflow even while deploys are still
+      # skipped for lack of a provisioned secret — otherwise a red backend
+      # would sit silently until the key showed up. The deploy step below
+      # still can't run past a failure here: its `if:` carries no status
+      # function, so Actions keeps the implicit `success()` check.
+      #
+      # -C form, not --filter: `pnpm --filter <pkg> <script>` exits 0 when the
+      # script or package doesn't match, which would turn this pre-deploy gate
+      # into a silent no-op if the script were ever renamed.
+      - run: pnpm -C packages/backend run test
 
       - name: Deploy to Convex
         if: env.HAS_DEPLOY_KEY == 'true'
