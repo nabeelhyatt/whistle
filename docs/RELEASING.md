@@ -1,6 +1,6 @@
 # Releasing Whistle
 
-How to cut a public release. Since v1.0.17 the release lives in **this repo** after the
+How to cut a public release. Since v1.0.18 the release lives in **this repo** after the
 one-time download-page cutover below — pushing a tag is then the entire process. Read this
 before tagging. First-time CI provisioning is in [`SECRETS.md`](../SECRETS.md).
 
@@ -59,10 +59,10 @@ item is in fact invalid XML: duplicate `length` attribute, since fixed).
 
 ## Cutting a release
 
-0. **Do the one-time download-page cutover before v1.0.17.** On the separately hosted
+0. **Do the one-time download-page cutover before v1.0.18.** On the separately hosted
    `nabeelhyatt.com/experiments/whistle` page, change the download button to
    `https://github.com/nabeelhyatt/whistle/releases/latest/download/Whistle.dmg`. Without this,
-   fresh downloads stay on v1.0.16 and keep checking the retired feed URL. This is the last
+   fresh downloads stay on v1.0.17 and keep checking the retired feed URL. This is the last
    required off-repo edit; do it once before this migration ships.
 1. **Bump the version.** In the PR with your app changes, bump `MARKETING_VERSION` in
    `apps/macos/project.yml` by one patch (per AGENTS.md "Version Bumping"). Merge to `main`.
@@ -124,9 +124,9 @@ previous release, so this rollback path remains valid across the migration.
   URL 404s. Harmless: Sparkle treats it as a failed check and retries on schedule, and the
   first-launch probe in `UpdateCoordinator.swift` does not retire a check on fetch failure.
 - **App is arm64-only, macOS 14+.** State this on the download page — Intel Macs can't run it.
-- **Pre-v1.0.17 installs are stranded.** Builds up to and including v1.0.16 baked in the old
+- **Pre-v1.0.18 installs are stranded.** Builds up to and including v1.0.17 baked in the old
   `nabeelhyatt.com/experiments/whistle/appcast.xml` feed URL, which is no longer maintained.
   There were no real users at cutover, so this was accepted rather than migrated; any such
-  install must be replaced by re-downloading. v1.0.17's run backfills a complete feed asset
-  onto v1.0.16 anyway, but only so the rollback path below works — no v1.0.16 install ever
+  install must be replaced by re-downloading. v1.0.18's run backfills a complete feed asset
+  onto v1.0.17 anyway, but only so the rollback path below works — no v1.0.17 install ever
   reads it.
