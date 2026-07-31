@@ -5,13 +5,15 @@
   "scripts": {
     "dev": "convex dev",
     "deploy": "convex deploy",
-    "test": "vitest run"
+    "test": "vitest run",
+    "typecheck": "tsc -p convex/tsconfig.json --noEmit"
   },
   "dependencies": {
     "convex": "1.42.1"
   },
   "devDependencies": {
     "@edge-runtime/vm": "5.0.0",
+    "@types/node": "20.19.43",
     "convex-test": "0.0.54",
     "typescript": "5.9.3",
     "vitest": "4.1.10"

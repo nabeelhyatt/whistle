@@ -2,7 +2,11 @@
 #
 # Two jobs, mirroring the local verification ladder (TECH-SPEC §2a
 # Definition of done):
-#   backend — vitest/convex-test matrix (packages/backend), ubuntu-latest
+#   backend — vitest/convex-test matrix (packages/backend), plus a
+#             `tsc --noEmit` typecheck and a `next build` of apps/web, on
+#             ubuntu-latest. No SwiftLint runs anywhere in this workflow —
+#             it was evaluated and explicitly rejected as not worth the
+#             noise; don't reintroduce that claim without adding the job.
 #   macos   — plain SPM `swift test` (packages/whistle-core), then
 #             xcodegen + `xcodebuild test` for the Whistle app target, both
 #             on a single macos-26 runner (one VM instead of two — macOS
@@ -31,6 +35,14 @@ on:
     branches: [main]
   pull_request:
 
+# Without an explicit block, GITHUB_TOKEN inherits the repository default,
+# which is broader than anything here needs — this repo is public, and the
+# macos job now uploads a log/.xcresult artifact on failure. Checkout and
+# upload-artifact both work with read-only contents; release.yml sets its
+# own `contents: write` because it actually creates releases.
+permissions:
+  contents: read
+
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -48,7 +60,19 @@ jobs:
           node-version: 22
           cache: pnpm
       - run: pnpm install --frozen-lockfile
-      - run: pnpm --filter backend test
+      # `pnpm -C <dir> run <script>` rather than `pnpm --filter <pkg> <script>`:
+      # --filter exits 0 when the script (or the package) doesn't match, so a
+      # renamed script or moved package would turn these gates into silent
+      # no-ops that still report green. The -C form exits 1 on a missing
+      # script — a gate that can't fail is worse than no gate.
+      - run: pnpm -C packages/backend run test
+      # Cheap type-level gates: these have no unit tests of their own but
+      # catch type-level breakage in convex/files.ts, convex/lib/auth.ts,
+      # convex/defaultTemplate.ts (backend typecheck) and in apps/web,
+      # which hosts the download page (production build), for near-zero
+      # CI cost.
+      - run: pnpm -C packages/backend run typecheck
+      - run: pnpm -C apps/web run build
 
   macos:
     name: macOS (swift test + xcodebuild test)
@@ -69,8 +93,50 @@ jobs:
         working-directory: apps/macos
         run: |
           set -o pipefail
+          # -derivedDataPath pins DerivedData to a workspace-local, clean
+          # directory instead of the shared ~/Library/Developer one. Without
+          # this, xcodebuild can pick up a stale/broken SPM checkout from a
+          # previous run and fail from cold on a fresh runner. .build/ is
+          # already in the root .gitignore.
           xcodebuild test \
             -project Whistle.xcodeproj \
             -scheme Whistle \
             -destination 'platform=macOS' \
+            -derivedDataPath .build/DerivedData \
+            -resultBundlePath .build/TestResults.xcresult \
+            | tee /tmp/xcodebuild.log \
             | tail -n 60
+
+      # `tail -n 60` above keeps the happy-path log short, but on failure the
+      # actual compile error or assertion is usually further up and gets cut
+      # off — whoever reads the log can't see the cause and ends up
+      # thrashing guessing. On failure, surface it directly instead.
+      - name: Show failure details
+        if: failure()
+        working-directory: apps/macos
+        run: |
+          # `if: failure()` fires for a failure in ANY earlier step — swift
+          # test, brew, xcodegen — in which case xcodebuild never ran and the
+          # log doesn't exist. Without this guard `tail` exits 1 and this
+          # diagnostic step fails too, adding noise to the failure it exists
+          # to explain.
+          if [ ! -f /tmp/xcodebuild.log ]; then
+            echo "No /tmp/xcodebuild.log — the failure was before the xcodebuild step; see that step's own output."
+            exit 0
+          fi
+          echo "=== Lines matching error/fail/BUILD FAILED ==="
+          grep -n -i -E "error:|fatal error|BUILD FAILED|failing tests?|Fatal error" /tmp/xcodebuild.log || true
+          echo ""
+          echo "=== Last 300 lines of xcodebuild.log ==="
+          tail -n 300 /tmp/xcodebuild.log
+
+      - name: Upload xcodebuild artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xcodebuild-results
+          path: |
+            /tmp/xcodebuild.log
+            apps/macos/.build/TestResults.xcresult
+          retention-days: 7
+          if-no-files-found: ignore
