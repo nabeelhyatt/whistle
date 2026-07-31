@@ -59,11 +59,12 @@ item is in fact invalid XML: duplicate `length` attribute, since fixed).
 
 ## Cutting a release
 
-0. **Do the one-time download-page cutover before v1.0.18.** On the separately hosted
-   `nabeelhyatt.com/experiments/whistle` page, change the download button to
-   `https://github.com/nabeelhyatt/whistle/releases/latest/download/Whistle.dmg`. Without this,
-   fresh downloads stay on v1.0.17 and keep checking the retired feed URL. This is the last
-   required off-repo edit; do it once before this migration ships.
+0. **One-time download-page cutover — DONE at the v1.0.18 cutover.** The download button on the
+   separately hosted `nabeelhyatt.com/experiments/whistle` page now points at the permanent
+   `https://github.com/nabeelhyatt/whistle/releases/latest/download/Whistle.dmg` (always resolves
+   to the newest release's copy), and the hand-maintained hosted `appcast.xml` is retired — the
+   live feed is now the GitHub-published one. This was the last required off-repo edit; the page
+   never needs touching again. Kept here for the record — future releases start at step 1.
 1. **Bump the version.** In the PR with your app changes, bump `MARKETING_VERSION` in
    `apps/macos/project.yml` by one patch (per AGENTS.md "Version Bumping"). Merge to `main`.
 2. **Tag and push.** From `main` at the merged commit:
