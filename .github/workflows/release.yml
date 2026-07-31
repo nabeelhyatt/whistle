@@ -1,14 +1,17 @@
 # release.yml — tag-triggered signed release (U11, TECH-SPEC §10).
 #
-# Builds the Whistle app, signs, notarizes, packages a DMG, generates a
-# Sparkle appcast entry, and uploads everything to a GitHub Release.
+# Builds the Whistle app, signs, notarizes, packages a DMG, and publishes it
+# to a GitHub Release together with the Sparkle appcast feed itself.
 #
-# EVERY credentialed step is ENV-GATED (TECH-SPEC §10): it checks its
-# secret first and skips with a logged reason when absent. The repo
-# currently has ZERO Actions secrets, so an un-provisioned run produces an
-# ad-hoc-signed, un-notarized DMG (not distributable) and an unsigned
-# appcast item — the workflow itself still succeeds. Provision the secrets
-# in SECRETS.md to get a full signed/notarized/published release.
+# THIS WORKFLOW IS THE ONLY PUBLISHING SURFACE — nothing is hand-edited on
+# any other host. SU_FEED_URL (apps/macos/Config/Sparkle.xcconfig) points at
+# https://github.com/<owner>/<repo>/releases/latest/download/appcast.xml, so
+# the `appcast.xml` asset created below IS the live update feed the moment the
+# release is published. See docs/RELEASING.md.
+#
+# A release must have signing, notarization, and Sparkle credentials. Publishing
+# a non-distributable DMG or a release without an appcast asset would make the
+# `latest` feed offer a broken update to every existing install.
 #
 # Required secrets for a FULL release (see SECRETS.md for provisioning):
 #   DEVELOPER_ID_P12_BASE64   Developer ID Application cert, base64 .p12
@@ -32,7 +35,9 @@ permissions:
   contents: write # create the GitHub Release + upload assets
 
 concurrency:
-  group: release-${{ github.ref }}
+  # GitHub's `latest` release is the live Sparkle feed. Different tags must
+  # not publish concurrently, or a slower older tag can replace that feed.
+  group: release
   cancel-in-progress: false
 
 jobs:
@@ -46,12 +51,23 @@ jobs:
       HAS_SPARKLE_KEY: ${{ secrets.SPARKLE_ED_PRIVATE_KEY != '' }}
       SPARKLE_VERSION: 2.9.4 # keep in lockstep with project.yml's pin
     steps:
+      # The published release is the live update feed, so every distribution
+      # credential is mandatory. Checked before the ~10-minute build.
+      # Checked before the ~10-minute build so it fails fast.
+      - name: Require distribution credentials
+        if: env.HAS_SIGNING != 'true' || env.HAS_NOTARY != 'true' || env.HAS_SPARKLE_KEY != 'true'
+        run: |
+          echo "ERROR: release credentials are incomplete (see SECRETS.md)." >&2
+          echo "A published release must be Developer-ID signed, notarized, and" >&2
+          echo "Sparkle-signed; otherwise the live feed can offer a broken update." >&2
+          exit 1
+
       - uses: actions/checkout@v4
 
       - name: Install xcodegen
         run: brew install xcodegen
 
-      # ---- Codesigning cert (env-gated) ----------------------------------
+      # ---- Codesigning certificate ----------------------------------------
       - name: Import Developer ID certificate
         if: env.HAS_SIGNING == 'true'
         env:
@@ -73,11 +89,7 @@ jobs:
           security list-keychains -d user -s "$KEYCHAIN_PATH" login.keychain-db
           rm -f "$RUNNER_TEMP/developer_id.p12"
 
-      - name: Skip cert import (no signing secrets)
-        if: env.HAS_SIGNING != 'true'
-        run: echo "SKIP Developer ID cert import — DEVELOPER_ID_P12_BASE64 / DEVELOPER_ID_P12_PASSWORD not provisioned (see SECRETS.md). Build will be ad-hoc signed."
-
-      # ---- Notary key (env-gated) -----------------------------------------
+      # ---- Notary key ------------------------------------------------------
       - name: Materialize notary API key
         if: env.HAS_NOTARY == 'true'
         env:
@@ -91,15 +103,12 @@ jobs:
             echo "NOTARY_ISSUER_ID=${{ secrets.NOTARY_ISSUER_ID }}"
           } >> "$GITHUB_ENV"
 
-      - name: Skip notary setup (no notary secrets)
-        if: env.HAS_NOTARY != 'true'
-        run: echo "SKIP notarization setup — NOTARY_KEY_ID / NOTARY_ISSUER_ID / NOTARY_KEY_P8_BASE64 not provisioned (see SECRETS.md)."
-
       # ---- Build / sign / DMG / notarize ----------------------------------
-      # package-dmg.sh env-gates internally: it falls back to ad-hoc signing
-      # when no Developer ID identity is in the keychain and skips
-      # notarization when NOTARY_* are unset.
+      # package-dmg.sh verifies the imported Developer ID identity and submits
+      # the DMG using the notarization credentials prepared above.
       - name: Package DMG
+        env:
+          REQUIRE_DISTRIBUTION: "true"
         run: ./apps/macos/Scripts/package-dmg.sh
 
       - name: Locate artifact
@@ -116,9 +125,8 @@ jobs:
           echo "dmg=$DMG" >> "$GITHUB_OUTPUT"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
-      # ---- Sparkle appcast entry (env-gated) -------------------------------
+      # ---- Sparkle appcast (REQUIRED — the feed IS a release asset) --------
       - name: Sign update & generate appcast item
-        if: env.HAS_SPARKLE_KEY == 'true'
         env:
           SPARKLE_ED_PRIVATE_KEY: ${{ secrets.SPARKLE_ED_PRIVATE_KEY }}
           DMG: ${{ steps.artifact.outputs.dmg }}
@@ -150,12 +158,97 @@ jobs:
               type="application/octet-stream" />
           </item>
           ITEM
-          echo "Appcast item written to apps/macos/dist/appcast-item.xml —"
-          echo "merge it into apps/web/public/appcast.xml and deploy the web app to publish the update."
+          echo "Appcast item written to apps/macos/dist/appcast-item.xml"
 
-      - name: Skip appcast signing (no Sparkle key)
-        if: env.HAS_SPARKLE_KEY != 'true'
-        run: echo "SKIP Sparkle appcast entry — SPARKLE_ED_PRIVATE_KEY not provisioned (see SECRETS.md). Update cannot be offered to existing installs without it."
+      # Wraps the signed item in a complete feed published as the `appcast.xml`
+      # release asset, which is what SU_FEED_URL
+      # (…/releases/latest/download/appcast.xml) resolves to. The feed carries
+      # only the CURRENT release: Sparkle offers the newest applicable item, all
+      # releases share minimumSystemVersion 14.0, and no item carries release
+      # notes, so historical items would change nothing. Each release keeps its
+      # own appcast-item.xml asset, so history stays reconstructible.
+      # (Concatenating history was tried and rejected: v1.0.9's published item
+      # has a duplicate `length` attribute — see the note above — so it is
+      # invalid XML, and one bad historical asset would break every future
+      # release's feed.)
+      - name: Assemble appcast feed
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # sparkle:version must strictly increase or Sparkle never offers the
+          # update. Resolve the prior release the SAME way GitHub resolves
+          # /releases/latest (the URL the feed is served from) rather than by
+          # list order, so the monotonicity baseline, any backfill target, and
+          # the feed the app actually fetches are all the same release. Empty
+          # means there is no published release yet (this is the first release).
+          BUILD_NUMBER="$(grep -o '<sparkle:version>[^<]*' apps/macos/dist/appcast-item.xml | sed 's/.*>//')"
+          PRIOR_TAG="$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" -q '.tag_name' 2>/dev/null || true)"
+          if [[ -n "$PRIOR_TAG" ]]; then
+            gh release download "$PRIOR_TAG" --pattern appcast-item.xml \
+              --output "$RUNNER_TEMP/prior-item.xml"
+            PRIOR="$(grep -o '<sparkle:version>[^<]*' "$RUNNER_TEMP/prior-item.xml" | sed 's/.*>//')"
+            version_is_greater() {
+              local candidate="$1"
+              local prior="$2"
+              local i candidate_part prior_part
+              local -a candidate_parts prior_parts
+              IFS=. read -r -a candidate_parts <<< "$candidate"
+              IFS=. read -r -a prior_parts <<< "$prior"
+              for ((i = 0; i < ${#candidate_parts[@]} || i < ${#prior_parts[@]}; i++)); do
+                candidate_part="${candidate_parts[i]:-0}"
+                prior_part="${prior_parts[i]:-0}"
+                [[ "$candidate_part" =~ ^[0-9]+$ && "$prior_part" =~ ^[0-9]+$ ]] || return 2
+                if ((10#$candidate_part > 10#$prior_part)); then return 0; fi
+                if ((10#$candidate_part < 10#$prior_part)); then return 1; fi
+              done
+              return 1
+            }
+            if ! version_is_greater "$BUILD_NUMBER" "$PRIOR"; then
+              echo "ERROR: sparkle:version $BUILD_NUMBER does not exceed $PRIOR_TAG's $PRIOR —" >&2
+              echo "Sparkle would never offer this update. Bump MARKETING_VERSION." >&2
+              exit 1
+            fi
+            echo "sparkle:version $BUILD_NUMBER > $PRIOR_TAG's $PRIOR"
+          else
+            echo "No prior release to compare against (first release)."
+          fi
+          write_feed() {
+            local item="$1"
+            local output="$2"
+            {
+            printf '%s\n' '<?xml version="1.0" encoding="utf-8"?>' \
+              '<rss version="2.0" xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle">' \
+              '  <channel>' \
+              '    <title>Whistle</title>' \
+              "    <link>https://github.com/${GITHUB_REPOSITORY}/releases/latest/download/appcast.xml</link>" \
+              '    <description>Sparkle update feed for the Whistle macOS app.</description>' \
+              '    <language>en</language>'
+              sed 's/^/    /' "$item"
+            printf '%s\n' '  </channel>' '</rss>'
+            } > "$output"
+          }
+          write_feed apps/macos/dist/appcast-item.xml apps/macos/dist/appcast.xml
+          xmllint --noout apps/macos/dist/appcast.xml
+          if [[ -n "$PRIOR_TAG" ]]; then
+            # Releases published before the GitHub-hosted feed have an
+            # appcast-item.xml but no complete appcast.xml, so deleting THIS
+            # release would roll `latest` back to a 404-ing feed. Backfill a
+            # complete feed onto such a prior release once. Skip it when the
+            # prior release already has its own appcast.xml — clobbering a good
+            # live feed on every release is needless risk for no benefit.
+            PRIOR_ASSETS="$(gh release view "$PRIOR_TAG" --json assets -q '.assets[].name')"
+            if ! grep -Fqx 'appcast.xml' <<< "$PRIOR_ASSETS"; then
+              echo "Backfilling a complete appcast.xml onto $PRIOR_TAG (predates the GitHub-hosted feed)."
+              write_feed "$RUNNER_TEMP/prior-item.xml" "$RUNNER_TEMP/appcast.xml"
+              xmllint --noout "$RUNNER_TEMP/appcast.xml"
+              gh release upload "$PRIOR_TAG" "$RUNNER_TEMP/appcast.xml" --clobber
+            else
+              echo "$PRIOR_TAG already has appcast.xml — no backfill needed."
+            fi
+          fi
+          echo "--- apps/macos/dist/appcast.xml ---"
+          cat apps/macos/dist/appcast.xml
 
       # ---- Publish -----------------------------------------------------------
       - name: Create GitHub Release
@@ -164,9 +257,43 @@ jobs:
           DMG: ${{ steps.artifact.outputs.dmg }}
         run: |
           set -euo pipefail
-          ASSETS=("$DMG")
-          [[ -f apps/macos/dist/appcast-item.xml ]] && ASSETS+=(apps/macos/dist/appcast-item.xml)
-          gh release create "$GITHUB_REF_NAME" \
+          # Whistle.dmg is an unversioned COPY so the download page can link to a
+          # permanent …/releases/latest/download/Whistle.dmg and never be edited
+          # again. The appcast <enclosure> keeps pointing at the VERSIONED asset —
+          # the EdDSA signature binds to exact bytes, and this alias's contents
+          # change every release.
+          cp "$DMG" apps/macos/dist/Whistle.dmg
+          # Three-phase publish, so a failed run never wedges the tag and never
+          # deletes an already-published release:
+          #   1. create an EMPTY draft (invisible to `/releases/latest`);
+          #   2. arm cleanup only AFTER that draft exists;
+          #   3. upload the assets, then un-draft.
+          # `gh release create` uploads assets as a second step of the same
+          # command, so a mid-upload failure of a combined create+upload would
+          # leave a draft while the post-command `release_created=true` never
+          # ran — the trap would then skip cleanup and wedge the tag. Splitting
+          # create from upload lets the trap fire on an upload failure. And
+          # arming cleanup only after a successful create means a failed create
+          # (e.g. a release for this tag already exists on a rerun) leaves that
+          # existing release untouched.
+          release_created=false
+          cleanup_draft() {
+            if [[ "$release_created" == true ]]; then
+              gh release delete "$GITHUB_REF_NAME" --yes 2>/dev/null || true
+            fi
+          }
+          trap cleanup_draft ERR INT TERM
+          gh release create "$GITHUB_REF_NAME" --draft \
             --title "Whistle $GITHUB_REF_NAME" \
-            --generate-notes \
-            "${ASSETS[@]}"
+            --generate-notes
+          release_created=true
+          gh release upload "$GITHUB_REF_NAME" \
+            "$DMG" \
+            apps/macos/dist/Whistle.dmg \
+            apps/macos/dist/appcast.xml \
+            apps/macos/dist/appcast-item.xml
+          # --latest pins this as the release /releases/latest resolves to, so
+          # the served feed, the next run's monotonicity baseline, and rollback
+          # all agree on one release.
+          gh release edit "$GITHUB_REF_NAME" --draft=false --latest
+          trap - ERR INT TERM

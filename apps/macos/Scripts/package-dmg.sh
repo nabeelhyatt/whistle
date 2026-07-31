@@ -27,6 +27,8 @@
 #   NOTARY_KEY_PATH   Path to the ASC API .p8 private key
 #   SIGN_IDENTITY     codesign identity substring (default below)
 #   CONFIGURATION     xcodebuild configuration (default Release)
+#   REQUIRE_DISTRIBUTION  fail instead of producing an ad-hoc or
+#                         unnotarized DMG (set by release.yml)
 
 set -euo pipefail
 
@@ -38,6 +40,7 @@ REPO_ROOT="$(cd "$MACOS_DIR/../.." && pwd)"
 
 CONFIGURATION="${CONFIGURATION:-Release}"
 SIGN_IDENTITY="${SIGN_IDENTITY:-Developer ID Application}"
+REQUIRE_DISTRIBUTION="${REQUIRE_DISTRIBUTION:-false}"
 DIST_DIR="$MACOS_DIR/dist"
 DERIVED_DATA="$DIST_DIR/DerivedData"
 
@@ -98,6 +101,10 @@ HAVE_SIGNING_IDENTITY=0
 if codesign -dvvv "$APP_PATH" 2>&1 | grep -q '^Authority='; then
   HAVE_SIGNING_IDENTITY=1
 fi
+if [[ "$REQUIRE_DISTRIBUTION" == true && "$HAVE_SIGNING_IDENTITY" != 1 ]]; then
+  log "ERROR: distribution build requires a valid Developer ID signing identity"
+  exit 1
+fi
 
 # --- Package the DMG ------------------------------------------------------------
 DMG_PATH="$DIST_DIR/Whistle-$VERSION.dmg"
@@ -122,14 +129,26 @@ fi
 # --- Notarize + staple (env-gated) ----------------------------------------------
 notarize() {
   if [[ -z "${NOTARY_KEY_ID:-}" || -z "${NOTARY_ISSUER_ID:-}" || -z "${NOTARY_KEY_PATH:-}" ]]; then
+    if [[ "$REQUIRE_DISTRIBUTION" == true ]]; then
+      log "ERROR: distribution build requires notarization credentials"
+      return 1
+    fi
     log "SKIP notarization: NOTARY_KEY_ID / NOTARY_ISSUER_ID / NOTARY_KEY_PATH not all set (see SECRETS.md)"
     return 0
   fi
   if [[ ! -f "$NOTARY_KEY_PATH" ]]; then
+    if [[ "$REQUIRE_DISTRIBUTION" == true ]]; then
+      log "ERROR: distribution build cannot find the notarization key"
+      return 1
+    fi
     log "SKIP notarization: key file not found at NOTARY_KEY_PATH=$NOTARY_KEY_PATH"
     return 0
   fi
   if [[ "$HAVE_SIGNING_IDENTITY" != 1 ]]; then
+    if [[ "$REQUIRE_DISTRIBUTION" == true ]]; then
+      log "ERROR: distribution build requires Developer ID signing before notarization"
+      return 1
+    fi
     log "SKIP notarization: app is ad-hoc signed (Apple only notarizes Developer ID signed artifacts)"
     return 0
   fi
