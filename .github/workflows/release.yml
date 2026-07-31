@@ -177,14 +177,14 @@ jobs:
         run: |
           set -euo pipefail
           # sparkle:version must strictly increase or Sparkle never offers the
-          # update. Compare against the release that `latest` points at today.
+          # update. Resolve the prior release the SAME way GitHub resolves
+          # /releases/latest (the URL the feed is served from) rather than by
+          # list order, so the monotonicity baseline, any backfill target, and
+          # the feed the app actually fetches are all the same release. Empty
+          # means there is no published release yet (this is the first release).
           BUILD_NUMBER="$(grep -o '<sparkle:version>[^<]*' apps/macos/dist/appcast-item.xml | sed 's/.*>//')"
-          PRIOR_TAG="$(gh release list --limit 1 --exclude-drafts --exclude-pre-releases \
-            --json tagName -q '.[0].tagName // empty')"
+          PRIOR_TAG="$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" -q '.tag_name' 2>/dev/null || true)"
           if [[ -n "$PRIOR_TAG" ]]; then
-            # The release before this migration has an item but no complete
-            # feed. Build and upload one before publishing, so deleting this
-            # release really rolls `latest` back to a working appcast.
             gh release download "$PRIOR_TAG" --pattern appcast-item.xml \
               --output "$RUNNER_TEMP/prior-item.xml"
             PRIOR="$(grep -o '<sparkle:version>[^<]*' "$RUNNER_TEMP/prior-item.xml" | sed 's/.*>//')"
@@ -231,9 +231,21 @@ jobs:
           write_feed apps/macos/dist/appcast-item.xml apps/macos/dist/appcast.xml
           xmllint --noout apps/macos/dist/appcast.xml
           if [[ -n "$PRIOR_TAG" ]]; then
-            write_feed "$RUNNER_TEMP/prior-item.xml" "$RUNNER_TEMP/appcast.xml"
-            xmllint --noout "$RUNNER_TEMP/appcast.xml"
-            gh release upload "$PRIOR_TAG" "$RUNNER_TEMP/appcast.xml" --clobber
+            # Releases published before the GitHub-hosted feed have an
+            # appcast-item.xml but no complete appcast.xml, so deleting THIS
+            # release would roll `latest` back to a 404-ing feed. Backfill a
+            # complete feed onto such a prior release once. Skip it when the
+            # prior release already has its own appcast.xml — clobbering a good
+            # live feed on every release is needless risk for no benefit.
+            PRIOR_ASSETS="$(gh release view "$PRIOR_TAG" --json assets -q '.assets[].name')"
+            if ! grep -Fqx 'appcast.xml' <<< "$PRIOR_ASSETS"; then
+              echo "Backfilling a complete appcast.xml onto $PRIOR_TAG (predates the GitHub-hosted feed)."
+              write_feed "$RUNNER_TEMP/prior-item.xml" "$RUNNER_TEMP/appcast.xml"
+              xmllint --noout "$RUNNER_TEMP/appcast.xml"
+              gh release upload "$PRIOR_TAG" "$RUNNER_TEMP/appcast.xml" --clobber
+            else
+              echo "$PRIOR_TAG already has appcast.xml — no backfill needed."
+            fi
           fi
           echo "--- apps/macos/dist/appcast.xml ---"
           cat apps/macos/dist/appcast.xml
@@ -280,5 +292,8 @@ jobs:
             apps/macos/dist/Whistle.dmg \
             apps/macos/dist/appcast.xml \
             apps/macos/dist/appcast-item.xml
-          gh release edit "$GITHUB_REF_NAME" --draft=false
+          # --latest pins this as the release /releases/latest resolves to, so
+          # the served feed, the next run's monotonicity baseline, and rollback
+          # all agree on one release.
+          gh release edit "$GITHUB_REF_NAME" --draft=false --latest
           trap - ERR INT TERM
