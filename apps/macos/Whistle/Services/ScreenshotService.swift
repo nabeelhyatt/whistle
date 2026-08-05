@@ -7,6 +7,15 @@
 // (that's an onboarding/upsell concern, §4.1 OnboardingWindow) — this
 // service only *checks* via `CGPreflightScreenCaptureAccess()` and backs
 // off to `nil` when it's not granted.
+//
+// Screenshot-before-panel ordering: `capture(onCaptureStarted:)` fires a
+// one-shot acknowledgement the instant the ScreenCaptureKit request is
+// submitted (or, on any no-image path, immediately) so the caller can
+// present its capture panel AFTER the frame request is in flight but
+// WITHOUT waiting for image bytes or JPEG encoding. Submission-before-show
+// narrows the WindowServer race but isn't a hard guarantee, so the real
+// capturer also excludes Whistle's own app from the content filter — a
+// frame sampled even after the panel appears can never contain it.
 
 import AppKit
 import CoreGraphics
@@ -37,20 +46,50 @@ public protocol DisplayImageCapturing: Sendable {
     /// Returns the raw captured image for the display under the cursor, or
     /// `nil` if capture failed for any reason (no displays, SCK error,
     /// etc.) — never throws.
-    func captureDisplayUnderCursor() async -> CGImage?
+    ///
+    /// `onCaptureStarted` fires EXACTLY ONCE on every path, on an arbitrary
+    /// thread: immediately after the `SCScreenshotManager` request is
+    /// submitted, or immediately before returning `nil` on any failure path
+    /// (content fetch failed, no display). Semantics: "presenting UI can no
+    /// longer contaminate this capture." A conformance that fires it more
+    /// than once is tolerated (the sole caller's completion is idempotent);
+    /// a conformance that never fires it is covered by the caller's timeout.
+    func captureDisplayUnderCursor(onCaptureStarted: @escaping @Sendable () -> Void) async -> CGImage?
+}
+
+public extension DisplayImageCapturing {
+    /// Source-compat convenience for callers that don't need the ack.
+    func captureDisplayUnderCursor() async -> CGImage? {
+        await captureDisplayUnderCursor(onCaptureStarted: {})
+    }
 }
 
 /// Real `ScreenCaptureKit`-backed capturer.
 public struct SCKitDisplayImageCapturer: DisplayImageCapturing {
     public init() {}
 
-    public func captureDisplayUnderCursor() async -> CGImage? {
-        guard let content = try? await SCShareableContent.current else { return nil }
+    public func captureDisplayUnderCursor(onCaptureStarted: @escaping @Sendable () -> Void) async -> CGImage? {
+        guard let content = try? await SCShareableContent.current else {
+            onCaptureStarted()
+            return nil
+        }
         guard let display = Self.displayUnderCursor(in: content.displays) ?? content.displays.first else {
+            onCaptureStarted()
             return nil
         }
 
-        let filter = SCContentFilter(display: display, excludingWindows: [])
+        // Exclude Whistle's own app from the capture so the panel (and any
+        // other Whistle window, e.g. History/Settings) can never appear in
+        // the frame — the invariant that submit-before-show alone can't
+        // guarantee across the WindowServer's independent request channels.
+        let selfApp = content.applications.first {
+            $0.processID == ProcessInfo.processInfo.processIdentifier
+        }
+        let filter = SCContentFilter(
+            display: display,
+            excludingApplications: selfApp.map { [$0] } ?? [],
+            exceptingWindows: []
+        )
         let config = SCStreamConfiguration()
         config.width = max(1, Int(display.width))
         config.height = max(1, Int(display.height))
@@ -60,6 +99,8 @@ public struct SCKitDisplayImageCapturer: DisplayImageCapturing {
             SCScreenshotManager.captureImage(contentFilter: filter, configuration: config) { image, _ in
                 continuation.resume(returning: image)
             }
+            // Request submitted — safe to present UI now, ahead of the image.
+            onCaptureStarted()
         }
     }
 
@@ -104,9 +145,18 @@ public struct ScreenshotService: Sendable {
     /// access isn't granted, or if capture/encode fails for any reason —
     /// this service never throws and never itself prompts for TCC (per
     /// TECH-SPEC §4.1/§4.3, prompting is an onboarding-only concern).
-    public func capture() async -> Data? {
-        guard preflight.isScreenCaptureAccessGranted() else { return nil }
-        guard let image = await capturer.captureDisplayUnderCursor() else { return nil }
+    ///
+    /// `onCaptureStarted` fires exactly once as soon as it is safe to present
+    /// UI (request submitted, or no capture will occur), so the caller can
+    /// show its panel ahead of image delivery — see the file header.
+    public func capture(onCaptureStarted: @escaping @Sendable () -> Void = {}) async -> Data? {
+        guard preflight.isScreenCaptureAccessGranted() else {
+            onCaptureStarted()
+            return nil
+        }
+        guard let image = await capturer.captureDisplayUnderCursor(onCaptureStarted: onCaptureStarted) else {
+            return nil
+        }
         return Self.encode(image)
     }
 
