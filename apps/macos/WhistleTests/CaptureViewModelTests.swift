@@ -162,6 +162,19 @@ private enum TestSupport {
     static let project1 = Project(id: "proj-1", name: "Project One", gitRemote: "git@example.com:one.git")
     static let project2 = Project(id: "proj-2", name: "Project Two", gitRemote: "git@example.com:two.git")
 
+    /// Multi-org fixtures (multi-org plan) -- two projects, each from a
+    /// different labeled Conductor org key, so a test can pin `submit()`'s
+    /// `orgId` threading and confirm selection fallback stays keyed by
+    /// `projectId` (never `orgId`) even across orgs.
+    static let projectOrgA = Project(
+        id: "proj-org-a-1", name: "Org A Project", gitRemote: "git@example.com:org-a-1.git",
+        orgId: "org-a", orgLabel: "Org A"
+    )
+    static let projectOrgB = Project(
+        id: "proj-org-b-1", name: "Org B Project", gitRemote: "git@example.com:org-b-1.git",
+        orgId: "org-b", orgLabel: "Org B"
+    )
+
     /// - Parameters:
     ///   - micStatus/speechStatus: the tri-state TCC status each permission
     ///     reports (reset-deadlock fix: `.notDetermined` is distinct from
@@ -252,6 +265,51 @@ final class CaptureViewModelTests: XCTestCase {
         if let path = draft?.screenshotPath {
             XCTAssertEqual(store.screenshotData(atPath: path), TestSupport.sampleScreenshot)
         }
+    }
+
+    // MARK: Happy: submit threads the selected project's orgId onto the draft (multi-org plan)
+
+    @MainActor
+    func testSubmitPopulatesDraftOrgIdFromSelectedProject() throws {
+        let (store, tempDir) = try TestSupport.makeStore()
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+        try store.saveProjectsSnapshot([TestSupport.projectOrgA, TestSupport.projectOrgB])
+
+        let (viewModel, _) = TestSupport.makeViewModel(store: store)
+        viewModel.beginCapture()
+        viewModel.transcriptText = "a transcript"
+        viewModel.selectProject(TestSupport.projectOrgB.id)
+
+        let result = viewModel.submit()
+        guard case .submitted(let clientId) = result else {
+            XCTFail("expected .submitted")
+            return
+        }
+
+        let draft = try store.draft(clientId: clientId)
+        XCTAssertEqual(draft?.projectId, TestSupport.projectOrgB.id)
+        XCTAssertEqual(draft?.orgId, TestSupport.projectOrgB.orgId)
+    }
+
+    @MainActor
+    func testSubmitLeavesDraftOrgIdNilForALegacyProjectWithNoOrg() throws {
+        let (store, tempDir) = try TestSupport.makeStore()
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+        try store.saveProjectsSnapshot([TestSupport.project1])
+
+        let (viewModel, _) = TestSupport.makeViewModel(store: store)
+        viewModel.beginCapture()
+        viewModel.transcriptText = "a transcript"
+        viewModel.selectProject(TestSupport.project1.id)
+
+        let result = viewModel.submit()
+        guard case .submitted(let clientId) = result else {
+            XCTFail("expected .submitted")
+            return
+        }
+
+        let draft = try store.draft(clientId: clientId)
+        XCTAssertNil(draft?.orgId, "a pre-multi-org project (nil orgId/orgLabel) must not synthesize one")
     }
 
     // MARK: Edge: submit disabled when all empty; enabled for screenshot-only with auto-note
@@ -1146,6 +1204,24 @@ final class CaptureViewModelTests: XCTestCase {
         viewModel.beginCapture()
 
         XCTAssertEqual(viewModel.selectedProjectId, TestSupport.project1.id)
+    }
+
+    @MainActor
+    func testFallsBackToFirstProjectAcrossMultipleOrgsSelectionStaysKeyedByProjectId() throws {
+        let (store, tempDir) = try TestSupport.makeStore()
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+        try store.saveProjectsSnapshot([TestSupport.projectOrgA, TestSupport.projectOrgB])
+
+        let (viewModel, _) = TestSupport.makeViewModel(store: store)
+        viewModel.beginCapture()
+
+        // Selection/fallback stays keyed by projectId -- multi-org grouping
+        // is a `ProjectPicker.rail` presentation concern only, never part of
+        // this selection logic.
+        XCTAssertEqual(viewModel.selectedProjectId, TestSupport.projectOrgA.id)
+
+        viewModel.selectProject(TestSupport.projectOrgB.id)
+        XCTAssertEqual(try store.lastUsedProjectId(), TestSupport.projectOrgB.id)
     }
 
     // MARK: Happy: pre-fill (duplicate-as-new-capture) populates fields, focuses picker, mints new clientId

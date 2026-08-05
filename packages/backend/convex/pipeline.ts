@@ -30,7 +30,6 @@ import {
   type ConductorCreds,
   type ConductorMessage,
 } from "./conductorClient";
-import { credsFromSettings } from "./settings";
 import { renderTemplate } from "./promptRenderer";
 
 // ─── Tunables (TECH-SPEC §6) ────────────────────────────────────────────
@@ -359,19 +358,22 @@ async function runSubmit(
     return;
   }
 
-  const settings = await ctx.runQuery(
-    internal.pipelineInternal.getSettingsInternal,
-    { userId: capture.userId },
+  const credsResult = await ctx.runQuery(
+    internal.pipelineInternal.credsForCaptureInternal,
+    { userId: capture.userId, orgId: capture.orgId, projectId: capture.projectId },
   );
-  const creds = credsFromSettings(settings ?? undefined);
-  if (creds === undefined) {
+  if (!credsResult.ok) {
     await patchCapture(ctx, captureId, {
       status: "failed",
       errorCode: "auth",
-      error: "No Conductor API key configured.",
+      error: credsResult.error,
     });
     return;
   }
+  const creds = {
+    apiKey: credsResult.apiKey,
+    environment: credsResult.environment,
+  };
 
   const template = await ctx.runQuery(
     internal.pipelineInternal.getTemplateInternal,
@@ -419,11 +421,14 @@ async function runSubmit(
     // Settings-routing message instead. Runs only on a fresh submit (no
     // workspaceId yet); adopted/created captures skip it on later passes.
     if (!(await projectVisibleToKey(creds, capture.projectId))) {
+      const keyName =
+        credsResult.orgLabel !== undefined
+          ? `your "${credsResult.orgLabel}" API key`
+          : "your saved API key";
       await patchCapture(ctx, captureId, {
         status: "failed",
         errorCode: "auth",
-        error:
-          "This capture's Conductor project isn't visible to your saved API key — the key may belong to a different Conductor account. Update it in Settings.",
+        error: `This capture's Conductor project isn't visible to ${keyName} — the key may belong to a different Conductor account or organization. Update it in Settings.`,
       });
       return;
     }
@@ -643,19 +648,26 @@ export const awaitWorkspaceReady = internalAction({
         return;
       }
 
-      const settings = await ctx.runQuery(
-        internal.pipelineInternal.getSettingsInternal,
-        { userId: capture.userId },
+      const credsResult = await ctx.runQuery(
+        internal.pipelineInternal.credsForCaptureInternal,
+        {
+          userId: capture.userId,
+          orgId: capture.orgId,
+          projectId: capture.projectId,
+        },
       );
-      const creds = credsFromSettings(settings ?? undefined);
-      if (creds === undefined) {
+      if (!credsResult.ok) {
         await patchCapture(ctx, args.captureId, {
           status: "failed",
           errorCode: "auth",
-          error: "No Conductor API key configured.",
+          error: credsResult.error,
         });
         return;
       }
+      const creds = {
+        apiKey: credsResult.apiKey,
+        environment: credsResult.environment,
+      };
 
       const elapsedMs = args.pollCount * AWAIT_READY_INITIAL_MS;
       const status = await getWorkspaceStatus(creds, capture.workspaceId);
@@ -768,19 +780,22 @@ async function runWatch(
     return;
   }
 
-  const settings = await ctx.runQuery(
-    internal.pipelineInternal.getSettingsInternal,
-    { userId: capture.userId },
+  const credsResult = await ctx.runQuery(
+    internal.pipelineInternal.credsForCaptureInternal,
+    { userId: capture.userId, orgId: capture.orgId, projectId: capture.projectId },
   );
-  const creds = credsFromSettings(settings ?? undefined);
-  if (creds === undefined) {
+  if (!credsResult.ok) {
     await patchCapture(ctx, captureId, {
       status: "failed",
       errorCode: "auth",
-      error: "No Conductor API key configured.",
+      error: credsResult.error,
     });
     return;
   }
+  const creds = {
+    apiKey: credsResult.apiKey,
+    environment: credsResult.environment,
+  };
 
   const sessionStatus = await getSessionStatus(creds, capture.sessionId!);
 

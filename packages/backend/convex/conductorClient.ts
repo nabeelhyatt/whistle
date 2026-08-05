@@ -422,6 +422,45 @@ export async function listWorkspaceSessions(
   });
 }
 
+export interface ConductorMe {
+  organizationId?: string;
+  // SEAM: the API doesn't return an org name yet, but will soon — the field
+  // is parsed leniently so names light up here the day it ships, with no
+  // code change (see conductorOrgs.organizationName in schema.ts).
+  organizationName?: string;
+  authMethod?: string;
+}
+
+/**
+ * Best-effort identity probe (`GET /me`, experimental stability). Returns
+ * `undefined` on ANY failure — 404 from a deployment that doesn't serve it
+ * yet, auth errors, network errors, unexpected body shape — because every
+ * caller treats this as optional metadata (org dedupe at key-save time,
+ * organizationName backfill), never as validation. Goes through
+ * `conductorFetch` so the no-key-logging invariant holds.
+ */
+export async function getMe(
+  creds: ConductorCreds,
+): Promise<ConductorMe | undefined> {
+  let body: unknown;
+  try {
+    body = await conductorFetch<unknown>({ creds, method: "GET", path: "/me" });
+  } catch {
+    return undefined;
+  }
+  if (body === null || typeof body !== "object") return undefined;
+  const record = body as Record<string, unknown>;
+  const str = (key: string): string | undefined =>
+    typeof record[key] === "string" ? (record[key] as string) : undefined;
+  return {
+    organizationId: str("organizationId"),
+    // Server org name lands here when the API ships it (accept either
+    // `organizationName` or a plain `name`).
+    organizationName: str("organizationName") ?? str("name"),
+    authMethod: str("authMethod"),
+  };
+}
+
 // ─── Environment resolution (probe, don't parse — KTD1) ─────────────────
 
 export type ResolveConductorEnvironmentResult =

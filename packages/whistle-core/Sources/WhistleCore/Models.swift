@@ -46,6 +46,12 @@ public struct CaptureDraft: Codable, Equatable, Sendable {
     /// Local-only human-readable failure reason, set when `localState ==
     /// .syncFailed`. Distinct from the server's `error`/`errorCode`.
     public var localError: String?
+    /// Which Conductor org key this capture was created under (multi-org
+    /// plan) -- threaded through to `captures.create`'s optional `orgId` arg.
+    /// `nil` when the project was picked before multi-org existed, or under
+    /// a single-key account; the server falls back to its own single-org
+    /// shim in that case.
+    public var orgId: String?
 
     public init(
         clientId: String = UUID().uuidString,
@@ -60,7 +66,8 @@ public struct CaptureDraft: Codable, Equatable, Sendable {
         localState: LocalCaptureState = .draft,
         localAttempt: Int = 0,
         serverId: String? = nil,
-        localError: String? = nil
+        localError: String? = nil,
+        orgId: String? = nil
     ) {
         self.clientId = clientId
         self.transcript = transcript
@@ -75,6 +82,7 @@ public struct CaptureDraft: Codable, Equatable, Sendable {
         self.localAttempt = localAttempt
         self.serverId = serverId
         self.localError = localError
+        self.orgId = orgId
     }
 }
 
@@ -198,10 +206,31 @@ public struct Project: Codable, Equatable, Sendable, Identifiable {
     public var id: String
     public var name: String
     public var gitRemote: String
+    /// Which Conductor org key this project came from (multi-org plan) --
+    /// absent for a legacy pre-migration cache row (both `orgId`/`orgLabel`
+    /// arrive together or not at all, per `projects:list`). Decoded leniently
+    /// (see `init(from:)`) so a client running ahead of a backend rollout
+    /// still decodes instead of throwing.
+    public var orgId: String?
+    /// Display name for `orgId`'s org (server-resolved `orgDisplayName`, not
+    /// user-typed `label` directly) -- for grouping the project picker by
+    /// org.
+    public var orgLabel: String?
 
-    public init(id: String, name: String, gitRemote: String) {
+    public init(id: String, name: String, gitRemote: String, orgId: String? = nil, orgLabel: String? = nil) {
         self.id = id
         self.name = name
         self.gitRemote = gitRemote
+        self.orgId = orgId
+        self.orgLabel = orgLabel
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(String.self, forKey: .id)
+        name = try container.decode(String.self, forKey: .name)
+        gitRemote = try container.decode(String.self, forKey: .gitRemote)
+        orgId = try container.decodeIfPresent(String.self, forKey: .orgId)
+        orgLabel = try container.decodeIfPresent(String.self, forKey: .orgLabel)
     }
 }

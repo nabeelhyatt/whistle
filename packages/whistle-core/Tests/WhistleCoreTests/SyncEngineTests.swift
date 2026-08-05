@@ -124,6 +124,42 @@ final class SyncEngineTests: XCTestCase {
         XCTAssertEqual(try store.draft(clientId: "second")?.localState, .synced)
     }
 
+    // MARK: - orgId passthrough (multi-org plan)
+
+    func testSyncOnePassesDraftOrgIdThroughToCapturesCreate() async throws {
+        let (store, tempDir) = try TestSupport.makeStore()
+        self.tempDir = tempDir
+
+        var draft = TestSupport.makeDraft(clientId: "with-org")
+        draft.orgId = "org-abc"
+        try store.saveDraft(draft)
+
+        let convex = FakeConvexService()
+        let engine = SyncEngine(store: store, convex: convex)
+
+        _ = await engine.drainOnce()
+
+        XCTAssertEqual(convex.capturesCreateCalls.map(\.orgId), ["org-abc"])
+    }
+
+    func testSyncOneOmitsOrgIdWhenDraftHasNone() async throws {
+        let (store, tempDir) = try TestSupport.makeStore()
+        self.tempDir = tempDir
+
+        // TestSupport.makeDraft's default has no orgId -- the common
+        // single-key/legacy case.
+        let draft = TestSupport.makeDraft(clientId: "no-org")
+        try store.saveDraft(draft)
+
+        let convex = FakeConvexService()
+        let engine = SyncEngine(store: store, convex: convex)
+
+        _ = await engine.drainOnce()
+
+        XCTAssertEqual(convex.capturesCreateCalls.count, 1)
+        XCTAssertNil(convex.capturesCreateCalls.first?.orgId)
+    }
+
     // MARK: - captures.create failure -> syncFailed -> local retry, same clientId
 
     func testCapturesCreateFailureMarksSyncFailedThenLocalRetrySucceedsWithSameClientId() async throws {

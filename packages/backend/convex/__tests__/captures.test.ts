@@ -72,6 +72,35 @@ describe("captures.create", () => {
     expect(row?.status).toBe("queued");
     expect(row?.attempt).toBe(0);
   });
+
+  test("an optional orgId round-trips onto the row; omitting it leaves the field undefined", async () => {
+    const t = convexTest(schema, modules);
+    const asUser = withMockUser(t, "auth0|captures-create-orgid");
+    const userId = await asUser.mutation(api.users.ensure, {});
+    const orgId = await t.run(async (ctx) =>
+      ctx.db.insert("conductorOrgs", {
+        userId,
+        label: "Work",
+        conductorApiKey: "sk-captures-orgid-1234",
+        conductorEnvironment: "prod",
+        createdAt: 1,
+      }),
+    );
+
+    const withOrgId = await asUser.mutation(
+      api.captures.create,
+      baseCaptureArgs({ clientId: "client-with-org", orgId }),
+    );
+    const rowWithOrg = await t.run(async (ctx) => ctx.db.get(withOrgId));
+    expect(rowWithOrg?.orgId).toBe(orgId);
+
+    const withoutOrgId = await asUser.mutation(
+      api.captures.create,
+      baseCaptureArgs({ clientId: "client-without-org" }),
+    );
+    const rowWithoutOrg = await t.run(async (ctx) => ctx.db.get(withoutOrgId));
+    expect(rowWithoutOrg?.orgId).toBeUndefined();
+  });
 });
 
 describe("captures.listRecent / captures.list", () => {

@@ -709,7 +709,8 @@ public final class CaptureViewModel: ObservableObject {
                 projectName: "",
                 agent: defaultAgent,
                 model: defaultModel,
-                localState: .queued
+                localState: .queued,
+                orgId: nil
             )
             try? store.saveDraft(draft)
             return .submitted(clientId: clientId)
@@ -726,7 +727,8 @@ public final class CaptureViewModel: ObservableObject {
             projectName: project.name,
             agent: defaultAgent,
             model: defaultModel,
-            localState: .queued
+            localState: .queued,
+            orgId: project.orgId
         )
         try? store.saveDraft(draft)
 

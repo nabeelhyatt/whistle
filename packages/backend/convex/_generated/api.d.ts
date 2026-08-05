@@ -14,6 +14,7 @@ import type * as conductorClient from "../conductorClient.js";
 import type * as defaultTemplate from "../defaultTemplate.js";
 import type * as files from "../files.js";
 import type * as lib_auth from "../lib/auth.js";
+import type * as orgs from "../orgs.js";
 import type * as pipeline from "../pipeline.js";
 import type * as pipelineInternal from "../pipelineInternal.js";
 import type * as projects from "../projects.js";
@@ -35,6 +36,7 @@ declare const fullApi: ApiFromModules<{
   defaultTemplate: typeof defaultTemplate;
   files: typeof files;
   "lib/auth": typeof lib_auth;
+  orgs: typeof orgs;
   pipeline: typeof pipeline;
   pipelineInternal: typeof pipelineInternal;
   projects: typeof projects;

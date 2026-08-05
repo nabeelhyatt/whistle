@@ -8,9 +8,10 @@
 // Carries: hotkey recorder (KeyboardShortcuts UI), default project picker,
 // agent picker (claude/codex/cursor) + optional model string
 // (settings.update), screenshot on/off default, the template editor
-// (TemplateEditor.swift), account/sign-out, and API key management (masked
-// display via settings.get hasKey/last-4; replace flow =
-// conductor.validateKey then settings.setConductorKey).
+// (TemplateEditor.swift), account/sign-out, and API key management (multi-
+// org plan: a list of labeled org keys via orgs.list, add via
+// orgs.addKey/rename via orgs.rename/remove via orgs.remove -- there is no
+// in-place "replace", just remove-then-add).
 
 import AppKit
 import Combine
@@ -42,23 +43,29 @@ public final class SettingsViewModel: ObservableObject {
     @Published public var defaultProjectId: String?
     @Published public private(set) var projects: [Project] = []
 
-    // API key
-    @Published public private(set) var hasKey = false
-    @Published public private(set) var keyLastFour: String?
+    // API key (multi-org plan: a list of labeled org keys, not one key)
+    @Published public private(set) var orgKeys: [OrgKeyInfo] = []
+
+    // Add-key form
+    @Published public var newKeyLabel: String = ""
     @Published public var newKeyInput: String = ""
-    @Published public private(set) var isReplacingKey = false
+    @Published public private(set) var isAddingKey = false
     @Published public private(set) var keyStatusMessage: String?
-    @Published public private(set) var keyReplaceSucceeded: Bool?
+    @Published public private(set) var keyAddSucceeded: Bool?
     /// Set after a successful Save & Validate when the new key lists a
-    /// different set of Conductor projects than the previous key — a heads-up
+    /// different set of Conductor projects than any existing key — a heads-up
     /// that it may belong to a different Conductor account (canonical-accounts).
     @Published public private(set) var keyProjectsChanged = false
-    @Published public private(set) var keyProjectsAvailable = false
-    /// The stored key's environment (`settings:get`'s `environment` field,
-    /// R4: absent/legacy rows read back as `.prod`). Drives the `· Staging`
-    /// suffix on `maskedKeyDisplay` and the environment-aware dashboard
-    /// links (R6).
-    @Published public private(set) var environment: ConductorEnvironment = .prod
+
+    // Per-row rename affordance -- `renamingOrgId` is the row currently
+    // showing its inline `TextField` instead of its label `Text` (nil when
+    // no row is being renamed; only one row can be mid-rename at a time).
+    @Published public var renamingOrgId: String?
+    @Published public var renameLabelInput: String = ""
+
+    // Per-row remove confirmation -- the row awaiting a
+    // `.confirmationDialog` "are you sure" (nil when none pending).
+    @Published public var pendingRemoveOrgId: String?
 
     @Published public private(set) var loadError: String?
     @Published public private(set) var authState: AuthState
@@ -103,16 +110,19 @@ public final class SettingsViewModel: ObservableObject {
             model = snapshot.model ?? ""
             screenshotsEnabled = snapshot.screenshotsEnabled
             defaultProjectId = snapshot.defaultProjectId
-            hasKey = snapshot.hasKey
-            keyProjectsAvailable = snapshot.hasKey
-            keyLastFour = snapshot.lastFour
-            environment = snapshot.environment
             loadError = nil
         } catch {
             loadError = "Couldn't load settings. Check your connection."
         }
+        await loadOrgKeys()
         await loadSignedInIdentity()
         subscribeToProjects()
+    }
+
+    /// Refreshes the API-key tab's row list from `orgs:list` -- called on
+    /// initial `load()` and after any add/remove/rename mutation succeeds.
+    private func loadOrgKeys() async {
+        orgKeys = (try? await convex.orgsList()) ?? []
     }
 
     /// Loads `users:me` for the account tab's identity display. Best-effort:
@@ -187,74 +197,107 @@ public final class SettingsViewModel: ObservableObject {
         try? await convex.settingsUpdate(SettingsPatch(defaultProjectId: projectId.map { .set($0) } ?? .clear))
     }
 
-    // MARK: API key management (PRD F5.2: masked, replaceable)
+    // MARK: API key management (multi-org plan: labeled org keys, masked)
 
-    /// Masked display: the key itself is never returned to clients
-    /// (TECH-SPEC §9) — only `hasKey` + last-4.
-    public var maskedKeyDisplay: String {
-        guard hasKey else { return "No key on file" }
-        let base: String
-        if let last = keyLastFour, !last.isEmpty {
-            base = "••••••••••••\(last)"
-        } else {
-            base = "•••••••••••• (on file)"
-        }
-        return environment == .staging ? "\(base) · Staging" : base
+    /// The dashboard URL for the add-key form's "Get your key at…" link.
+    /// Always prod: a not-yet-added key's environment is unknown until
+    /// `orgAddKey` probes it, unlike an existing row (which shows its own
+    /// `environment` via `OrgKeyRow`).
+    public var addKeyDashboardURL: URL {
+        ConductorDashboardLink.apiKeysURL(environment: .prod)
     }
 
-    /// The dashboard URL to send the user to for key management — staging
-    /// when the stored key's environment is staging, prod otherwise (R6).
-    public var dashboardKeysURL: URL {
-        ConductorDashboardLink.apiKeysURL(environment: environment)
+    public var addKeyDashboardLabel: String {
+        ConductorDashboardLink.apiKeysLabel(environment: .prod)
     }
 
-    /// Replace flow (staging-keys plan KTD3): one atomic call probes the
-    /// pasted key against both Conductor hosts and, only on acceptance,
-    /// stores it + the detected environment and seeds the projects cache
-    /// server-side — replacing the previous validate-then-`settingsSetConductorKey`
-    /// two-step. The different-project-set warning is preserved, now driven
-    /// by the action's own `projectsChanged` signal.
-    public func replaceKey() async {
+    /// Add flow (multi-org plan): one atomic call probes the pasted key
+    /// against both Conductor hosts and, only on acceptance, stores it as a
+    /// NEW labeled org row and seeds that org's projects cache server-side
+    /// -- mirrors the old single-key `replaceKey`'s post-success refresh,
+    /// except there's no existing row to replace, so this only ever adds.
+    /// The different-project-set warning is preserved, still driven by the
+    /// action's own `projectsChanged` signal.
+    public func addKey() async {
+        let label = newKeyLabel.trimmingCharacters(in: .whitespacesAndNewlines)
         let key = newKeyInput.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !key.isEmpty else {
             keyStatusMessage = "Paste the new key first."
-            keyReplaceSucceeded = nil
+            keyAddSucceeded = nil
             return
         }
-        guard !isReplacingKey else { return }
-        isReplacingKey = true
-        defer { isReplacingKey = false }
+        guard !isAddingKey else { return }
+        isAddingKey = true
+        defer { isAddingKey = false }
 
-        let result: ConductorSetAndValidateResult
+        let result: OrgAddKeyResult
         do {
-            result = try await convex.conductorSetAndValidateKey(key: key)
+            result = try await convex.orgAddKey(label: label.isEmpty ? "Default" : label, key: key)
         } catch {
             keyStatusMessage = "Couldn't reach Conductor. Check your connection and try again."
-            keyReplaceSucceeded = false
+            keyAddSucceeded = false
             keyProjectsChanged = false
             return
         }
 
         guard result.ok else {
             keyStatusMessage = result.error ?? "Conductor didn't accept that key. Check that you copied the whole key."
-            keyReplaceSucceeded = false
+            keyAddSucceeded = false
             keyProjectsChanged = false
             return
         }
 
         keyStatusMessage = "Key saved and validated."
-        keyReplaceSucceeded = true
-        keyProjectsChanged = result.projectsChanged
-        keyProjectsAvailable = true
-        environment = result.environment ?? .prod
-        hasKey = true
-        keyLastFour = String(key.suffix(4))
+        keyAddSucceeded = true
+        keyProjectsChanged = result.projectsChanged ?? false
+        newKeyLabel = ""
         newKeyInput = ""
-        // Refresh masked display (hasKey / last-4 / environment).
-        if let snapshot = try? await convex.settingsGet() {
-            hasKey = snapshot.hasKey
-            keyLastFour = snapshot.lastFour
-            environment = snapshot.environment
+        await loadOrgKeys()
+    }
+
+    /// Removes an org key -- mirrors `orgs:remove`. The view is responsible
+    /// for confirming with the user first (`pendingRemoveOrgId` drives that
+    /// dialog); this just performs the mutation and refreshes the list.
+    public func removeKey(orgId: String) async {
+        do {
+            try await convex.orgRemove(orgId: orgId)
+            await loadOrgKeys()
+        } catch {
+            keyStatusMessage = "Couldn't remove that key. Check your connection and try again."
+        }
+    }
+
+    /// Begins the inline rename affordance for one row.
+    public func beginRename(_ info: OrgKeyInfo) {
+        renamingOrgId = info.orgId
+        renameLabelInput = info.label
+    }
+
+    public func cancelRename() {
+        renamingOrgId = nil
+        renameLabelInput = ""
+    }
+
+    /// Commits `renameLabelInput` as the new label for `renamingOrgId` (a
+    /// blank input is treated as "cancel", not "clear the label" -- an org
+    /// key always keeps a non-empty label). Thin wrapper over `renameKey`
+    /// that also tears down the inline-edit UI state.
+    public func commitRename() async {
+        guard let orgId = renamingOrgId else { return }
+        let trimmed = renameLabelInput.trimmingCharacters(in: .whitespacesAndNewlines)
+        renamingOrgId = nil
+        renameLabelInput = ""
+        guard !trimmed.isEmpty else { return }
+        await renameKey(orgId: orgId, label: trimmed)
+    }
+
+    /// Renames an org key's label -- mirrors `orgs:rename`.
+    public func renameKey(orgId: String, label: String) async {
+        do {
+            try await convex.orgRename(orgId: orgId, label: label)
+            await loadOrgKeys()
+        } catch {
+            keyStatusMessage = "Couldn't rename that key. Check your connection and try again."
         }
     }
 
@@ -373,44 +416,55 @@ struct SettingsView: View {
 
     private var apiKeyTab: some View {
         Form {
-            Section("Conductor API key") {
-                LabeledContent("Current key:", value: viewModel.maskedKeyDisplay)
+            Section("Conductor organizations") {
+                if viewModel.orgKeys.isEmpty {
+                    Text("No organization keys on file.")
+                        .foregroundStyle(.secondary)
+                } else {
+                    ForEach(viewModel.orgKeys, id: \.orgId) { info in
+                        OrgKeyRow(info: info, viewModel: viewModel)
+                    }
+                }
+            }
 
-                SecureField("New key", text: $viewModel.newKeyInput, prompt: Text("Paste a new Conductor API key"))
-                    .onSubmit { Task { await viewModel.replaceKey() } }
+            Section("Add organization key") {
+                TextField("Label", text: $viewModel.newKeyLabel, prompt: Text("Personal"))
+
+                SecureField("New key", text: $viewModel.newKeyInput, prompt: Text("Paste a Conductor API key"))
+                    .onSubmit { Task { await viewModel.addKey() } }
 
                 HStack {
                     Link(
-                        ConductorDashboardLink.apiKeysLabel(environment: viewModel.environment),
-                        destination: viewModel.dashboardKeysURL
+                        viewModel.addKeyDashboardLabel,
+                        destination: viewModel.addKeyDashboardURL
                     )
                     .font(.callout)
                     Spacer()
                     Button {
-                        Task { await viewModel.replaceKey() }
+                        Task { await viewModel.addKey() }
                     } label: {
-                        if viewModel.isReplacingKey {
+                        if viewModel.isAddingKey {
                             ProgressView().controlSize(.small)
                         } else {
                             Text("Save & Validate")
                         }
                     }
-                    .disabled(viewModel.isReplacingKey)
+                    .disabled(viewModel.isAddingKey)
                 }
 
                 if let message = viewModel.keyStatusMessage {
                     Label(
                         message,
-                        systemImage: viewModel.keyReplaceSucceeded == true
+                        systemImage: viewModel.keyAddSucceeded == true
                             ? "checkmark.circle" : "exclamationmark.triangle"
                     )
-                    .foregroundStyle(viewModel.keyReplaceSucceeded == true ? Color.secondary : .orange)
+                    .foregroundStyle(viewModel.keyAddSucceeded == true ? Color.secondary : .orange)
                     .font(.callout)
                 }
 
                 if viewModel.keyProjectsChanged {
                     Label(
-                        "This key can see a different set of Conductor projects than your previous key. If that's unexpected, it may belong to a different Conductor account than the one you use in the Conductor app.",
+                        "This key can see a different set of Conductor projects than your existing keys. If that's unexpected, it may belong to a different Conductor account than the one you use in the Conductor app.",
                         systemImage: "exclamationmark.triangle"
                     )
                     .foregroundStyle(.orange)
@@ -418,14 +472,18 @@ struct SettingsView: View {
                 }
             }
 
-            // Which Conductor account is this key on? There's no Conductor
-            // whoami endpoint, so we show the projects the key can reach as an
+            // Which Conductor account(s) can these keys reach? There's no
+            // Conductor whoami endpoint, so we show the projects as an
             // identity proxy — a mismatch with what the user expects is the
             // tell that captures will land in the wrong account.
-            if viewModel.hasKey && viewModel.keyProjectsAvailable && !viewModel.projects.isEmpty {
-                Section("Projects this key can access") {
+            if !viewModel.orgKeys.isEmpty && !viewModel.projects.isEmpty {
+                Section("Projects these keys can access") {
                     ForEach(viewModel.projects) { project in
-                        Text(project.name)
+                        if let orgLabel = project.orgLabel {
+                            LabeledContent(project.name, value: orgLabel)
+                        } else {
+                            Text(project.name)
+                        }
                     }
                 }
             }
@@ -473,6 +531,81 @@ struct SettingsView: View {
         }
         .formStyle(.grouped)
         .padding(12)
+    }
+}
+
+/// One row in the API-key tab's org list (multi-org plan): label + masked
+/// key + env suffix, an inline pencil-to-`TextField` rename toggle, and a
+/// Remove button gated by a `.confirmationDialog` (removing a key can fail
+/// any capture currently in flight for that org).
+private struct OrgKeyRow: View {
+    let info: OrgKeyInfo
+    @ObservedObject var viewModel: SettingsViewModel
+
+    private var isRenaming: Bool { viewModel.renamingOrgId == info.orgId }
+
+    /// Same "•••• last-4 · Staging" shape the old single-key
+    /// `maskedKeyDisplay` used, just per-row now.
+    private var maskedKey: String {
+        let base = "••••••••••••\(info.lastFour)"
+        return info.environment == .staging ? "\(base) · Staging" : base
+    }
+
+    var body: some View {
+        HStack {
+            VStack(alignment: .leading, spacing: 2) {
+                if isRenaming {
+                    TextField("Label", text: $viewModel.renameLabelInput)
+                        .textFieldStyle(.roundedBorder)
+                        .onSubmit { Task { await viewModel.commitRename() } }
+                } else {
+                    Text(info.displayName)
+                        .fontWeight(.semibold)
+                }
+                Text(maskedKey)
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            }
+
+            Spacer()
+
+            if isRenaming {
+                Button("Save") { Task { await viewModel.commitRename() } }
+                Button("Cancel") { viewModel.cancelRename() }
+            } else {
+                Button {
+                    viewModel.beginRename(info)
+                } label: {
+                    Image(systemName: "pencil")
+                }
+                .buttonStyle(.borderless)
+
+                Button("Remove", role: .destructive) {
+                    viewModel.pendingRemoveOrgId = info.orgId
+                }
+                .buttonStyle(.borderless)
+            }
+        }
+        .confirmationDialog(
+            "Remove this organization key?",
+            isPresented: Binding(
+                get: { viewModel.pendingRemoveOrgId == info.orgId },
+                set: { isPresented in
+                    if !isPresented { viewModel.pendingRemoveOrgId = nil }
+                }
+            ),
+            titleVisibility: .visible
+        ) {
+            Button("Remove", role: .destructive) {
+                Task { await viewModel.removeKey(orgId: info.orgId) }
+                viewModel.pendingRemoveOrgId = nil
+            }
+            Button("Cancel", role: .cancel) {
+                viewModel.pendingRemoveOrgId = nil
+            }
+        } message: {
+            Text("Any captures currently in flight for this organization will fail. This can't be undone.")
+        }
     }
 }
 

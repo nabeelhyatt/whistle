@@ -60,6 +60,10 @@ export const accountReport = internalQuery({
           .query("settings")
           .withIndex("by_user", (q) => q.eq("userId", user._id))
           .unique();
+        const orgRows = await ctx.db
+          .query("conductorOrgs")
+          .withIndex("by_user", (q) => q.eq("userId", user._id))
+          .collect();
 
         return {
           userId: user._id,
@@ -80,6 +84,13 @@ export const accountReport = internalQuery({
                     settingsRow.conductorEnvironment,
                   ),
                 },
+          conductorOrgs: orgRows.map((org) => ({
+            orgId: org._id,
+            label: org.label,
+            organizationId: org.organizationId,
+            lastFour: org.conductorApiKey.slice(-4),
+            environment: org.conductorEnvironment,
+          })),
         };
       }),
     );
@@ -87,22 +98,37 @@ export const accountReport = internalQuery({
 });
 
 /**
- * Repoints `captures`, `promptTemplates`, and `projectsCache` rows from
- * `fromUserId` to `toUserId`. Deliberately does NOT move `settings` — see
- * plan §2 "What moves where": `settings.get` uses `.unique()` per user, so
- * two settings rows on one user would break every read; the `from` user's
- * settings row (and its Conductor key) stays exactly where it is,
- * untouched and unreachable by any future login once Auth0 linking
- * freezes that subject.
+ * Repoints `captures`, `promptTemplates`, `conductorOrgs`, and
+ * `projectsCache` rows from `fromUserId` to `toUserId`. Deliberately does
+ * NOT move `settings` — see plan §2 "What moves where": `settings.get` uses
+ * `.unique()` per user, so two settings rows on one user would break every
+ * read; the `from` user's settings row stays exactly where it is, untouched
+ * and unreachable by any future login once Auth0 linking freezes that
+ * subject. (In the multi-org era the legacy settings key is migrated onto a
+ * `conductorOrgs` row at the shell user's next launch anyway — and org rows
+ * DO move, because moved captures pin their org row by id.)
+ *
+ * Org collision policy: a `from` org row whose `organizationId` already
+ * exists under `to` is skipped (never two rows for one org), and every
+ * *moved* capture pointing at the skipped row is rewritten to the surviving
+ * target row — same organization, semantically the same key. A plain skip
+ * would strand those captures on a foreign-user row and fail them `auth` at
+ * the pipeline's ownership check. Rewrites are recorded in the manifest
+ * (`captureOrgRewrites`) so the rollback ledger stays complete.
+ *
+ * projectsCache rows follow their org row (keyed by orgId, so no collision
+ * is possible); the legacy no-org cache row keeps the old rule — left in
+ * place if `to` already has a no-org row (it's a cache; staleness is
+ * harmless).
  *
  * `dryRun` (default `true`) returns the manifest of row ids that would
  * move without writing anything. A live run (`dryRun: false`) patches
  * `userId` on each manifest row, marks `from.mergedInto = to`, and returns
  * the same manifest — save this output, it's the rollback ledger.
  *
- * Idempotent: once `from`'s captures/promptTemplates/projectsCache have
- * been repointed, a second live run finds zero rows left under `from` and
- * no-ops (empty manifest; `mergedInto` patched to the same value again).
+ * Idempotent: once `from`'s rows have been repointed, a second live run
+ * finds zero rows left under `from` and no-ops (empty manifest;
+ * `mergedInto` patched to the same value again).
  */
 export const mergeUserData = internalMutation({
   args: {
@@ -169,22 +195,67 @@ export const mergeUserData = internalMutation({
       }
     }
 
-    // If `to` already has a projectsCache row, leave `from`'s in place —
-    // it's a cache; staleness is harmless, and there's nowhere to move it
-    // to without a collision.
-    const toHasProjectsCache =
-      (
-        await ctx.db
-          .query("projectsCache")
-          .withIndex("by_user", (q) => q.eq("userId", args.toUserId))
-          .collect()
-      ).length > 0;
-    const projectsCacheIds: Id<"projectsCache">[] = toHasProjectsCache
-      ? []
-      : fromProjectsCache.map((row) => row._id);
-    const skippedProjectsCacheIds: Id<"projectsCache">[] = toHasProjectsCache
-      ? fromProjectsCache.map((row) => row._id)
-      : [];
+    // Org rows move with the user; a duplicate `organizationId` under `to`
+    // is skipped, with moved captures rewritten to the surviving row.
+    const fromOrgs = await ctx.db
+      .query("conductorOrgs")
+      .withIndex("by_user", (q) => q.eq("userId", args.fromUserId))
+      .collect();
+    const toOrgs = await ctx.db
+      .query("conductorOrgs")
+      .withIndex("by_user", (q) => q.eq("userId", args.toUserId))
+      .collect();
+
+    const conductorOrgIds: Id<"conductorOrgs">[] = [];
+    const skippedConductorOrgIds: Id<"conductorOrgs">[] = [];
+    const survivingOrgByFromOrg = new Map<
+      Id<"conductorOrgs">,
+      Id<"conductorOrgs">
+    >();
+    for (const org of fromOrgs) {
+      const duplicate =
+        org.organizationId !== undefined
+          ? toOrgs.find((t) => t.organizationId === org.organizationId)
+          : undefined;
+      if (duplicate !== undefined) {
+        skippedConductorOrgIds.push(org._id);
+        survivingOrgByFromOrg.set(org._id, duplicate._id);
+      } else {
+        conductorOrgIds.push(org._id);
+      }
+    }
+
+    const movingOrgIds = new Set(conductorOrgIds);
+    const captureOrgRewrites: {
+      captureId: Id<"captures">;
+      orgId: Id<"conductorOrgs">;
+    }[] = [];
+    for (const capture of fromCaptures) {
+      if (capture.orgId === undefined) continue;
+      if (!captureIds.includes(capture._id)) continue; // collided; stays put
+      const surviving = survivingOrgByFromOrg.get(capture.orgId);
+      if (surviving !== undefined) {
+        captureOrgRewrites.push({ captureId: capture._id, orgId: surviving });
+      }
+    }
+
+    // Per-org cache rows follow their org row; the legacy no-org row keeps
+    // the old all-or-nothing rule against `to`'s legacy row.
+    const toCaches = await ctx.db
+      .query("projectsCache")
+      .withIndex("by_user", (q) => q.eq("userId", args.toUserId))
+      .collect();
+    const toHasLegacyCache = toCaches.some((row) => row.orgId === undefined);
+
+    const projectsCacheIds: Id<"projectsCache">[] = [];
+    const skippedProjectsCacheIds: Id<"projectsCache">[] = [];
+    for (const cache of fromProjectsCache) {
+      const moves =
+        cache.orgId !== undefined
+          ? movingOrgIds.has(cache.orgId)
+          : !toHasLegacyCache;
+      (moves ? projectsCacheIds : skippedProjectsCacheIds).push(cache._id);
+    }
 
     const promptTemplateIds = fromPromptTemplates.map((row) => row._id);
 
@@ -192,8 +263,11 @@ export const mergeUserData = internalMutation({
       captures: captureIds,
       promptTemplates: promptTemplateIds,
       projectsCache: projectsCacheIds,
+      conductorOrgs: conductorOrgIds,
       collisions: { captures: collidedCaptureIds },
       skippedProjectsCache: skippedProjectsCacheIds,
+      skippedConductorOrgs: skippedConductorOrgIds,
+      captureOrgRewrites,
     };
 
     if (dryRun) {
@@ -203,8 +277,14 @@ export const mergeUserData = internalMutation({
     for (const captureId of captureIds) {
       await ctx.db.patch(captureId, { userId: args.toUserId });
     }
+    for (const rewrite of captureOrgRewrites) {
+      await ctx.db.patch(rewrite.captureId, { orgId: rewrite.orgId });
+    }
     for (const templateId of promptTemplateIds) {
       await ctx.db.patch(templateId, { userId: args.toUserId });
+    }
+    for (const orgId of conductorOrgIds) {
+      await ctx.db.patch(orgId, { userId: args.toUserId });
     }
     for (const cacheId of projectsCacheIds) {
       await ctx.db.patch(cacheId, { userId: args.toUserId });

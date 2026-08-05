@@ -41,6 +41,10 @@ private struct PendingCaptureRow: Codable, FetchableRecord, PersistableRecord {
     var localAttempt: Int
     var serverId: String?
     var localError: String?
+    /// Added by `v2_pending_captures_org_id` -- nullable so pre-migration
+    /// rows (and drafts saved before multi-org existed) decode as `nil`
+    /// rather than failing the migration.
+    var orgId: String?
 
     init(draft: CaptureDraft) {
         clientId = draft.clientId
@@ -56,6 +60,7 @@ private struct PendingCaptureRow: Codable, FetchableRecord, PersistableRecord {
         localAttempt = draft.localAttempt
         serverId = draft.serverId
         localError = draft.localError
+        orgId = draft.orgId
     }
 
     var asDraft: CaptureDraft {
@@ -72,7 +77,8 @@ private struct PendingCaptureRow: Codable, FetchableRecord, PersistableRecord {
             localState: LocalCaptureState(rawValue: localState) ?? .draft,
             localAttempt: localAttempt,
             serverId: serverId,
-            localError: localError
+            localError: localError,
+            orgId: orgId
         )
     }
 }
@@ -198,6 +204,19 @@ public final class CaptureStore: Sendable {
             try db.create(table: "app_state") { t in
                 t.column("key", .text).primaryKey()
                 t.column("value", .text).notNull()
+            }
+        }
+
+        // Adds `orgId` to `pending_captures` (multi-org plan) so a queued
+        // draft remembers which Conductor org key it was created under and
+        // can thread that through to `captures.create` even if the app is
+        // relaunched mid-drain. Nullable, no default needed beyond SQLite's
+        // implicit NULL for existing rows -- `projects_snapshot` needs no
+        // equivalent migration since it's a single JSON blob and `Project`'s
+        // `Codable` evolution (lenient `decodeIfPresent`) already covers it.
+        migrator.registerMigration("v2_pending_captures_org_id") { db in
+            try db.alter(table: "pending_captures") { t in
+                t.add(column: "orgId", .text)
             }
         }
 

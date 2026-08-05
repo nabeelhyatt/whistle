@@ -109,4 +109,30 @@ describe("conductorFetch logging", () => {
     expect(message).not.toContain("secretPrompt");
     expect(message).not.toContain("should never be logged either");
   });
+
+  test("getMe goes through conductorFetch: a failing /me logs without the key and getMe swallows it", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(() =>
+        Promise.resolve(
+          new Response(JSON.stringify({ userMessage: "not found" }), {
+            status: 404,
+            headers: { "content-type": "application/json" },
+          }),
+        ),
+      ),
+    );
+
+    const { getMe } = await import("../conductorClient");
+    const result = await getMe({
+      apiKey: "sk-should-never-be-logged",
+      environment: "prod",
+    });
+    expect(result).toBeUndefined();
+
+    expect(errorSpy).toHaveBeenCalledTimes(1);
+    const [message] = errorSpy.mock.calls[0];
+    expect(message).toContain("/me");
+    expect(message).not.toContain("sk-should-never-be-logged");
+  });
 });

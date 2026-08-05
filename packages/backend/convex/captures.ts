@@ -21,6 +21,9 @@ export const create = mutation({
     screenshotId: v.optional(v.id("_storage")),
     projectId: v.string(),
     projectName: v.string(),
+    // Which org key to use for this capture. Optional: old clients omit it
+    // and the pipeline's credsForCapture fallback chain resolves them.
+    orgId: v.optional(v.id("conductorOrgs")),
     agent: v.string(),
     model: v.optional(v.string()),
     capturedAt: v.number(),
@@ -47,6 +50,7 @@ export const create = mutation({
       screenshotId: args.screenshotId,
       projectId: args.projectId,
       projectName: args.projectName,
+      orgId: args.orgId,
       agent: args.agent,
       model: args.model,
       capturedAt: args.capturedAt,
