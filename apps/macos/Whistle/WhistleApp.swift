@@ -71,10 +71,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// Convex deployment URL — read from Info.plist (`CONVEX_URL`, injected
     /// via xcconfig, see project.yml), never hardcoded. Falls back to the
-    /// known grandiose-alpaca-243 deployment as a hardcoded emergency
-    /// default only if the plist entry is somehow absent, so the app never
-    /// crashes at launch over a missing config value.
-    private static let fallbackConvexUrl = "https://grandiose-alpaca-243.convex.cloud"
+    /// known precious-loris-637 production deployment as a hardcoded
+    /// emergency default only if the plist entry is somehow absent, so the
+    /// app never crashes at launch over a missing config value. Keep this in
+    /// sync with `Config/Convex.xcconfig` — a fallback pointing at a
+    /// different deployment than the xcconfig turns an xcconfig typo into a
+    /// silent switch to the wrong backend rather than a visible failure.
+    private static let fallbackConvexUrl = "https://precious-loris-637.convex.cloud"
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -603,9 +606,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         fatalError("Whistle: unable to construct any CaptureStore, in-memory fallback included")
     }
 
+    /// Returns `raw` only if it's a Convex deployment URL the client can
+    /// actually connect to: an https URL with a non-empty host, and not an
+    /// unsubstituted `$(VAR)` build-setting placeholder. Any other value
+    /// (missing, empty, `"https:"` from the xcconfig comment trap, a bare
+    /// hostname) returns nil so the caller falls back to a known-good default.
+    static func usableDeploymentUrl(_ raw: String?) -> String? {
+        guard let raw, !raw.isEmpty, !raw.hasPrefix("$("),
+              let parsed = URL(string: raw),
+              parsed.scheme?.lowercased() == "https",
+              let host = parsed.host, !host.isEmpty
+        else { return nil }
+        return raw
+    }
+
     private static func makeConvexService(authProvider: any WhistleAuthProvider) -> any ConvexServiceProtocol {
-        let url = Bundle.main.object(forInfoDictionaryKey: "CONVEX_URL") as? String
-        let deploymentUrl = (url?.isEmpty == false && url?.hasPrefix("$(") == false) ? url! : fallbackConvexUrl
+        // Accept the plist value only if it's a *usable* https URL with a host.
+        // Checking non-empty + no "$(" prefix isn't enough: the xcconfig
+        // `//`-comment trap (see Config/Convex.xcconfig) produced the literal
+        // "https:" once already, which is non-empty, has no "$(" prefix, and
+        // parses as a URL with a scheme but no host — so it would sail through
+        // a laxer guard and hand LiveConvexService an address it can never
+        // reach. Requiring a host turns that class of config truncation into a
+        // fall back to the known-good default instead of a silently dead app.
+        let plistUrl = Bundle.main.object(forInfoDictionaryKey: "CONVEX_URL") as? String
+        let deploymentUrl = Self.usableDeploymentUrl(plistUrl) ?? fallbackConvexUrl
         #if canImport(ConvexMobile)
             return LiveConvexService(deploymentUrl: deploymentUrl, authProvider: authProvider)
         #else

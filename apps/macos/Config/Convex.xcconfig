@@ -1,14 +1,28 @@
 // Convex.xcconfig
 // Convex deployment URL for team `nabeelo`, project `whistle`, deployment
-// `grandiose-alpaca-243` (TECH-SPEC §2a — this deployment already exists
-// and is targeted non-interactively). Not a secret (it's a public HTTPS
-// endpoint), but kept out of source per TECH-SPEC's "env/xcconfig, never
-// hardcoded" convention so switching deployments (e.g. a future prod vs.
-// dev split) never requires a source-code change.
+// `precious-loris-637` — the *production* deployment (TECH-SPEC §2a). Not a
+// secret (it's a public HTTPS endpoint), but kept out of source per
+// TECH-SPEC's "env/xcconfig, never hardcoded" convention so this is the one
+// place a deployment switch is configured.
+//
+// One exception to "never hardcoded": `WhistleApp.fallbackConvexUrl` carries
+// the same value as a launch-time emergency default (so a missing plist entry
+// can't crash the app), and must be changed alongside this file. That is the
+// only other place the URL appears.
+//
+// Ships prod, not dev, since 1.0.20. `grandiose-alpaca-243` is the *dev*
+// deployment `npx convex dev` pushes to, and it was what shipped through
+// 1.0.19 — which meant the app's backend only updated when someone ran
+// `convex dev` locally: `npx convex deploy` (what backend-deploy.yml runs
+// on every push to main) can only target a prod or preview deployment,
+// never a dev one, so CI structurally could not deploy the deployment
+// users were hitting. PR #38's workspace-title change sat undeployed for a
+// day that way, with the workflow reporting green. Point this at prod and
+// CI owns the deployment. Don't move it back to a dev deployment.
 
 // NOTE: `//` begins a comment ANYWHERE in an xcconfig line, so a literal
 // URL here silently truncated to `https:` (caught during U11 packaging
 // verification — the built Info.plist carried CONVEX_URL="https:" and the
 // app fell through to its hardcoded fallback). The empty substitution
 // `$()` splits the two slashes without changing the resolved value.
-CONVEX_URL = https:/$()/grandiose-alpaca-243.convex.cloud
+CONVEX_URL = https:/$()/precious-loris-637.convex.cloud

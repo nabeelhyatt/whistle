@@ -77,6 +77,19 @@ Convex dashboard → team `nabeelo` → project `whistle` → Settings →
 gh secret set CONVEX_DEPLOY_KEY   # paste the key (starts "prod:…")
 ```
 
+**Load-bearing, and it was missing until 2026-08-05.** Without it,
+`backend-deploy.yml` skips its deploy step and the whole workflow still
+reports **green** — so backend changes merge to main and never reach users,
+with no red build anywhere. That is exactly how PR #38 sat undeployed for a
+day. If backend behavior doesn't match `main`, check this secret exists and
+that the workflow's `Deploy to Convex` step actually *ran* rather than
+showing as skipped:
+
+```sh
+gh run list --workflow=backend-deploy.yml -L 1
+gh run view <id> --json jobs -q '.jobs[].steps[] | "\(.conclusion) \(.name)"'
+```
+
 ## 5. SENTRY_DSN — optional crash reporting
 
 No Sentry project exists yet (TECH-SPEC §2a). The app has an env-gated
@@ -107,18 +120,28 @@ client secret in a native PKCE flow) and are committed in
 - `AUTH0_DOMAIN` = `dev-jrm7z08z1lx4u3pg.us.auth0.com`
 - `AUTH0_CLIENT_ID` = `jvCvc5uGUuTJjirvZMI7RAl7A3wrduYj`
 
-The same values are set on the Convex dev deployment
-(`grandiose-alpaca-243`) so the backend validates the app's Auth0 ID
-tokens (`packages/backend/convex/auth.config.ts` uses `AUTH0_AUDIENCE` as
-the provider `applicationID`, which for ID-token validation is the client
-ID):
+The same values must be set on **both** Convex deployments so the backend
+validates the app's Auth0 ID tokens (`packages/backend/convex/auth.config.ts`
+uses `AUTH0_AUDIENCE` as the provider `applicationID`, which for ID-token
+validation is the client ID). Convex env vars are per-deployment — setting
+one does not set the other:
 
 ```sh
 cd packages/backend
+# prod (precious-loris-637) — what the shipped app talks to
+npx convex env set --prod AUTH0_DOMAIN dev-jrm7z08z1lx4u3pg.us.auth0.com
+npx convex env set --prod AUTH0_AUDIENCE jvCvc5uGUuTJjirvZMI7RAl7A3wrduYj
+npx convex deploy         # redeploy so auth.config.ts picks the values up
+
+# dev (grandiose-alpaca-243) — local development only
 npx convex env set AUTH0_DOMAIN dev-jrm7z08z1lx4u3pg.us.auth0.com
 npx convex env set AUTH0_AUDIENCE jvCvc5uGUuTJjirvZMI7RAl7A3wrduYj
-npx convex dev --once   # redeploy so auth.config.ts picks the values up
+npx convex dev --once
 ```
+
+Verify with `npx convex env list --prod` and `npx convex env list`. A value
+present on dev but missing on prod is invisible in local testing and only
+shows up as failing auth for real users.
 
 ### Auth0 application settings (dashboard)
 
@@ -151,6 +174,35 @@ that (`Auth0Config.fromInfoPlist`) and degrades to a clearly-labeled local
 
 ---
 
+## 7. OPENROUTER_API_KEY — PROVISIONED (2026-08-04)
+
+Convex env var only (never a GitHub secret, never in the app bundle) — the
+call is made server-side by `packages/backend/convex/titleGenerator.ts` to
+generate the 3-5 word Conductor workspace title. Set on **both**
+deployments, same caveat as Auth0 above:
+
+Copy the key from openrouter.ai → Keys, then pipe it in from the clipboard.
+Omitting the value keeps the secret out of shell history and out of the
+process argument list (`ps`), which passing it inline would not:
+
+```sh
+cd packages/backend
+pbpaste | npx convex env set --prod OPENROUTER_API_KEY
+pbpaste | npx convex env set        OPENROUTER_API_KEY
+```
+
+It funds `anthropic/claude-haiku-4.5` (`TITLE_MODEL`), roughly a few hundred
+output tokens per capture.
+
+**This one fails silently by design.** `generateWorkspaceTitle` never
+throws: a missing key returns `null` and `buildWorkspaceName` falls back to
+the first six raw words of the notes/transcript. So a deployment missing
+this var produces workspace names like `on the detail page off the #a7be3e`
+with no error anywhere — the symptom is ugly branch names, not a failure.
+If titles look raw, check `npx convex env list --prod` first.
+
+---
+
 ## Quick verification after provisioning
 
 ```sh
@@ -158,6 +210,12 @@ gh secret list
 # Expect: DEVELOPER_ID_P12_BASE64, DEVELOPER_ID_P12_PASSWORD,
 #         NOTARY_KEY_ID, NOTARY_ISSUER_ID, NOTARY_KEY_P8_BASE64,
 #         SPARKLE_ED_PRIVATE_KEY, CONVEX_DEPLOY_KEY, (SENTRY_DSN)
+
+cd packages/backend
+# Both deployments need all three — a var set on one is NOT visible to the
+# other, and a gap on prod is invisible in local testing.
+npx convex env list --names-only --prod   # prod: AUTH0_DOMAIN, AUTH0_AUDIENCE, OPENROUTER_API_KEY
+npx convex env list --names-only          # dev:  same three
 ```
 
 Then push a `v*` tag whose version matches `MARKETING_VERSION` in
