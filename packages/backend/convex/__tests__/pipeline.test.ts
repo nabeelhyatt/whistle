@@ -350,27 +350,39 @@ async function tick(t: ReturnType<typeof convexTest>, ms = 0) {
 // ─── Pure helper unit tests ────────────────────────────────────────────────
 
 describe("buildWorkspaceName", () => {
-  test("uses first 6 meaningful words of notes when present", () => {
+  test("uses the title when present", () => {
     const name = buildWorkspaceName({
       notes: "add a dark mode toggle to settings page please",
       transcript: "ignored",
       clientId: "abcdef123456",
       capturedAt: Date.now(),
+      title: "Dark mode toggle",
     });
-    expect(name).toBe("idea: add a dark mode toggle to #abcdef");
+    expect(name).toBe("Dark mode toggle #abcdef");
   });
 
-  test("falls back to transcript when notes is empty", () => {
+  test("falls back to first 6 meaningful words of notes when title is null", () => {
+    const name = buildWorkspaceName({
+      notes: "add a dark mode toggle to settings page please",
+      transcript: "ignored",
+      clientId: "abcdef123456",
+      capturedAt: Date.now(),
+      title: null,
+    });
+    expect(name).toBe("add a dark mode toggle to #abcdef");
+  });
+
+  test("falls back to transcript when notes is empty and no title", () => {
     const name = buildWorkspaceName({
       notes: "",
       transcript: "improve login flow speed",
       clientId: "123456abcdef",
       capturedAt: Date.now(),
     });
-    expect(name).toBe("idea: improve login flow speed #123456");
+    expect(name).toBe("improve login flow speed #123456");
   });
 
-  test("falls back to screenshot-only form when both are empty", () => {
+  test("falls back to screenshot-only form when both are empty and no title", () => {
     const capturedAt = new Date("2026-07-04T12:00:00.000Z").getTime();
     const name = buildWorkspaceName({
       notes: "",
@@ -378,7 +390,18 @@ describe("buildWorkspaceName", () => {
       clientId: "aaaaaa000000",
       capturedAt,
     });
-    expect(name).toBe("idea: screenshot capture 2026-07-04 #aaaaaa");
+    expect(name).toBe("Screenshot capture 2026-07-04 #aaaaaa");
+  });
+
+  test("empty-string title falls back like a missing title", () => {
+    const name = buildWorkspaceName({
+      notes: "",
+      transcript: "improve login flow speed",
+      clientId: "123456abcdef",
+      capturedAt: Date.now(),
+      title: "",
+    });
+    expect(name).toBe("improve login flow speed #123456");
   });
 });
 
@@ -966,7 +989,7 @@ describe("error: create succeeded but action died pre-patch", () => {
       workspaceId: "ws-orphan",
       sessionId: "sess-orphan",
       projectId: "proj-1",
-      name: `idea: orphan adoption test #${tag}`,
+      name: `orphan adoption test #${tag}`,
       status: "ready",
     });
 

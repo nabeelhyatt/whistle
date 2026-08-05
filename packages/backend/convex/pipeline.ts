@@ -32,6 +32,7 @@ import {
 } from "./conductorClient";
 import { credsFromSettings } from "./settings";
 import { renderTemplate } from "./promptRenderer";
+import { generateWorkspaceTitle } from "./titleGenerator";
 
 // ─── Tunables (TECH-SPEC §6) ────────────────────────────────────────────
 
@@ -58,31 +59,41 @@ const IN_FLIGHT_STATUSES = [
 // ─── Workspace naming (TECH-SPEC §6) ────────────────────────────────────
 
 /**
- * `workspaceName = "idea: " + firstMeaningfulWords(notes || transcript, 6) +
- * " #" + clientId.slice(0, 6)`; falls back to a screenshot-only form when
- * neither notes nor transcript has any words. Naming happens server-side
- * (here, not the app) so iOS inherits it unchanged (TECH-SPEC §6/§12).
+ * `workspaceName = title + " #" + clientId.slice(0, 6)`, where `title` is a
+ * Haiku-generated 3-5 word title (`titleGenerator.ts`) when available, else
+ * `firstMeaningfulWords(notes || transcript, 6)`; falls back further to
+ * `"Screenshot capture <YYYY-MM-DD>"` when neither notes nor transcript has
+ * any words. The trailing `#<clientId prefix>` tag is always present and is
+ * load-bearing (orphan-workspace adoption, below). Naming happens
+ * server-side (here, not the app) so iOS inherits it unchanged (TECH-SPEC
+ * §6/§12).
  */
 export function buildWorkspaceName(args: {
   notes: string;
   transcript: string;
   clientId: string;
   capturedAt: number;
+  title?: string | null;
 }): string {
+  const tag = args.clientId.slice(0, 6);
+
+  if (args.title !== undefined && args.title !== null && args.title.length > 0) {
+    return `${args.title} #${tag}`;
+  }
+
   const source = args.notes.trim().length > 0 ? args.notes : args.transcript;
   const words = source
     .trim()
     .split(/\s+/)
     .filter((w) => w.length > 0)
     .slice(0, 6);
-  const tag = args.clientId.slice(0, 6);
 
   if (words.length === 0) {
     const date = new Date(args.capturedAt).toISOString().slice(0, 10);
-    return `idea: screenshot capture ${date} #${tag}`;
+    return `Screenshot capture ${date} #${tag}`;
   }
 
-  return `idea: ${words.join(" ")} #${tag}`;
+  return `${words.join(" ")} #${tag}`;
 }
 
 /** Returns the `#<clientId prefix>` tag used for orphan-workspace adoption. */
@@ -392,6 +403,14 @@ async function runSubmit(
       transcript: capture.transcript,
       clientId: capture.clientId,
       capturedAt: capture.capturedAt,
+      // Only spend a Haiku call on a name that hasn't been persisted yet —
+      // the `capture.workspaceName ??` guard above already makes retries
+      // reuse the stored name, so this runs at most once per capture.
+      title: await generateWorkspaceTitle({
+        transcript: capture.transcript,
+        notes: capture.notes,
+        projectName: capture.projectName,
+      }),
     });
 
   const renderedPrompt = renderTemplate(template, {
