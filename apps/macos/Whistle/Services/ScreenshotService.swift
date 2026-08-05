@@ -12,10 +12,18 @@
 // one-shot acknowledgement the instant the ScreenCaptureKit request is
 // submitted (or, on any no-image path, immediately) so the caller can
 // present its capture panel AFTER the frame request is in flight but
-// WITHOUT waiting for image bytes or JPEG encoding. Submission-before-show
-// narrows the WindowServer race but isn't a hard guarantee, so the real
-// capturer also excludes Whistle's own app from the content filter — a
-// frame sampled even after the panel appears can never contain it.
+// WITHOUT waiting for image bytes or JPEG encoding. Submitting the request
+// before showing the panel is the PRIMARY protection against Whistle
+// capturing itself.
+//
+// As defense-in-depth the real capturer also tries to exclude Whistle's own
+// app from the content filter. Caveat: `SCShareableContent.current` only
+// enumerates apps that own a capturable window at fetch time, and on the bare
+// trigger path (no History/Settings window open, capture panel not yet
+// created) Whistle may own none — so `selfApp` can be nil and the exclusion
+// then no-ops. It reliably helps when Whistle already has another window open.
+// Whether the menu-bar status item keeps Whistle enumerable is verified in
+// MANUAL-QA, not assumed here.
 
 import AppKit
 import CoreGraphics
@@ -47,13 +55,14 @@ public protocol DisplayImageCapturing: Sendable {
     /// `nil` if capture failed for any reason (no displays, SCK error,
     /// etc.) — never throws.
     ///
-    /// `onCaptureStarted` fires EXACTLY ONCE on every path, on an arbitrary
+    /// `onCaptureStarted` fires AT LEAST ONCE on every path, on an arbitrary
     /// thread: immediately after the `SCScreenshotManager` request is
     /// submitted, or immediately before returning `nil` on any failure path
     /// (content fetch failed, no display). Semantics: "presenting UI can no
-    /// longer contaminate this capture." A conformance that fires it more
-    /// than once is tolerated (the sole caller's completion is idempotent);
-    /// a conformance that never fires it is covered by the caller's timeout.
+    /// longer contaminate this capture." The real capturer fires it exactly
+    /// once; the caller's completion is idempotent, so an extra fire is
+    /// harmless, and a conformance that never fires it is covered by the
+    /// caller's timeout fallback.
     func captureDisplayUnderCursor(onCaptureStarted: @escaping @Sendable () -> Void) async -> CGImage?
 }
 
@@ -78,10 +87,12 @@ public struct SCKitDisplayImageCapturer: DisplayImageCapturing {
             return nil
         }
 
-        // Exclude Whistle's own app from the capture so the panel (and any
-        // other Whistle window, e.g. History/Settings) can never appear in
-        // the frame — the invariant that submit-before-show alone can't
-        // guarantee across the WindowServer's independent request channels.
+        // Best-effort: exclude Whistle's own app so any Whistle window
+        // (History/Settings, or the capture panel if it races on-screen) is
+        // filtered out. `content.applications` only lists apps that currently
+        // own a capturable window, so on the bare trigger path this may be nil
+        // (see the file header) — a no-op fallback, not a guarantee. Ordering
+        // (submit-before-show) is the primary protection.
         let selfApp = content.applications.first {
             $0.processID == ProcessInfo.processInfo.processIdentifier
         }

@@ -20,9 +20,11 @@
 // is shown, and the panel is presented only after a one-shot capture-start
 // acknowledgement (or a short timeout fallback) — so the frame is requested
 // while Whistle is not yet on screen, without blocking presentation on image
-// bytes or JPEG encoding (the thumbnail fades in when it resolves). The real
-// capturer also excludes Whistle's own app from the frame, so exclusion is
-// invariant even if the panel appears before the frame is sampled.
+// bytes or JPEG encoding (the thumbnail fades in when it resolves). Submitting
+// the request before showing the panel is the primary protection against
+// Whistle capturing itself; the capturer's self-app content-filter exclusion
+// is a best-effort backstop (it may no-op on the bare path -- see
+// ScreenshotService's header).
 // `TranscriptionService.start()` happens on open (prewarmed engine, per
 // §4.2 point 3); panel visible + first responder immediately after the ack.
 //
@@ -217,12 +219,10 @@ public final class CapturePanelController: NSObject, NSWindowDelegate {
     /// visibility, not mere existence -- a dismissed-with-draft panel
     /// (fix #4b) still exists (to preserve its draft) but is not "open".
     var isPanelOpen: Bool { panelPresented }
-    var hasPreservedDraft: Bool { panel != nil && !panelPresented }
-    /// True while a screenshot-before-present handshake is in flight (request
-    /// dispatched, panel not yet presented). Deterministic main-actor state,
-    /// so tests can wait for a handshake to settle without depending on
-    /// AppKit window visibility (which lags/races in a headless test host).
-    var hasPendingPresentation: Bool { isPresentationPending }
+    /// A hidden panel that still exists to preserve its draft -- but NOT a
+    /// brand-new panel still mid-handshake (created, not yet presented), which
+    /// has `panel != nil` with `panelPresented == false` too.
+    var hasPreservedDraft: Bool { panel != nil && !panelPresented && !isPresentationPending }
     var currentViewModel: CaptureViewModel? { viewModel }
     func submitCurrentForTesting() { handleSubmit() }
     func requestSignInForTesting() { handleSignIn() }
@@ -409,6 +409,18 @@ public final class CapturePanelController: NSObject, NSWindowDelegate {
         guard let panel, !panelPresented else { return }
         showPanel(panel)
         onTimingMeasured(Date().timeIntervalSince(triggerStart))
+    }
+
+    /// Invalidates any in-flight present-after-ack handshake: bumps the
+    /// generation so a late ack/timeout fails the `completePendingPresentation`
+    /// guard, clears the pending flag, and cancels the timeout fallback. Does
+    /// not cancel `screenshotTask` -- a preserved-draft dismiss lets an
+    /// in-flight image still attach to the surviving view model.
+    private func invalidatePendingPresentation() {
+        presentationGeneration &+= 1
+        isPresentationPending = false
+        presentationTimeoutTask?.cancel()
+        presentationTimeoutTask = nil
     }
 
     private func focusExistingPanel(_ panel: NSPanel) {
@@ -628,6 +640,14 @@ public final class CapturePanelController: NSObject, NSWindowDelegate {
         }
         previousFrontmostApp = nil
 
+        // Invalidate any in-flight presentation handshake so a late ack or
+        // timeout can't re-present a panel the user just dismissed. Cannot
+        // happen via the production dismiss entry points (they're only armed
+        // after the panel is shown), but keeping the state-machine invariant
+        // self-contained -- rather than resting on external unreachability --
+        // is cheaper than reasoning about every future caller.
+        invalidatePendingPresentation()
+
         panelPresented = false
         if let panel { windowOps.orderOut(panel) }
     }
@@ -636,15 +656,11 @@ public final class CapturePanelController: NSObject, NSWindowDelegate {
     /// outright, discarding any preserved draft. Safe to call when nothing
     /// exists yet (all no-ops via optional chaining).
     private func tearDownPanel() {
-        // Invalidate any in-flight presentation handshake: the generation
-        // bump makes a late ack/timeout completion no-op, and cancelling the
-        // screenshot task bounds wasted encode work for a viewModel that's
-        // about to be released (the weak-viewModel + request-generation guard
-        // already drops the image regardless).
-        presentationGeneration &+= 1
-        isPresentationPending = false
-        presentationTimeoutTask?.cancel()
-        presentationTimeoutTask = nil
+        // Invalidate any in-flight presentation handshake, then also cancel
+        // the screenshot task -- this fully releases the viewModel, so bound
+        // the wasted encode work too (the weak-viewModel + request-generation
+        // guard already drops any late image regardless).
+        invalidatePendingPresentation()
         screenshotTask?.cancel()
         viewModel?.stopTranscription()
         panelPresented = false

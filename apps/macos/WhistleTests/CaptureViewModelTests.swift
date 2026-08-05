@@ -1591,7 +1591,9 @@ final class CapturePanelControllerTests: XCTestCase {
         try await Whistle_waitUntil { controller.isPanelOpen }
         XCTAssertNil(controller.currentViewModel?.screenshotData, "panel opened before the image was delivered")
 
-        // Deliver the image: it attaches asynchronously.
+        // Deliver the image (once the capturer has parked at Gate B): it
+        // attaches asynchronously.
+        try await Whistle_waitUntil { capturer.deliveryWaitingCount == 1 }
         capturer.releaseDelivery()
         try await Whistle_waitUntil { controller.currentViewModel?.screenshotData != nil }
     }
@@ -1628,6 +1630,11 @@ final class CapturePanelControllerTests: XCTestCase {
 
         capturer.releaseStart()
         try await Whistle_waitUntil { controller.isPanelOpen }
+
+        // Drain the second capture's delivery gate so no continuation is left
+        // parked when the test ends.
+        try await Whistle_waitUntil { capturer.deliveryWaitingCount == 1 }
+        capturer.releaseDelivery()
     }
 
     /// A slow image result must not delay panel presentation: once the
@@ -1651,6 +1658,7 @@ final class CapturePanelControllerTests: XCTestCase {
         XCTAssertNil(controller.currentViewModel?.screenshotData)
         controller.currentViewModel?.transcriptText = "typed before the screenshot arrived"
 
+        try await Whistle_waitUntil { capturer.deliveryWaitingCount == 1 }
         capturer.releaseDelivery()
         try await Whistle_waitUntil { controller.currentViewModel?.screenshotData != nil }
         XCTAssertEqual(
@@ -1734,6 +1742,11 @@ final class CapturePanelControllerTests: XCTestCase {
         try await Whistle_waitUntil { controller.isPanelOpen }
         XCTAssertEqual(capturer.enteredCount, 1, "still exactly one capture after the panel opens")
         XCTAssertTrue(controller.currentViewModel === viewModel, "the same view model is the one presented")
+
+        // Drain the single capture's delivery gate so no continuation is left
+        // parked when the test ends.
+        try await Whistle_waitUntil { capturer.deliveryWaitingCount == 1 }
+        capturer.releaseDelivery()
     }
 
     /// A duplicate-as-new preFill arriving mid-handshake REPLACES the pending
@@ -1841,12 +1854,11 @@ final class CapturePanelControllerTests: XCTestCase {
 
             controller.trigger()
             try await waitForScreenshotCount(1, counter: counter)
-            // Settle the first handshake on deterministic controller state
-            // rather than window visibility: we only need the presentation to
-            // have completed (isPresentationPending cleared) so the reopen
-            // below doesn't coalesce -- the panel's real visibility lags/races
-            // in the headless test host, especially in `.activating` mode.
-            try await Whistle_waitUntil { !controller.hasPendingPresentation }
+            // `isPanelOpen` is the deterministic `panelPresented` flag (the
+            // no-op window seam means no real AppKit visibility to race), and
+            // it flips true only once the first handshake completes -- so this
+            // also guarantees the reopen below won't coalesce.
+            try await Whistle_waitUntil { controller.isPanelOpen }
 
             controller.currentViewModel?.clear()
             XCTAssertNil(controller.currentViewModel?.screenshotData, "clear must remove the previous screenshot")
@@ -2073,7 +2085,6 @@ private final class GatedCapturer: DisplayImageCapturing, @unchecked Sendable {
     private var deliveryContinuations: [CheckedContinuation<CGImage?, Never>] = []
     private var _enteredCount = 0
     private var _startWaitingCount = 0
-    private var _ackedCount = 0
     private var _deliveryWaitingCount = 0
     private let image: CGImage?
     private let parkBeforeAck: Bool
@@ -2093,8 +2104,6 @@ private final class GatedCapturer: DisplayImageCapturing, @unchecked Sendable {
     var enteredCount: Int { lock.lock(); defer { lock.unlock() }; return _enteredCount }
     /// Callers currently parked at Gate A.
     var startWaitingCount: Int { lock.lock(); defer { lock.unlock() }; return _startWaitingCount }
-    /// Times `onCaptureStarted` has fired.
-    var ackedCount: Int { lock.lock(); defer { lock.unlock() }; return _ackedCount }
     /// Callers currently parked at Gate B.
     var deliveryWaitingCount: Int { lock.lock(); defer { lock.unlock() }; return _deliveryWaitingCount }
 
@@ -2108,7 +2117,6 @@ private final class GatedCapturer: DisplayImageCapturing, @unchecked Sendable {
                 lock.unlock()
             }
         }
-        lock.lock(); _ackedCount += 1; lock.unlock()
         onCaptureStarted()
         return await withCheckedContinuation { (continuation: CheckedContinuation<CGImage?, Never>) in
             lock.lock()
