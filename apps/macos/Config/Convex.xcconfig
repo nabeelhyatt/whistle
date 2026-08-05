@@ -2,8 +2,13 @@
 // Convex deployment URL for team `nabeelo`, project `whistle`, deployment
 // `precious-loris-637` — the *production* deployment (TECH-SPEC §2a). Not a
 // secret (it's a public HTTPS endpoint), but kept out of source per
-// TECH-SPEC's "env/xcconfig, never hardcoded" convention so switching
-// deployments never requires a source-code change.
+// TECH-SPEC's "env/xcconfig, never hardcoded" convention so this is the one
+// place a deployment switch is configured.
+//
+// One exception to "never hardcoded": `WhistleApp.fallbackConvexUrl` carries
+// the same value as a launch-time emergency default (so a missing plist entry
+// can't crash the app), and must be changed alongside this file. That is the
+// only other place the URL appears.
 //
 // Ships prod, not dev, since 1.0.20. `grandiose-alpaca-243` is the *dev*
 // deployment `npx convex dev` pushes to, and it was what shipped through

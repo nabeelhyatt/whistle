@@ -393,8 +393,9 @@ async function runSubmit(
   // and createWorkspace would then fail with an opaque 4xx that burns all five
   // retries and strands the capture in "Agent working" pointing at a workspace
   // the user can't open. Fail fast with a Settings-routing message instead.
-  // Runs only on a fresh submit (no workspaceId yet); adopted/created captures
-  // skip it on later passes.
+  // Gated on `needsWorkspace` — either id still missing — so it runs on a fresh
+  // submit and on any later pass that still has workspace setup left to do. A
+  // capture with both ids already patched skips it and goes straight to sending.
   if (needsWorkspace && !(await projectVisibleToKey(creds, capture.projectId))) {
     await patchCapture(ctx, captureId, {
       status: "failed",

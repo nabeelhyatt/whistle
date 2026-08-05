@@ -181,14 +181,18 @@ call is made server-side by `packages/backend/convex/titleGenerator.ts` to
 generate the 3-5 word Conductor workspace title. Set on **both**
 deployments, same caveat as Auth0 above:
 
+Copy the key from openrouter.ai → Keys, then pipe it in from the clipboard.
+Omitting the value keeps the secret out of shell history and out of the
+process argument list (`ps`), which passing it inline would not:
+
 ```sh
 cd packages/backend
-npx convex env set --prod OPENROUTER_API_KEY sk-or-v1-…
-npx convex env set        OPENROUTER_API_KEY sk-or-v1-…
+pbpaste | npx convex env set --prod OPENROUTER_API_KEY
+pbpaste | npx convex env set        OPENROUTER_API_KEY
 ```
 
-Key from openrouter.ai → Keys. It funds `anthropic/claude-haiku-4.5`
-(`TITLE_MODEL`), roughly a few hundred output tokens per capture.
+It funds `anthropic/claude-haiku-4.5` (`TITLE_MODEL`), roughly a few hundred
+output tokens per capture.
 
 **This one fails silently by design.** `generateWorkspaceTitle` never
 throws: a missing key returns `null` and `buildWorkspaceName` falls back to
@@ -208,7 +212,10 @@ gh secret list
 #         SPARKLE_ED_PRIVATE_KEY, CONVEX_DEPLOY_KEY, (SENTRY_DSN)
 
 cd packages/backend
-npx convex env list --prod   # Expect: AUTH0_DOMAIN, AUTH0_AUDIENCE, OPENROUTER_API_KEY
+# Both deployments need all three — a var set on one is NOT visible to the
+# other, and a gap on prod is invisible in local testing.
+npx convex env list --names-only --prod   # prod: AUTH0_DOMAIN, AUTH0_AUDIENCE, OPENROUTER_API_KEY
+npx convex env list --names-only          # dev:  same three
 ```
 
 Then push a `v*` tag whose version matches `MARKETING_VERSION` in
