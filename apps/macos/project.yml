@@ -140,5 +140,12 @@ schemes:
       config: Debug
       targets:
         - WhistleTests
+      # The test host is the full Whistle.app, so its composition root runs on
+      # launch. This flag makes it use the in-memory breadcrumb store + dev
+      # auth provider instead of the Keychain-backed ones, so an ad-hoc-signed
+      # test build never triggers a login-keychain access prompt (see
+      # WhistleApp.isRunningUnderTest and AGENTS.md).
+      environmentVariables:
+        WHISTLE_TESTING: "1"
     run:
       config: Debug

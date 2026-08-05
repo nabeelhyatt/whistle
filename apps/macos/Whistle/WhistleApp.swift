@@ -105,7 +105,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let auth = AuthController(
             authProvider: authProvider,
             convexService: convexService,
-            breadcrumbStore: KeychainAuthBreadcrumbStore(),
+            breadcrumbStore: Self.makeBreadcrumbStore(),
             performInteractiveLogin: Self.makeInteractiveLogin(authProvider: authProvider),
             isDevSignIn: authProvider is DevSignInAuthProvider
         )
@@ -491,6 +491,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - Wiring
 
     private static func makeAuthProvider() -> any WhistleAuthProvider {
+        // Under `xcodebuild test` the host app is the full Whistle.app, so this
+        // composition root runs on launch. Never construct `Auth0AuthProvider`
+        // there: its `CredentialsManager` reads the login keychain (service =
+        // bundle id `build.conductor.whistle.app`), and because every test
+        // build is ad-hoc signed with a shifting signature, macOS prompts for
+        // keychain access on every launch (multiplied by any looped run). The
+        // dev fallback never touches the keychain. Automated tests inject their
+        // own provider into `AuthController` directly, so this only affects the
+        // untested composition root (see AGENTS.md "Testing" -> keychain note).
+        if isRunningUnderTest {
+            return DevSignInAuthProvider()
+        }
         // Real Auth0 wiring when the xcconfig-injected tenant config is
         // present and non-placeholder; otherwise the local dev sign-in
         // fallback, so a fresh checkout with placeholder Auth0.xcconfig
@@ -502,6 +514,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSLog("Whistle: Auth0 is not configured (placeholder AUTH0_DOMAIN/AUTH0_CLIENT_ID) — using local dev sign-in fallback")
         return DevSignInAuthProvider()
     }
+
+    /// In-memory breadcrumb store under test (no login-keychain read), the
+    /// real Keychain store otherwise. Same rationale as `makeAuthProvider`'s
+    /// test carve-out: the breadcrumb store's `hasSignedInBefore()` reads the
+    /// keychain (service `build.conductor.whistle.auth`) on launch.
+    private static func makeBreadcrumbStore() -> any AuthBreadcrumbStore {
+        isRunningUnderTest ? InMemoryAuthBreadcrumbStore() : KeychainAuthBreadcrumbStore()
+    }
+
+    /// True when the app-host launch is an `xcodebuild test` run. Detected via
+    /// the `WHISTLE_TESTING` env var set by the test scheme (project.yml),
+    /// with the XCTest bundle's presence as a belt-and-suspenders fallback for
+    /// any launch path that doesn't go through the scheme. Production never
+    /// sets the env var and never links XCTest, so this is always false there.
+    static let isRunningUnderTest: Bool = {
+        ProcessInfo.processInfo.environment["WHISTLE_TESTING"] == "1"
+            || NSClassFromString("XCTestCase") != nil
+    }()
 
     private static func makeInteractiveLogin(authProvider: any WhistleAuthProvider) -> @Sendable () async throws -> Void {
         {
