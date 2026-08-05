@@ -386,6 +386,15 @@ async function runSubmit(
 
   const needsWorkspace =
     capture.workspaceId === undefined || capture.sessionId === undefined;
+  // Project-visibility guard (canonical-accounts). The stored key must be able
+  // to see this capture's project. A key that belongs to a *different*
+  // Conductor account than the one the user picked the project under lists a
+  // different project set (or none) — orphan-adoption's listProjectWorkspaces
+  // and createWorkspace would then fail with an opaque 4xx that burns all five
+  // retries and strands the capture in "Agent working" pointing at a workspace
+  // the user can't open. Fail fast with a Settings-routing message instead.
+  // Runs only on a fresh submit (no workspaceId yet); adopted/created captures
+  // skip it on later passes.
   if (needsWorkspace && !(await projectVisibleToKey(creds, capture.projectId))) {
     await patchCapture(ctx, captureId, {
       status: "failed",
@@ -442,15 +451,6 @@ async function runSubmit(
   let deepLink = capture.deepLink;
 
   if (needsWorkspace) {
-    // 3·0. Project-visibility guard (canonical-accounts). The stored key must
-    // be able to see this capture's project. A key that belongs to a
-    // *different* Conductor account than the one the user picked the project
-    // under lists a different project set (or none) — orphan-adoption's
-    // listProjectWorkspaces and createWorkspace would then fail with an opaque
-    // 4xx that burns all five retries and strands the capture in "Agent
-    // working" pointing at a workspace the user can't open. Fail fast with a
-    // Settings-routing message instead. Runs only on a fresh submit (no
-    // workspaceId yet); adopted/created captures skip it on later passes.
     // 3a. Orphan adoption: search for a workspace already tagged with our
     // clientId (a previous run created it but died before patching ids).
     const tag = orphanTag(capture.clientId);

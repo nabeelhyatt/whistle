@@ -71,10 +71,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// Convex deployment URL — read from Info.plist (`CONVEX_URL`, injected
     /// via xcconfig, see project.yml), never hardcoded. Falls back to the
-    /// known grandiose-alpaca-243 deployment as a hardcoded emergency
-    /// default only if the plist entry is somehow absent, so the app never
-    /// crashes at launch over a missing config value.
-    private static let fallbackConvexUrl = "https://grandiose-alpaca-243.convex.cloud"
+    /// known precious-loris-637 production deployment as a hardcoded
+    /// emergency default only if the plist entry is somehow absent, so the
+    /// app never crashes at launch over a missing config value. Keep this in
+    /// sync with `Config/Convex.xcconfig` — a fallback pointing at a
+    /// different deployment than the xcconfig turns an xcconfig typo into a
+    /// silent switch to the wrong backend rather than a visible failure.
+    private static let fallbackConvexUrl = "https://precious-loris-637.convex.cloud"
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)

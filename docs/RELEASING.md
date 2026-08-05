@@ -79,6 +79,19 @@ and user-facing — "Faster capture panel startup", not a commit message or a fi
    never needs touching again. Kept here for the record — future releases start at step 1.
 1. **Bump the version.** In the PR with your app changes, bump `MARKETING_VERSION` in
    `apps/macos/project.yml` by one patch (per AGENTS.md "Version Bumping"). Merge to `main`.
+1a. **If the release depends on a backend change, confirm the backend actually deployed** —
+   `release.yml` ships the app; it does not touch Convex. `backend-deploy.yml` does, and it
+   only runs on pushes touching `packages/backend/**`. Shipping a DMG whose behavior depends
+   on undeployed backend code produces a build that looks correct in `main` and wrong in
+   users' hands, with nothing red anywhere:
+   ```sh
+   gh run list --workflow=backend-deploy.yml -L 1
+   gh run view <id> --json jobs -q '.jobs[].steps[] | "\(.conclusion) \(.name)"'
+   # "Deploy to Convex" must be `success`, NOT `skipped` — skipped means
+   # CONVEX_DEPLOY_KEY is missing (SECRETS.md §4) and nothing was deployed.
+   ```
+   Belt-and-braces check that the deployment has the code, not just that CI was green:
+   `cd packages/backend && npx convex function-spec --prod | grep <a-function-your-change-added>`.
 2. **Tag and push.** From `main` at the merged commit, as an **annotated** tag carrying 2-4
    short, user-facing release-note bullets as the message (the `/release` skill drafts these
    for you from the commits since the last tag — see "Release notes" above):
