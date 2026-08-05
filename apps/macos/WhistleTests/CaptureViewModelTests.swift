@@ -194,6 +194,26 @@ private enum TestSupport {
     }
 
     static let sampleScreenshot = Data([0xFF, 0xD8, 0xFF, 0xD9]) // minimal JPEG-ish bytes, content irrelevant to tests
+
+    /// A tiny real `CGImage` so a `GatedCapturer` can hand `ScreenshotService`
+    /// something its encode pipeline turns into actual JPEG bytes -- letting
+    /// the "image attaches after the panel opens" assertion check for non-nil
+    /// `screenshotData` rather than a scripted placeholder.
+    static func makeCGImage(width: Int = 2, height: Int = 2) -> CGImage {
+        let colorSpace = CGColorSpaceCreateDeviceRGB()
+        let context = CGContext(
+            data: nil,
+            width: width,
+            height: height,
+            bitsPerComponent: 8,
+            bytesPerRow: 0,
+            space: colorSpace,
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        )!
+        context.setFillColor(CGColor(red: 0.2, green: 0.4, blue: 0.6, alpha: 1))
+        context.fill(CGRect(x: 0, y: 0, width: width, height: height))
+        return context.makeImage()!
+    }
 }
 
 /// Polls `condition` on the main actor until it's true or the timeout
@@ -1395,7 +1415,7 @@ final class CapturePanelControllerTests: XCTestCase {
             defer { try? FileManager.default.removeItem(at: tempDir) }
             try store.saveProjectsSnapshot([TestSupport.project1])
 
-            let controller = CapturePanelController(store: store, mode: mode, micPermissionStatus: { .granted }, speechPermissionStatus: { .granted }, transcriptionServiceFactory: { FakeTranscriptionService() })
+            let controller = CapturePanelController(store: store, mode: mode, micPermissionStatus: { .granted }, speechPermissionStatus: { .granted }, transcriptionServiceFactory: { FakeTranscriptionService() }, windowOps: .noop)
             controller.trigger()
             // Poll rather than a fixed sleep: `.activating` mode's
             // NSApp.activate()/makeKeyAndOrderFront() can lag under
@@ -1429,7 +1449,8 @@ final class CapturePanelControllerTests: XCTestCase {
             speechPermissionStatus: { .granted },
             transcriptionServiceFactory: { FakeTranscriptionService() },
             authStateProvider: { authState },
-            requestSignIn: { signInRequestCount += 1 }
+            requestSignIn: { signInRequestCount += 1 },
+            windowOps: .noop
         )
         controller.trigger()
         try await Whistle_waitUntil { controller.isPanelOpen }
@@ -1471,11 +1492,16 @@ final class CapturePanelControllerTests: XCTestCase {
 
             let counter = CaptureCounter()
             let screenshotService = makeCountingScreenshotService(counter: counter)
-            let controller = CapturePanelController(store: store, screenshotService: screenshotService, mode: mode, micPermissionStatus: { .granted }, speechPermissionStatus: { .granted }, transcriptionServiceFactory: { FakeTranscriptionService() })
+            let controller = CapturePanelController(store: store, screenshotService: screenshotService, mode: mode, micPermissionStatus: { .granted }, speechPermissionStatus: { .granted }, transcriptionServiceFactory: { FakeTranscriptionService() }, windowOps: .noop)
 
             controller.trigger()
             try await waitForScreenshotCount(1, counter: counter)
             XCTAssertEqual(counter.count, 1, "mode \(mode): first trigger should capture exactly one screenshot")
+            // Presentation is deferred to the capture-start ack, which lands
+            // just after the preflight counter bump -- wait for the panel to
+            // actually be visible so the second trigger exercises the
+            // already-open (branch 1) path, not the mid-handshake coalesce.
+            try await Whistle_waitUntil { controller.isPanelOpen }
 
             controller.trigger()
             XCTAssertEqual(counter.count, 1, "mode \(mode): duplicate trigger while open must not re-screenshot")
@@ -1493,7 +1519,8 @@ final class CapturePanelControllerTests: XCTestCase {
             screenshotService: makeCountingScreenshotService(counter: counter),
             micPermissionStatus: { .granted },
             speechPermissionStatus: { .granted },
-            transcriptionServiceFactory: { FakeTranscriptionService() }
+            transcriptionServiceFactory: { FakeTranscriptionService() },
+            windowOps: .noop
         )
         let screenshot = TestSupport.sampleScreenshot
 
@@ -1515,6 +1542,279 @@ final class CapturePanelControllerTests: XCTestCase {
         XCTAssertEqual(counter.count, 0, "duplicate-as-new must retain its supplied screenshot")
     }
 
+    // MARK: Screenshot-before-panel ordering (present after the capture-start
+    // ack). A `GatedCapturer` holds two continuation gates so the ordering is
+    // asserted deterministically -- no fixed sleeps. Every ordering test sets
+    // a long `screenshotStartTimeout` so the fallback can't race the gates.
+
+    /// Controller wired with a preflight + gated capturer and a handshake
+    /// timeout long enough that only an explicit gate release can present.
+    @MainActor
+    private func makeGatedController(
+        store: CaptureStore,
+        preflight: any ScreenCapturePreflightChecking,
+        capturer: any DisplayImageCapturing,
+        timeout: TimeInterval = 60
+    ) -> CapturePanelController {
+        let controller = CapturePanelController(
+            store: store,
+            screenshotService: ScreenshotService(preflight: preflight, capturer: capturer),
+            micPermissionStatus: { .granted },
+            speechPermissionStatus: { .granted },
+            transcriptionServiceFactory: { FakeTranscriptionService() },
+            windowOps: .noop
+        )
+        controller.screenshotStartTimeout = timeout
+        return controller
+    }
+
+    /// A fresh capture must submit the ScreenCaptureKit request BEFORE the
+    /// panel is visible, and present only once the capture-start ack lands --
+    /// without waiting for the image bytes.
+    @MainActor
+    func testFreshCaptureSubmitsRequestBeforePresentingPanel() async throws {
+        let (store, tempDir) = try makeStore()
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let capturer = GatedCapturer(image: TestSupport.makeCGImage())
+        let controller = makeGatedController(store: store, preflight: GrantedPreflight(), capturer: capturer)
+
+        controller.trigger()
+
+        // The request has reached the capturer (parked at Gate A) while the
+        // panel is provably still hidden -- the load-bearing ordering proof.
+        try await Whistle_waitUntil { capturer.startWaitingCount == 1 }
+        XCTAssertFalse(controller.isPanelOpen, "panel must be hidden while the capture request is being submitted")
+
+        // Release the ack: the panel presents now, still ahead of the image.
+        capturer.releaseStart()
+        try await Whistle_waitUntil { controller.isPanelOpen }
+        XCTAssertNil(controller.currentViewModel?.screenshotData, "panel opened before the image was delivered")
+
+        // Deliver the image (once the capturer has parked at Gate B): it
+        // attaches asynchronously.
+        try await Whistle_waitUntil { capturer.deliveryWaitingCount == 1 }
+        capturer.releaseDelivery()
+        try await Whistle_waitUntil { controller.currentViewModel?.screenshotData != nil }
+    }
+
+    /// Clear -> dismiss -> reopen must apply the same ordering: the fresh
+    /// screenshot request on reopen is submitted before the panel re-presents.
+    @MainActor
+    func testClearReopenSubmitsRequestBeforePresentingPanel() async throws {
+        let (store, tempDir) = try makeStore()
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let capturer = GatedCapturer(image: TestSupport.makeCGImage())
+        let controller = makeGatedController(store: store, preflight: GrantedPreflight(), capturer: capturer)
+
+        // Open, settle, and finish the first capture cleanly.
+        controller.trigger()
+        try await Whistle_waitUntil { capturer.startWaitingCount == 1 }
+        capturer.releaseStart()
+        try await Whistle_waitUntil { controller.isPanelOpen }
+        capturer.releaseDelivery()
+        try await Whistle_waitUntil { controller.currentViewModel?.screenshotData != nil }
+
+        // Clear defers a fresh screenshot to the next open; dismiss hides the
+        // panel while preserving the (now-empty) draft.
+        controller.currentViewModel?.clear()
+        controller.dismissPreservingDraftForTesting()
+        XCTAssertFalse(controller.isPanelOpen)
+
+        // Reopen: the second request is submitted (Gate A) with the panel
+        // still hidden, exactly as the fresh path.
+        controller.trigger()
+        try await Whistle_waitUntil { capturer.enteredCount == 2 }
+        XCTAssertFalse(controller.isPanelOpen, "reopen after Clear must submit the new request before presenting")
+
+        capturer.releaseStart()
+        try await Whistle_waitUntil { controller.isPanelOpen }
+
+        // Drain the second capture's delivery gate so no continuation is left
+        // parked when the test ends.
+        try await Whistle_waitUntil { capturer.deliveryWaitingCount == 1 }
+        capturer.releaseDelivery()
+    }
+
+    /// A slow image result must not delay panel presentation: once the
+    /// request is in flight the panel opens and stays usable, and a late
+    /// image attaches without disturbing the draft.
+    @MainActor
+    func testPanelIsUsableAfterRequestSubmissionBeforeImageAttaches() async throws {
+        let (store, tempDir) = try makeStore()
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let capturer = GatedCapturer(image: TestSupport.makeCGImage())
+        let controller = makeGatedController(store: store, preflight: GrantedPreflight(), capturer: capturer)
+
+        controller.trigger()
+        try await Whistle_waitUntil { capturer.startWaitingCount == 1 }
+        capturer.releaseStart()
+        try await Whistle_waitUntil { controller.isPanelOpen }
+
+        // Gate B still holds the image -- the panel is fully usable without a
+        // thumbnail. Typing into it must survive the late image attachment.
+        XCTAssertNil(controller.currentViewModel?.screenshotData)
+        controller.currentViewModel?.transcriptText = "typed before the screenshot arrived"
+
+        try await Whistle_waitUntil { capturer.deliveryWaitingCount == 1 }
+        capturer.releaseDelivery()
+        try await Whistle_waitUntil { controller.currentViewModel?.screenshotData != nil }
+        XCTAssertEqual(
+            controller.currentViewModel?.transcriptText,
+            "typed before the screenshot arrived",
+            "a late image must not disturb text typed before it arrived"
+        )
+    }
+
+    /// A denied/unavailable screenshot start still presents a usable
+    /// no-screenshot panel: the service-level ack alone releases presentation
+    /// and the capturer is never reached.
+    @MainActor
+    func testDeniedScreenshotStartStillPresentsUsablePanel() async throws {
+        let (store, tempDir) = try makeStore()
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let capturer = GatedCapturer(image: TestSupport.makeCGImage())
+        let controller = makeGatedController(store: store, preflight: DeniedPreflight(), capturer: capturer)
+
+        controller.trigger()
+        try await Whistle_waitUntil { controller.isPanelOpen }
+
+        XCTAssertEqual(capturer.enteredCount, 0, "denied preflight must short-circuit before the capturer")
+        XCTAssertNil(controller.currentViewModel?.screenshotData, "no screenshot on the denied path")
+    }
+
+    /// A hung/slow capturer (ack never fires) must not hold the panel
+    /// hostage: the timeout fallback presents anyway, and a late ack + image
+    /// still land without error afterwards.
+    @MainActor
+    func testTimeoutFallbackPresentsPanelWhenAckIsSlow() async throws {
+        let (store, tempDir) = try makeStore()
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let capturer = GatedCapturer(image: TestSupport.makeCGImage())
+        let controller = makeGatedController(
+            store: store,
+            preflight: GrantedPreflight(),
+            capturer: capturer,
+            timeout: 0.05
+        )
+
+        controller.trigger()
+        // Gate A is never released before this -- the panel opens only via
+        // the fallback timeout, not the ack.
+        try await Whistle_waitUntil(timeout: 2) { controller.isPanelOpen }
+
+        // A late ack (no double-show) and a late image still resolve cleanly.
+        // Release start, wait for the capturer to actually reach the delivery
+        // gate, then release it -- releasing back-to-back would no-op the
+        // delivery when the capturer hasn't parked there yet.
+        capturer.releaseStart()
+        try await Whistle_waitUntil { capturer.deliveryWaitingCount == 1 }
+        capturer.releaseDelivery()
+        try await Whistle_waitUntil { controller.currentViewModel?.screenshotData != nil }
+        XCTAssertTrue(controller.isPanelOpen, "panel stays open after the late ack/image")
+    }
+
+    /// Repeated plain triggers during the handshake coalesce: no duplicate
+    /// capture job and no duplicate panel/view model.
+    @MainActor
+    func testRepeatedTriggersDuringHandshakeCoalesce() async throws {
+        let (store, tempDir) = try makeStore()
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let capturer = GatedCapturer(image: TestSupport.makeCGImage())
+        let controller = makeGatedController(store: store, preflight: GrantedPreflight(), capturer: capturer)
+
+        controller.trigger()
+        try await Whistle_waitUntil { capturer.startWaitingCount == 1 }
+        let viewModel = controller.currentViewModel
+
+        controller.trigger()
+        controller.trigger()
+
+        XCTAssertEqual(capturer.enteredCount, 1, "re-triggers during the handshake must not start a second capture")
+        XCTAssertTrue(controller.currentViewModel === viewModel, "no duplicate view model during the handshake")
+
+        capturer.releaseStart()
+        try await Whistle_waitUntil { controller.isPanelOpen }
+        XCTAssertEqual(capturer.enteredCount, 1, "still exactly one capture after the panel opens")
+        XCTAssertTrue(controller.currentViewModel === viewModel, "the same view model is the one presented")
+
+        // Drain the single capture's delivery gate so no continuation is left
+        // parked when the test ends.
+        try await Whistle_waitUntil { capturer.deliveryWaitingCount == 1 }
+        capturer.releaseDelivery()
+    }
+
+    /// A duplicate-as-new preFill arriving mid-handshake REPLACES the pending
+    /// panel and shows synchronously with its own bytes; the original,
+    /// now-stale handshake must not resurrect or overwrite it.
+    @MainActor
+    func testDuplicateAsNewMidHandshakeReplacesPendingPanel() async throws {
+        let (store, tempDir) = try makeStore()
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let capturer = GatedCapturer(image: TestSupport.makeCGImage())
+        let controller = makeGatedController(store: store, preflight: GrantedPreflight(), capturer: capturer)
+        let bytes = TestSupport.sampleScreenshot
+
+        controller.trigger()
+        try await Whistle_waitUntil { capturer.startWaitingCount == 1 }
+
+        // Duplicate-as-new arrives while the first handshake is pending: it
+        // replaces the pending panel and shows synchronously with its bytes.
+        controller.trigger(preFill: CapturePreFill(transcript: "dup", notes: "", screenshotData: bytes))
+        try await Whistle_waitUntil { controller.isPanelOpen }
+        let replacement = controller.currentViewModel
+        XCTAssertEqual(replacement?.screenshotData, bytes)
+        XCTAssertEqual(replacement?.transcriptText, "dup")
+
+        // Release the ORIGINAL capture. Its stale ack (wrong generation) and
+        // stale image (cancelled task) must not touch the replacement panel.
+        capturer.releaseStart()
+        try await Whistle_waitUntil { capturer.deliveryWaitingCount == 1 }
+        capturer.releaseDelivery()
+        let settle = expectation(description: "let any stale completion attempt to fire")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { settle.fulfill() }
+        await fulfillment(of: [settle], timeout: 1)
+
+        XCTAssertTrue(controller.currentViewModel === replacement, "a stale handshake must not swap the view model")
+        XCTAssertEqual(controller.currentViewModel?.screenshotData, bytes, "a stale image must not overwrite the duplicate's bytes")
+        XCTAssertTrue(controller.isPanelOpen)
+    }
+
+    /// A capture whose panel hasn't been presented yet (mid present-after-ack
+    /// handshake) must still read as an active session, so the Sparkle update
+    /// gate stays busy and a relaunch can't discard an in-flight draft during
+    /// the async window.
+    @MainActor
+    func testCaptureSessionStaysActiveDuringHandshakeSoUpdateGateStaysBusy() async throws {
+        let (store, tempDir) = try makeStore()
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let capturer = GatedCapturer(image: TestSupport.makeCGImage())
+        let controller = makeGatedController(store: store, preflight: GrantedPreflight(), capturer: capturer)
+
+        XCTAssertFalse(controller.isCaptureSessionActive, "no capture in flight -> update gate is idle")
+
+        controller.trigger()
+        try await Whistle_waitUntil { capturer.startWaitingCount == 1 }
+        // Panel not shown yet, but a capture is in flight: the gate must be busy.
+        XCTAssertFalse(controller.isPanelOpen, "panel is not presented mid-handshake")
+        XCTAssertTrue(controller.isCaptureSessionActive, "a pending handshake keeps the update gate busy")
+
+        capturer.releaseStart()
+        try await Whistle_waitUntil { controller.isPanelOpen }
+        XCTAssertTrue(controller.isCaptureSessionActive, "a presented panel keeps the gate busy")
+
+        try await Whistle_waitUntil { capturer.deliveryWaitingCount == 1 }
+        capturer.releaseDelivery()
+        try await Whistle_waitUntil { controller.currentViewModel?.screenshotData != nil }
+    }
+
     // MARK: Fix #4b/c: dismissing (Esc / losing key) preserves the draft;
     // reopening restores it without retaking the screenshot.
 
@@ -1526,7 +1826,7 @@ final class CapturePanelControllerTests: XCTestCase {
 
             let counter = CaptureCounter()
             let screenshotService = makeCountingScreenshotService(counter: counter)
-            let controller = CapturePanelController(store: store, screenshotService: screenshotService, mode: mode, micPermissionStatus: { .granted }, speechPermissionStatus: { .granted }, transcriptionServiceFactory: { FakeTranscriptionService() })
+            let controller = CapturePanelController(store: store, screenshotService: screenshotService, mode: mode, micPermissionStatus: { .granted }, speechPermissionStatus: { .granted }, transcriptionServiceFactory: { FakeTranscriptionService() }, windowOps: .noop)
 
             controller.trigger()
             // Poll rather than a fixed sleep: `trigger()` fires the
@@ -1537,6 +1837,10 @@ final class CapturePanelControllerTests: XCTestCase {
             // continuation-based fix in TranscriptStitchingTests.
             try await waitForScreenshotCount(1, counter: counter)
             XCTAssertEqual(counter.count, 1, "mode \(mode): first trigger captures exactly one screenshot")
+            // Wait for the deferred presentation before dismissing, so the
+            // dismiss acts on a shown panel (matching real usage) rather than
+            // racing an in-flight handshake.
+            try await Whistle_waitUntil { controller.isPanelOpen }
 
             controller.currentViewModel?.transcriptText = "unsent draft for \(mode)"
             controller.currentViewModel?.notesText = "draft notes for \(mode)"
@@ -1573,11 +1877,17 @@ final class CapturePanelControllerTests: XCTestCase {
                 mode: mode,
                 micPermissionStatus: { .granted },
                 speechPermissionStatus: { .granted },
-                transcriptionServiceFactory: { FakeTranscriptionService() }
+                transcriptionServiceFactory: { FakeTranscriptionService() },
+                windowOps: .noop
             )
 
             controller.trigger()
             try await waitForScreenshotCount(1, counter: counter)
+            // `isPanelOpen` is the deterministic `panelPresented` flag (the
+            // no-op window seam means no real AppKit visibility to race), and
+            // it flips true only once the first handshake completes -- so this
+            // also guarantees the reopen below won't coalesce.
+            try await Whistle_waitUntil { controller.isPanelOpen }
 
             controller.currentViewModel?.clear()
             XCTAssertNil(controller.currentViewModel?.screenshotData, "clear must remove the previous screenshot")
@@ -1595,7 +1905,7 @@ final class CapturePanelControllerTests: XCTestCase {
         let (store, tempDir) = try makeStore()
         defer { try? FileManager.default.removeItem(at: tempDir) }
 
-        let controller = CapturePanelController(store: store, micPermissionStatus: { .granted }, speechPermissionStatus: { .granted }, transcriptionServiceFactory: { FakeTranscriptionService() })
+        let controller = CapturePanelController(store: store, micPermissionStatus: { .granted }, speechPermissionStatus: { .granted }, transcriptionServiceFactory: { FakeTranscriptionService() }, windowOps: .noop)
         controller.trigger()
         try await Whistle_waitUntil { controller.isPanelOpen }
 
@@ -1616,11 +1926,12 @@ final class CapturePanelControllerTests: XCTestCase {
 
         let counter = CaptureCounter()
         let screenshotService = makeCountingScreenshotService(counter: counter)
-        let controller = CapturePanelController(store: store, screenshotService: screenshotService, micPermissionStatus: { .granted }, speechPermissionStatus: { .granted }, transcriptionServiceFactory: { FakeTranscriptionService() })
+        let controller = CapturePanelController(store: store, screenshotService: screenshotService, micPermissionStatus: { .granted }, speechPermissionStatus: { .granted }, transcriptionServiceFactory: { FakeTranscriptionService() }, windowOps: .noop)
 
         controller.trigger()
         try await waitForScreenshotCount(1, counter: counter)
         XCTAssertEqual(counter.count, 1)
+        try await Whistle_waitUntil { controller.isPanelOpen }
 
         controller.currentViewModel?.transcriptText = "first capture"
         controller.currentViewModel?.selectProject(TestSupport.project1.id)
@@ -1646,7 +1957,7 @@ final class CapturePanelControllerTests: XCTestCase {
         let (store, tempDir) = try makeStore()
         defer { try? FileManager.default.removeItem(at: tempDir) }
 
-        let controller = CapturePanelController(store: store, micPermissionStatus: { .granted }, speechPermissionStatus: { .granted }, transcriptionServiceFactory: { FakeTranscriptionService() })
+        let controller = CapturePanelController(store: store, micPermissionStatus: { .granted }, speechPermissionStatus: { .granted }, transcriptionServiceFactory: { FakeTranscriptionService() }, windowOps: .noop)
         controller.trigger()
         try await Whistle_waitUntil { controller.isPanelOpen }
 
@@ -1678,7 +1989,8 @@ final class CapturePanelControllerTests: XCTestCase {
             refreshProjectsIfStale: { refreshCallCount += 1 },
             micPermissionStatus: { .granted },
             speechPermissionStatus: { .granted },
-            transcriptionServiceFactory: { FakeTranscriptionService() }
+            transcriptionServiceFactory: { FakeTranscriptionService() },
+            windowOps: .noop
         )
 
         controller.trigger()
@@ -1766,5 +2078,101 @@ private struct CountingPreflight: ScreenCapturePreflightChecking {
 }
 
 private struct CountingCapturer: DisplayImageCapturing {
-    func captureDisplayUnderCursor() async -> CGImage? { nil }
+    func captureDisplayUnderCursor(onCaptureStarted: @escaping @Sendable () -> Void) async -> CGImage? {
+        // Acknowledge immediately so the controller presents the panel; the
+        // preflight already bumped the counter, and no image is delivered.
+        onCaptureStarted()
+        return nil
+    }
+}
+
+/// A `ScreenCapturePreflightChecking` that reports screen-recording access
+/// denied, so `ScreenshotService.capture` short-circuits to its unavailable
+/// path (acking without ever reaching the capturer).
+private struct DeniedPreflight: ScreenCapturePreflightChecking {
+    func isScreenCaptureAccessGranted() -> Bool { false }
+}
+
+/// A `ScreenCapturePreflightChecking` that always reports access granted, so
+/// the capture reaches the (gated) capturer.
+private struct GrantedPreflight: ScreenCapturePreflightChecking {
+    func isScreenCaptureAccessGranted() -> Bool { true }
+}
+
+/// Continuation-gated `DisplayImageCapturing` fake (the `ManualPermissionGate`
+/// pattern) with two independent gates so ordering can be asserted
+/// deterministically without a fixed sleep:
+///   Gate A ("start"): parks BEFORE firing `onCaptureStarted`, so a test can
+///     assert the panel is still hidden at the instant the capture request
+///     reaches the capturer, then release the ack on command.
+///   Gate B ("delivery"): parks before returning the image, so a test can
+///     assert the panel opened and stayed usable before the thumbnail exists.
+/// All counters are lock-protected synchronous reads for `Whistle_waitUntil`.
+private final class GatedCapturer: DisplayImageCapturing, @unchecked Sendable {
+    private let lock = NSLock()
+    private var startContinuations: [CheckedContinuation<Void, Never>] = []
+    private var deliveryContinuations: [CheckedContinuation<CGImage?, Never>] = []
+    private var _enteredCount = 0
+    private var _startWaitingCount = 0
+    private var _deliveryWaitingCount = 0
+    private let image: CGImage?
+    private let parkBeforeAck: Bool
+
+    /// - Parameters:
+    ///   - image: the scripted result handed back once Gate B is released
+    ///     (`nil` simulates a capture failure).
+    ///   - parkBeforeAck: when true (default), Gate A holds the ack until
+    ///     `releaseStart()`; when false the ack fires immediately and only
+    ///     Gate B gates the image.
+    init(image: CGImage?, parkBeforeAck: Bool = true) {
+        self.image = image
+        self.parkBeforeAck = parkBeforeAck
+    }
+
+    /// Times `captureDisplayUnderCursor` was invoked.
+    var enteredCount: Int { lock.lock(); defer { lock.unlock() }; return _enteredCount }
+    /// Callers currently parked at Gate A.
+    var startWaitingCount: Int { lock.lock(); defer { lock.unlock() }; return _startWaitingCount }
+    /// Callers currently parked at Gate B.
+    var deliveryWaitingCount: Int { lock.lock(); defer { lock.unlock() }; return _deliveryWaitingCount }
+
+    func captureDisplayUnderCursor(onCaptureStarted: @escaping @Sendable () -> Void) async -> CGImage? {
+        lock.lock(); _enteredCount += 1; lock.unlock()
+        if parkBeforeAck {
+            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                lock.lock()
+                _startWaitingCount += 1
+                startContinuations.append(continuation)
+                lock.unlock()
+            }
+        }
+        onCaptureStarted()
+        return await withCheckedContinuation { (continuation: CheckedContinuation<CGImage?, Never>) in
+            lock.lock()
+            _deliveryWaitingCount += 1
+            deliveryContinuations.append(continuation)
+            lock.unlock()
+        }
+    }
+
+    /// Releases every caller parked at Gate A, letting the ack fire.
+    func releaseStart() {
+        lock.lock()
+        let pending = startContinuations
+        startContinuations.removeAll()
+        _startWaitingCount = 0
+        lock.unlock()
+        for continuation in pending { continuation.resume() }
+    }
+
+    /// Releases every caller parked at Gate B, delivering the scripted image.
+    func releaseDelivery() {
+        lock.lock()
+        let pending = deliveryContinuations
+        deliveryContinuations.removeAll()
+        _deliveryWaitingCount = 0
+        let image = self.image
+        lock.unlock()
+        for continuation in pending { continuation.resume(returning: image) }
+    }
 }

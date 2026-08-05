@@ -21,7 +21,10 @@ private struct FakePreflight: ScreenCapturePreflightChecking {
 /// `SCShareableContent`/`SCScreenshotManager` at all.
 private struct FakeDisplayCapturer: DisplayImageCapturing {
     let image: CGImage?
-    func captureDisplayUnderCursor() async -> CGImage? { image }
+    func captureDisplayUnderCursor(onCaptureStarted: @escaping @Sendable () -> Void) async -> CGImage? {
+        onCaptureStarted()
+        return image
+    }
 }
 
 /// Builds a synthetic `CGImage` of the given pixel dimensions with a
