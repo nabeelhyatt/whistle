@@ -7,21 +7,21 @@ import { generateWorkspaceTitle, sanitizeTitle } from "../titleGenerator";
 // does for its own single-fetch-entrypoint tests.
 
 describe("generateWorkspaceTitle", () => {
-  const ORIGINAL_ENV = process.env.ANTHROPIC_API_KEY;
+  const ORIGINAL_ENV = process.env.OPENROUTER_API_KEY;
   let errorSpy: ReturnType<typeof vi.spyOn>;
 
   beforeEach(() => {
     errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-    process.env.ANTHROPIC_API_KEY = "sk-ant-test-key";
+    process.env.OPENROUTER_API_KEY = "sk-or-test-key";
   });
 
   afterEach(() => {
     errorSpy.mockRestore();
     vi.unstubAllGlobals();
     if (ORIGINAL_ENV === undefined) {
-      delete process.env.ANTHROPIC_API_KEY;
+      delete process.env.OPENROUTER_API_KEY;
     } else {
-      process.env.ANTHROPIC_API_KEY = ORIGINAL_ENV;
+      process.env.OPENROUTER_API_KEY = ORIGINAL_ENV;
     }
   });
 
@@ -32,7 +32,7 @@ describe("generateWorkspaceTitle", () => {
         Promise.resolve(
           new Response(
             JSON.stringify({
-              content: [{ type: "text", text: "Dark mode toggle" }],
+              choices: [{ message: { content: "Dark mode toggle" } }],
             }),
             { status: 200 },
           ),
@@ -53,7 +53,7 @@ describe("generateWorkspaceTitle", () => {
     const fetchMock = vi.fn(() =>
       Promise.resolve(
         new Response(
-          JSON.stringify({ content: [{ type: "text", text: "Some title" }] }),
+          JSON.stringify({ choices: [{ message: { content: "Some title" } }] }),
           { status: 200 },
         ),
       ),
@@ -68,19 +68,18 @@ describe("generateWorkspaceTitle", () => {
 
     expect(fetchMock).toHaveBeenCalledTimes(1);
     const [url, init] = fetchMock.mock.calls[0];
-    expect(url).toBe("https://api.anthropic.com/v1/messages");
+    expect(url).toBe("https://openrouter.ai/api/v1/chat/completions");
     expect(init.method).toBe("POST");
-    expect(init.headers["x-api-key"]).toBe("sk-ant-test-key");
-    expect(init.headers["anthropic-version"]).toBe("2023-06-01");
+    expect(init.headers.authorization).toBe("Bearer sk-or-test-key");
     const body = JSON.parse(init.body as string);
-    expect(body.model).toBe("claude-haiku-4-5");
+    expect(body.model).toBe("anthropic/claude-haiku-4.5");
     expect(body.messages[0].content).toContain("improve login flow");
     expect(body.messages[0].content).toContain("make it faster");
     expect(body.messages[0].content).toContain("Whistle");
   });
 
-  test("returns null when ANTHROPIC_API_KEY is unset, without calling fetch", async () => {
-    delete process.env.ANTHROPIC_API_KEY;
+  test("returns null when OPENROUTER_API_KEY is unset, without calling fetch", async () => {
+    delete process.env.OPENROUTER_API_KEY;
     const fetchMock = vi.fn();
     vi.stubGlobal("fetch", fetchMock);
 
@@ -145,12 +144,12 @@ describe("generateWorkspaceTitle", () => {
     expect(title).toBeNull();
   });
 
-  test("returns null when the response body has no usable text block", async () => {
+  test("returns null when the response body has no usable content", async () => {
     vi.stubGlobal(
       "fetch",
       vi.fn(() =>
         Promise.resolve(
-          new Response(JSON.stringify({ content: [] }), { status: 200 }),
+          new Response(JSON.stringify({ choices: [] }), { status: 200 }),
         ),
       ),
     );
