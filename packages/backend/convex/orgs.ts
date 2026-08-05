@@ -60,6 +60,33 @@ export async function orgsForUser(
   return rows.sort((a, b) => a.createdAt - b.createdAt);
 }
 
+/**
+ * Maps each of a user's org rows to its display name, disambiguating
+ * same-name orgs by appending `··<lastFour>` (F9 — the plan's own
+ * disambiguation rule for the picker, previously unimplemented: two orgs
+ * with the same label/organizationName collapsed into one picker group).
+ * Used by `orgs.list` and `projects.list`'s `orgLabel`.
+ */
+export function displayNamesForOrgs(
+  orgs: Doc<"conductorOrgs">[],
+): Map<Id<"conductorOrgs">, string> {
+  const counts = new Map<string, number>();
+  for (const org of orgs) {
+    const name = orgDisplayName(org);
+    counts.set(name, (counts.get(name) ?? 0) + 1);
+  }
+  const result = new Map<Id<"conductorOrgs">, string>();
+  for (const org of orgs) {
+    const name = orgDisplayName(org);
+    const collides = (counts.get(name) ?? 0) > 1;
+    result.set(
+      org._id,
+      collides ? `${name}··${org.conductorApiKey.slice(-4)}` : name,
+    );
+  }
+  return result;
+}
+
 /** The calling user's org keys, masked (raw key never returned — same
  * discipline as settings.get). */
 export const list = query({
@@ -67,11 +94,12 @@ export const list = query({
   handler: async (ctx) => {
     const user = await requireUser(ctx);
     const rows = await orgsForUser(ctx, user._id);
+    const displayNames = displayNamesForOrgs(rows);
     return rows.map((row) => ({
       orgId: row._id,
       label: row.label,
       organizationName: row.organizationName,
-      displayName: orgDisplayName(row),
+      displayName: displayNames.get(row._id) ?? orgDisplayName(row),
       lastFour: row.conductorApiKey.slice(-4),
       environment: row.conductorEnvironment,
       createdAt: row.createdAt,
@@ -104,6 +132,25 @@ export function shimTargetOrg(
 }
 
 /**
+ * Write-path variant of `shimTargetOrg` for `setAndValidateKey`'s replace
+ * target (F6): exactly one row ⇒ that row; else the "Default"-labeled row;
+ * else `undefined` — meaning "insert a new Default row" rather than
+ * silently falling back to `orgs[0]`. The read-path `shimTargetOrg` above
+ * keeps the oldest-row fallback (settings.get's synthesized masked triple,
+ * validateKey's re-check) because a read can't destroy anything; a write
+ * that falls back to `orgs[0]` with no "Default" row would replace the
+ * oldest org's key in place, destroying it — the plan's rule was
+ * insert-or-replace-the-Default-row, never blindly overwrite whichever row
+ * happens to be oldest.
+ */
+export function shimWriteTargetOrg(
+  orgs: Doc<"conductorOrgs">[],
+): Doc<"conductorOrgs"> | undefined {
+  if (orgs.length === 1) return orgs[0];
+  return orgs.find((o) => o.label === "Default");
+}
+
+/**
  * True when a previously-cached project set exists AND its project ids differ
  * from the newly-fetched set. Order-independent; false with no prior cache so
  * a first key never shows a spurious "changed" warning.
@@ -127,6 +174,17 @@ export async function upsertOrgProjectsCache(
   orgId: Id<"conductorOrgs"> | undefined,
   projects: { id: string; name: string; gitRemote: string }[],
 ): Promise<{ projectsChanged: boolean }> {
+  if (orgId !== undefined) {
+    // F5: a validate/refresh call racing a concurrent `orgs.remove` for the
+    // same org must not resurrect a zombie cache row keyed to a dead
+    // orgId — that would poison projects.list with ungrouped ghost
+    // projects and shadow a live sibling in credsForCaptureInternal's
+    // branch 4. No-op instead of writing.
+    const org = await ctx.db.get(orgId);
+    if (org === null || org.userId !== userId) {
+      return { projectsChanged: false };
+    }
+  }
   const existing = await ctx.db
     .query("projectsCache")
     .withIndex("by_user_org", (q) => q.eq("userId", userId).eq("orgId", orgId))
@@ -157,6 +215,21 @@ export async function upsertOrgProjectsCache(
  * failed best-effort GET /me must never clear metadata a previous call
  * stored.
  */
+/** Discriminated result of {@link commitValidatedOrgKeyInternal} (F4/F15):
+ * callers (`addKey`, `projects.setAndValidateKey`) must check `ok` before
+ * touching `orgId`/`projectsChanged` — the mutation never throws for either
+ * failure case, so a raw exception never reaches an old client. */
+export type CommitValidatedOrgKeyResult =
+  | { ok: true; orgId: Id<"conductorOrgs">; projectsChanged: boolean }
+  // Insert branch (F4): another key for this organizationId already exists
+  // for this user — re-checked inside this mutation's own transaction, not
+  // just the action-level pre-check, so two concurrent calls can't both
+  // slip past it.
+  | { ok: false; reason: "duplicateOrg"; duplicateOfLabel: string }
+  // Replace branch (F15): the target row was deleted between whoever read
+  // it and this commit (e.g. a concurrent orgs.remove).
+  | { ok: false; reason: "rowRemoved" };
+
 export const commitValidatedOrgKeyInternal = internalMutation({
   args: {
     userId: v.id("users"),
@@ -171,15 +244,12 @@ export const commitValidatedOrgKeyInternal = internalMutation({
       v.object({ id: v.string(), name: v.string(), gitRemote: v.string() }),
     ),
   },
-  handler: async (
-    ctx,
-    args,
-  ): Promise<{ orgId: Id<"conductorOrgs">; projectsChanged: boolean }> => {
+  handler: async (ctx, args): Promise<CommitValidatedOrgKeyResult> => {
     let orgId: Id<"conductorOrgs">;
     if (args.orgId !== undefined) {
       const row = await ctx.db.get(args.orgId);
       if (row === null || row.userId !== args.userId) {
-        throw new Error("commitValidatedOrgKeyInternal: org row not found");
+        return { ok: false, reason: "rowRemoved" };
       }
       await ctx.db.patch(args.orgId, {
         conductorApiKey: args.conductorApiKey,
@@ -193,6 +263,22 @@ export const commitValidatedOrgKeyInternal = internalMutation({
       });
       orgId = args.orgId;
     } else {
+      if (args.organizationId !== undefined) {
+        const existing = await ctx.db
+          .query("conductorOrgs")
+          .withIndex("by_user", (q) => q.eq("userId", args.userId))
+          .collect();
+        const duplicate = existing.find(
+          (row) => row.organizationId === args.organizationId,
+        );
+        if (duplicate !== undefined) {
+          return {
+            ok: false,
+            reason: "duplicateOrg",
+            duplicateOfLabel: orgDisplayName(duplicate),
+          };
+        }
+      }
       orgId = await ctx.db.insert("conductorOrgs", {
         userId: args.userId,
         label: args.label,
@@ -210,9 +296,15 @@ export const commitValidatedOrgKeyInternal = internalMutation({
       orgId,
       args.projects,
     );
-    return { orgId, projectsChanged };
+    return { ok: true, orgId, projectsChanged };
   },
 });
+
+/** Shared copy for both `addKey` and `setAndValidateKey`'s duplicate-org
+ * rejection (F4) — same wording either way. */
+export function duplicateOrgMessage(label: string): string {
+  return `You already have a key for this organization ("${label}"). Remove or replace that one instead.`;
+}
 
 /**
  * Adds a new labeled org key: probes both Conductor hosts for the
@@ -272,12 +364,12 @@ export const addKey = action({
       if (duplicate !== undefined) {
         return {
           ok: false,
-          error: `You already have a key for this organization ("${orgDisplayName(duplicate)}"). Remove or replace that one instead.`,
+          error: duplicateOrgMessage(orgDisplayName(duplicate)),
         };
       }
     }
 
-    const { orgId, projectsChanged } = await ctx.runMutation(
+    const result = await ctx.runMutation(
       internal.orgs.commitValidatedOrgKeyInternal,
       {
         userId: user._id,
@@ -290,7 +382,22 @@ export const addKey = action({
       },
     );
 
-    return { ok: true, orgId, environment: resolved.environment, projectsChanged };
+    if (!result.ok) {
+      return {
+        ok: false,
+        error:
+          result.reason === "duplicateOrg"
+            ? duplicateOrgMessage(result.duplicateOfLabel)
+            : "That key entry was removed. Re-open Settings and try again.",
+      };
+    }
+
+    return {
+      ok: true,
+      orgId: result.orgId,
+      environment: resolved.environment,
+      projectsChanged: result.projectsChanged,
+    };
   },
 });
 

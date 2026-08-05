@@ -50,11 +50,23 @@ public final class SettingsViewModel: ObservableObject {
     @Published public var newKeyLabel: String = ""
     @Published public var newKeyInput: String = ""
     @Published public private(set) var isAddingKey = false
+    /// Unified last-action status for the API-key tab, shared by
+    /// `addKey`/`removeKey`/`renameKey` -- exactly one of the three
+    /// mutators' outcomes at a time, never a mix. Every mutator clears this
+    /// (via `resetKeyStatus`) before it does anything else, so a failed
+    /// remove/rename can never leave a stale success checkmark from an
+    /// earlier add, and a stale "Key saved and validated." can never persist
+    /// across a later action.
     @Published public private(set) var keyStatusMessage: String?
+    /// `true`/`false` for the last mutator's outcome, `nil` only for the
+    /// "no key pasted yet" validation message (which isn't a server
+    /// outcome at all). See `keyStatusMessage`.
     @Published public private(set) var keyAddSucceeded: Bool?
     /// Set after a successful Save & Validate when the new key lists a
     /// different set of Conductor projects than any existing key — a heads-up
     /// that it may belong to a different Conductor account (canonical-accounts).
+    /// Reset to `false` at the start of every mutator along with the rest of
+    /// the unified status.
     @Published public private(set) var keyProjectsChanged = false
 
     // Per-row rename affordance -- `renamingOrgId` is the row currently
@@ -121,8 +133,17 @@ public final class SettingsViewModel: ObservableObject {
 
     /// Refreshes the API-key tab's row list from `orgs:list` -- called on
     /// initial `load()` and after any add/remove/rename mutation succeeds.
+    /// A transient failure here must not wipe an already-loaded list (the
+    /// user would see their org keys vanish over a network blip), so on
+    /// throw `orgKeys` is left exactly as it was and only the status message
+    /// reports the failure.
     private func loadOrgKeys() async {
-        orgKeys = (try? await convex.orgsList()) ?? []
+        do {
+            orgKeys = try await convex.orgsList()
+        } catch {
+            keyStatusMessage = "Couldn't load your organization keys. Check your connection and try again."
+            keyAddSucceeded = false
+        }
     }
 
     /// Loads `users:me` for the account tab's identity display. Best-effort:
@@ -219,6 +240,7 @@ public final class SettingsViewModel: ObservableObject {
     /// The different-project-set warning is preserved, still driven by the
     /// action's own `projectsChanged` signal.
     public func addKey() async {
+        resetKeyStatus()
         let label = newKeyLabel.trimmingCharacters(in: .whitespacesAndNewlines)
         let key = newKeyInput.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !key.isEmpty else {
@@ -236,14 +258,12 @@ public final class SettingsViewModel: ObservableObject {
         } catch {
             keyStatusMessage = "Couldn't reach Conductor. Check your connection and try again."
             keyAddSucceeded = false
-            keyProjectsChanged = false
             return
         }
 
         guard result.ok else {
             keyStatusMessage = result.error ?? "Conductor didn't accept that key. Check that you copied the whole key."
             keyAddSucceeded = false
-            keyProjectsChanged = false
             return
         }
 
@@ -259,11 +279,15 @@ public final class SettingsViewModel: ObservableObject {
     /// for confirming with the user first (`pendingRemoveOrgId` drives that
     /// dialog); this just performs the mutation and refreshes the list.
     public func removeKey(orgId: String) async {
+        resetKeyStatus()
         do {
             try await convex.orgRemove(orgId: orgId)
+            keyStatusMessage = "Key removed."
+            keyAddSucceeded = true
             await loadOrgKeys()
         } catch {
             keyStatusMessage = "Couldn't remove that key. Check your connection and try again."
+            keyAddSucceeded = false
         }
     }
 
@@ -293,12 +317,28 @@ public final class SettingsViewModel: ObservableObject {
 
     /// Renames an org key's label -- mirrors `orgs:rename`.
     public func renameKey(orgId: String, label: String) async {
+        resetKeyStatus()
         do {
             try await convex.orgRename(orgId: orgId, label: label)
+            keyStatusMessage = "Key renamed."
+            keyAddSucceeded = true
             await loadOrgKeys()
         } catch {
             keyStatusMessage = "Couldn't rename that key. Check your connection and try again."
+            keyAddSucceeded = false
         }
+    }
+
+    /// Clears the unified last-action status (message + success flag + the
+    /// different-projects heads-up) at the start of every mutator
+    /// (add/remove/rename) so a stale success checkmark from a PREVIOUS
+    /// action can never survive into a later one that fails, and vice versa
+    /// -- exactly one of these three is ever "the last thing that
+    /// happened."
+    private func resetKeyStatus() {
+        keyStatusMessage = nil
+        keyAddSucceeded = nil
+        keyProjectsChanged = false
     }
 
     // MARK: Account

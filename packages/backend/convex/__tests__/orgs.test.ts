@@ -245,6 +245,11 @@ describe("getMe", () => {
     stubMeResponse(200, "ok");
     expect(await getMe(creds)).toBeUndefined();
   });
+
+  test("F11: returns undefined when organizationId, organizationName, AND authMethod are all absent from a 200 body (matches the doc comment contract)", async () => {
+    stubMeResponse(200, { userId: "u1" });
+    expect(await getMe(creds)).toBeUndefined();
+  });
 });
 
 // ─── orgs.addKey / list / rename / remove ──────────────────────────────────
@@ -480,6 +485,99 @@ describe("legacy key migration", () => {
     });
   });
 
+  test("F2: migration pins the new org row onto the caller's own non-terminal orgId-less captures, excludes terminal ones, and is bounded to the 50 most recent", async () => {
+    stubConductor({});
+    const t = convexTest(schema, modules);
+    const asUser = await seedLegacyUser(t, "auth0|migrate-pin");
+    const userId = await t.run(async (ctx) => {
+      const user = await ctx.db
+        .query("users")
+        .withIndex("by_subject", (q) => q.eq("authSubject", "auth0|migrate-pin"))
+        .unique();
+      return user!._id;
+    });
+
+    const insertCapture = (opts: {
+      clientId: string;
+      status: "queued" | "creating" | "sending" | "agentWorking" | "readyUnverified" | "ready" | "failed";
+      capturedAt: number;
+    }) =>
+      t.run(async (ctx) =>
+        ctx.db.insert("captures", {
+          userId,
+          clientId: opts.clientId,
+          transcript: "t",
+          notes: "",
+          projectId: "proj-1",
+          projectName: "P",
+          agent: "claude",
+          capturedAt: opts.capturedAt,
+          status: opts.status,
+          attempt: 0,
+        }),
+      );
+
+    // Recent non-terminal, orgId-less captures across every non-terminal
+    // status — should all get pinned.
+    const nonTerminalIds = await Promise.all(
+      (["queued", "creating", "sending", "agentWorking", "readyUnverified"] as const).map(
+        (status, i) =>
+          insertCapture({ clientId: `nonterm-${status}`, status, capturedAt: 1000 + i }),
+      ),
+    );
+
+    // A terminal capture (ready) — must be excluded even though it's recent
+    // and orgId-less.
+    const terminalReadyId = await insertCapture({
+      clientId: "terminal-ready",
+      status: "ready",
+      capturedAt: 2000,
+    });
+    // A terminal capture (failed) — same.
+    const terminalFailedId = await insertCapture({
+      clientId: "terminal-failed",
+      status: "failed",
+      capturedAt: 2001,
+    });
+
+    // 60 older queued captures, older than the ones above, to prove the
+    // `.take(50)` bound: the oldest of these should NOT be pinned even
+    // though they're non-terminal and orgId-less, because they fall
+    // outside the 50-most-recent window once the captures above are
+    // included.
+    const olderIds: Awaited<ReturnType<typeof insertCapture>>[] = [];
+    for (let i = 0; i < 60; i++) {
+      olderIds.push(
+        await insertCapture({ clientId: `older-${i}`, status: "queued", capturedAt: i }),
+      );
+    }
+
+    await asUser.mutation(api.users.ensure, {});
+
+    const orgs = await asUser.query(api.orgs.list, {});
+    expect(orgs).toHaveLength(1);
+    const orgId = orgs[0].orgId;
+
+    for (const id of nonTerminalIds) {
+      const capture = await t.run(async (ctx) => ctx.db.get(id));
+      expect(capture?.orgId).toBe(orgId);
+    }
+
+    const readyCapture = await t.run(async (ctx) => ctx.db.get(terminalReadyId));
+    expect(readyCapture?.orgId).toBeUndefined();
+    const failedCapture = await t.run(async (ctx) => ctx.db.get(terminalFailedId));
+    expect(failedCapture?.orgId).toBeUndefined();
+
+    // Only the 50 most recent captures (by capturedAt desc) were scanned at
+    // all: the 7 captures above plus the 43 newest of the 60 "older" ones
+    // fill that window, so the oldest "older" captures fall outside it and
+    // stay orgId-less no matter their status.
+    const oldestUnpinned = await t.run(async (ctx) => ctx.db.get(olderIds[0]));
+    expect(oldestUnpinned?.orgId).toBeUndefined();
+    const withinWindow = await t.run(async (ctx) => ctx.db.get(olderIds[59]));
+    expect(withinWindow?.orgId).toBe(orgId);
+  });
+
   test("migration is idempotent and never runs once org rows exist", async () => {
     stubConductor({});
     const t = convexTest(schema, modules);
@@ -488,6 +586,78 @@ describe("legacy key migration", () => {
     await asUser.mutation(api.users.ensure, {});
     await asUser.mutation(api.users.ensure, {});
     expect(await asUser.query(api.orgs.list, {})).toHaveLength(1);
+  });
+
+  test("F1a: coexistence state — org rows already exist AND the legacy key is still set — clears the legacy fields (never inserts a second org row), with a distinct log marker", async () => {
+    stubConductor({});
+    const t = convexTest(schema, modules);
+    const asUser = t.withIdentity({ subject: "auth0|migrate-coexist" });
+    const userId = await asUser.mutation(api.users.ensure, {});
+
+    // Simulate the reachable-but-buggy-before-F1 state: an admin merge (or
+    // an old-client setAndValidateKey racing first-launch ensure) left an
+    // org row in place while the legacy settings key is still set too.
+    const existingOrgId = await t.run(async (ctx) =>
+      ctx.db.insert("conductorOrgs", {
+        userId,
+        label: "Already migrated",
+        conductorApiKey: "sk-existing-org-1111",
+        conductorEnvironment: "prod",
+        createdAt: 1,
+      }),
+    );
+    await t.run(async (ctx) =>
+      ctx.db.insert("settings", {
+        userId,
+        conductorApiKey: "sk-stranded-legacy-2222",
+        conductorEnvironment: "staging",
+        agent: "claude",
+        screenshotsEnabled: true,
+      }),
+    );
+
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    let loggedCalls: unknown[][];
+    try {
+      await asUser.mutation(api.users.ensure, {});
+      // Read calls before mockRestore(), which resets recorded calls (it's
+      // mockReset() + restoring the original implementation).
+      loggedCalls = logSpy.mock.calls;
+    } finally {
+      logSpy.mockRestore();
+    }
+
+    expect(
+      loggedCalls.some(([msg]) =>
+        String(msg).includes(`legacy-key-cleared-coexistence userId=${userId}`),
+      ),
+    ).toBe(true);
+    expect(
+      loggedCalls.some(([msg]) => String(msg).includes("legacy-key-migrated")),
+    ).toBe(false);
+
+    // Still exactly the one pre-existing org row — never a second insert.
+    const orgs = await asUser.query(api.orgs.list, {});
+    expect(orgs).toHaveLength(1);
+    expect(orgs[0].orgId).toBe(existingOrgId);
+
+    // Legacy fields actually cleared.
+    const row = await t.run(async (ctx) =>
+      ctx.db
+        .query("settings")
+        .withIndex("by_user", (q) => q.eq("userId", userId))
+        .unique(),
+    );
+    expect(row?.conductorApiKey).toBeUndefined();
+    expect(row?.conductorEnvironment).toBeUndefined();
+
+    // And credsForCaptureInternal no longer resolves the stale legacy key —
+    // the existing org row wins (F1b).
+    const creds = await t.query(internal.pipelineInternal.credsForCaptureInternal, {
+      userId,
+      projectId: "proj-x",
+    });
+    expect(creds).toMatchObject({ ok: true, apiKey: "sk-existing-org-1111" });
   });
 
   test("no legacy key: ensure is a no-op for migration", async () => {
@@ -553,6 +723,142 @@ describe("projects.setAndValidateKey shim row resolution", () => {
     const listed = await asUser.query(api.orgs.list, {});
     expect(listed).toHaveLength(1);
     expect(listed[0].label).toBe("Default");
+  });
+
+  test("F6: 2+ orgs with no 'Default'-labeled row -> setAndValidateKey INSERTS a new Default row, never replaces the oldest row's key in place", async () => {
+    stubConductor({
+      "k-alpha": { projects: PROJECTS_A },
+      "k-beta": { projects: PROJECTS_B },
+      "k-new": { projects: PROJECTS_A },
+    });
+    const t = convexTest(schema, modules);
+    const asUser = t.withIdentity({ subject: "auth0|shim-no-default" });
+    await asUser.mutation(api.users.ensure, {});
+    await asUser.action(api.orgs.addKey, { label: "Alpha", apiKey: "k-alpha" });
+    await asUser.action(api.orgs.addKey, { label: "Beta", apiKey: "k-beta" });
+
+    const before = await asUser.query(api.orgs.list, {});
+    expect(before.map((o) => o.label).sort()).toEqual(["Alpha", "Beta"]);
+    const alphaBefore = before.find((o) => o.label === "Alpha")!;
+
+    const r = await asUser.action(api.projects.setAndValidateKey, { apiKey: "k-new" });
+    expect(r).toMatchObject({ ok: true });
+
+    const after = await asUser.query(api.orgs.list, {});
+    expect(after).toHaveLength(3); // inserted, not replaced
+    const alphaAfter = after.find((o) => o.orgId === alphaBefore.orgId)!;
+    expect(alphaAfter.lastFour).toBe(alphaBefore.lastFour); // untouched
+
+    const newDefault = after.find((o) => o.label === "Default");
+    expect(newDefault).toBeDefined();
+    expect(newDefault?.lastFour).toBe("k-new".slice(-4));
+  });
+});
+
+// ─── F4/F15: commitValidatedOrgKeyInternal's discriminated result ─────────
+
+describe("orgs.commitValidatedOrgKeyInternal (direct mutation-level tests)", () => {
+  test("F4: insert branch re-checks organizationId uniqueness inside the mutation's own transaction, rejecting a duplicate even when called directly (not just via addKey's action-level pre-check)", async () => {
+    const t = convexTest(schema, modules);
+    const asUser = t.withIdentity({ subject: "auth0|commit-dup" });
+    const userId = await asUser.mutation(api.users.ensure, {});
+
+    const first = await t.mutation(internal.orgs.commitValidatedOrgKeyInternal, {
+      userId,
+      label: "First",
+      conductorApiKey: "sk-first-1111",
+      conductorEnvironment: "prod",
+      organizationId: "org_dup",
+      projects: [],
+    });
+    expect(first.ok).toBe(true);
+
+    const second = await t.mutation(internal.orgs.commitValidatedOrgKeyInternal, {
+      userId,
+      label: "Second",
+      conductorApiKey: "sk-second-2222",
+      conductorEnvironment: "prod",
+      organizationId: "org_dup",
+      projects: [],
+    });
+    expect(second).toMatchObject({ ok: false, reason: "duplicateOrg", duplicateOfLabel: "First" });
+
+    // Nothing extra was written.
+    const rows = await t.run(async (ctx) =>
+      ctx.db.query("conductorOrgs").withIndex("by_user", (q) => q.eq("userId", userId)).collect(),
+    );
+    expect(rows).toHaveLength(1);
+  });
+
+  test("F15: replace path (orgId provided) whose target row was deleted between read and commit returns ok:false reason 'rowRemoved', never throws", async () => {
+    const t = convexTest(schema, modules);
+    const asUser = t.withIdentity({ subject: "auth0|commit-row-removed" });
+    const userId = await asUser.mutation(api.users.ensure, {});
+
+    const orgId = await t.run(async (ctx) =>
+      ctx.db.insert("conductorOrgs", {
+        userId,
+        label: "Soon gone",
+        conductorApiKey: "sk-gone-3333",
+        conductorEnvironment: "prod",
+        createdAt: 1,
+      }),
+    );
+    await t.run(async (ctx) => ctx.db.delete(orgId));
+
+    const result = await t.mutation(internal.orgs.commitValidatedOrgKeyInternal, {
+      userId,
+      orgId,
+      label: "Soon gone",
+      conductorApiKey: "sk-replacement-4444",
+      conductorEnvironment: "prod",
+      projects: [],
+    });
+    expect(result).toEqual({ ok: false, reason: "rowRemoved" });
+  });
+
+});
+
+// ─── F9: duplicate display names get disambiguated ────────────────────────
+
+describe("F9: duplicate org display names", () => {
+  test("orgs.list appends ··lastFour to every org sharing a display name; non-colliding names are untouched", async () => {
+    stubConductor({
+      "k-dup-1111": { projects: PROJECTS_A },
+      "k-dup-2222": { projects: PROJECTS_B },
+      "k-unique-3333": { projects: PROJECTS_A },
+    });
+    const t = convexTest(schema, modules);
+    const asUser = t.withIdentity({ subject: "auth0|dup-names" });
+    await asUser.mutation(api.users.ensure, {});
+    await asUser.action(api.orgs.addKey, { label: "Acme", apiKey: "k-dup-1111" });
+    await asUser.action(api.orgs.addKey, { label: "Acme", apiKey: "k-dup-2222" });
+    await asUser.action(api.orgs.addKey, { label: "Solo", apiKey: "k-unique-3333" });
+
+    const listed = await asUser.query(api.orgs.list, {});
+    const acmeRows = listed.filter((o) => o.label === "Acme");
+    expect(acmeRows).toHaveLength(2);
+    expect(acmeRows.map((o) => o.displayName).sort()).toEqual(
+      ["Acme··1111", "Acme··2222"].sort(),
+    );
+    const soloRow = listed.find((o) => o.label === "Solo")!;
+    expect(soloRow.displayName).toBe("Solo");
+  });
+
+  test("projects.list's orgLabel uses the same disambiguated display names", async () => {
+    stubConductor({
+      "k-dup-1111": { projects: PROJECTS_A },
+      "k-dup-2222": { projects: PROJECTS_B },
+    });
+    const t = convexTest(schema, modules);
+    const asUser = t.withIdentity({ subject: "auth0|dup-names-projects" });
+    await asUser.mutation(api.users.ensure, {});
+    await asUser.action(api.orgs.addKey, { label: "Acme", apiKey: "k-dup-1111" });
+    await asUser.action(api.orgs.addKey, { label: "Acme", apiKey: "k-dup-2222" });
+
+    const projects = await asUser.query(api.projects.list, {});
+    const labels = new Set(projects.map((p) => p.orgLabel));
+    expect(labels).toEqual(new Set(["Acme··1111", "Acme··2222"]));
   });
 });
 

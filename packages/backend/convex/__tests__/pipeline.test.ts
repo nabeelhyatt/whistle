@@ -864,18 +864,32 @@ describe("multi-org credsForCapture (canonical-accounts)", () => {
 
     const asUser = withMockUser(t, "auth0|multiorg-foreign-caller");
     await asUser.mutation(api.users.ensure, {});
+    // captures.create now validates orgId ownership at create time (F14) and
+    // would reject this outright — but a stale foreign pointer can still
+    // exist on an already-created capture (e.g. an admin merge that moved
+    // org rows without repointing every capture). Simulate that: create
+    // without orgId, cancel the auto-scheduled submit, patch orgId directly,
+    // then invoke submit as a later retry would.
     const captureId = await asUser.mutation(api.captures.create, {
       clientId: "client-foreign-org",
       transcript: "add dark mode toggle",
       notes: "",
       projectId: "proj-1",
       projectName: "Whistle",
-      orgId: foreignOrgId,
       agent: "claude",
       capturedAt: Date.now(),
     });
+    const scheduled = await t.run(async (ctx) =>
+      ctx.db.system.query("_scheduled_functions").collect(),
+    );
+    for (const s of scheduled) {
+      if (s.state.kind === "pending") {
+        await t.run(async (ctx) => ctx.scheduler.cancel(s._id));
+      }
+    }
+    await t.run(async (ctx) => ctx.db.patch(captureId, { orgId: foreignOrgId }));
 
-    await tick(t);
+    await t.action(internal.pipeline.submit, { captureId });
 
     const capture = await asUser.query(api.captures.get, { captureId });
     expect(capture?.status).toBe("failed");

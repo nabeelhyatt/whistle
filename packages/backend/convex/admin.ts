@@ -113,8 +113,14 @@ export const accountReport = internalQuery({
  * *moved* capture pointing at the skipped row is rewritten to the surviving
  * target row — same organization, semantically the same key. A plain skip
  * would strand those captures on a foreign-user row and fail them `auth` at
- * the pipeline's ownership check. Rewrites are recorded in the manifest
- * (`captureOrgRewrites`) so the rollback ledger stays complete.
+ * the pipeline's ownership check. Rewrites are recorded in the manifest as
+ * `captureOrgRewrites: { captureId, fromOrgId, toOrgId }[]` so the rollback
+ * ledger stays complete. A *collided* capture (stays under `from`, since its
+ * clientId already exists under `to`) whose orgId points at an org row that
+ * IS moving is a different stranding: it isn't repointed to `to`, but the
+ * org row it references is about to become foreign to `from`. That capture's
+ * `orgId` is cleared instead (`captureOrgClears: Id<"captures">[]`), falling
+ * through credsForCaptureInternal's chain rather than hard-failing forever.
  *
  * projectsCache rows follow their org row (keyed by orgId, so no collision
  * is possible); the legacy no-org cache row keeps the old rule — left in
@@ -228,14 +234,32 @@ export const mergeUserData = internalMutation({
     const movingOrgIds = new Set(conductorOrgIds);
     const captureOrgRewrites: {
       captureId: Id<"captures">;
-      orgId: Id<"conductorOrgs">;
+      fromOrgId: Id<"conductorOrgs">;
+      toOrgId: Id<"conductorOrgs">;
     }[] = [];
+    // F3a: a collided capture stays under `from`'s user row (it's not
+    // moving), but if its orgId points at an org row that IS about to move
+    // to `to`, that pointer becomes a foreign-user row the instant the move
+    // commits — a permanent auth hard-fail at the pipeline's ownership
+    // check. Clear it so credsForCaptureInternal's fallback chain resolves
+    // it instead.
+    const captureOrgClears: Id<"captures">[] = [];
     for (const capture of fromCaptures) {
       if (capture.orgId === undefined) continue;
-      if (!captureIds.includes(capture._id)) continue; // collided; stays put
+      if (!captureIds.includes(capture._id)) {
+        // collided; stays put
+        if (movingOrgIds.has(capture.orgId)) {
+          captureOrgClears.push(capture._id);
+        }
+        continue;
+      }
       const surviving = survivingOrgByFromOrg.get(capture.orgId);
       if (surviving !== undefined) {
-        captureOrgRewrites.push({ captureId: capture._id, orgId: surviving });
+        captureOrgRewrites.push({
+          captureId: capture._id,
+          fromOrgId: capture.orgId,
+          toOrgId: surviving,
+        });
       }
     }
 
@@ -268,6 +292,7 @@ export const mergeUserData = internalMutation({
       skippedProjectsCache: skippedProjectsCacheIds,
       skippedConductorOrgs: skippedConductorOrgIds,
       captureOrgRewrites,
+      captureOrgClears,
     };
 
     if (dryRun) {
@@ -278,7 +303,10 @@ export const mergeUserData = internalMutation({
       await ctx.db.patch(captureId, { userId: args.toUserId });
     }
     for (const rewrite of captureOrgRewrites) {
-      await ctx.db.patch(rewrite.captureId, { orgId: rewrite.orgId });
+      await ctx.db.patch(rewrite.captureId, { orgId: rewrite.toOrgId });
+    }
+    for (const captureId of captureOrgClears) {
+      await ctx.db.patch(captureId, { orgId: undefined });
     }
     for (const templateId of promptTemplateIds) {
       await ctx.db.patch(templateId, { userId: args.toUserId });

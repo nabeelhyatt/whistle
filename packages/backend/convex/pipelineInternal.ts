@@ -18,16 +18,6 @@ export const getCaptureInternal = internalQuery({
   },
 });
 
-export const getSettingsInternal = internalQuery({
-  args: { userId: v.id("users") },
-  handler: async (ctx, args) => {
-    return await ctx.db
-      .query("settings")
-      .withIndex("by_user", (q) => q.eq("userId", args.userId))
-      .unique();
-  },
-});
-
 /**
  * Resolves which Conductor credentials a capture's pipeline actions should
  * use — the multi-org replacement for reading the single legacy settings
@@ -38,9 +28,15 @@ export const getSettingsInternal = internalQuery({
  *     pointer, e.g. after an admin merge, must never leak another tenant's
  *     key). A row that's simply been deleted falls through — a working
  *     same-org sibling key may still be stored.
- *  2. The legacy `settings` key (pre-migration in-flight captures).
+ *  2. Zero org rows → the legacy `settings` key (pre-migration users only;
+ *     F1 — once any org row exists, `migrateLegacyKeyToOrg` clears the
+ *     legacy fields on the user's next launch even in the "org rows already
+ *     exist" coexistence case, so this branch never shadows a live org row).
  *  3. Exactly one org row → that row.
- *  4. The org whose projectsCache contains the capture's project.
+ *  4. The org whose projectsCache contains the capture's project, restricted
+ *     to a cache row whose orgId still resolves to a live org (F5 — a cache
+ *     upsert racing a concurrent `orgs.remove` must never resurrect a
+ *     zombie row that then shadows a live sibling here).
  *
  * Returns the raw creds (internal-only — never client-facing) plus the org's
  * display name for error copy.
@@ -84,38 +80,40 @@ export const credsForCaptureInternal = internalQuery({
       // still resolve below.
     }
 
-    const settings = await ctx.db
-      .query("settings")
-      .withIndex("by_user", (q) => q.eq("userId", args.userId))
-      .unique();
-    const legacy = credsFromSettings(settings ?? undefined);
-    if (legacy !== undefined) {
-      return { ok: true, apiKey: legacy.apiKey, environment: legacy.environment };
+    const orgs = await orgsForUser(ctx, args.userId);
+
+    if (orgs.length === 0) {
+      const settings = await ctx.db
+        .query("settings")
+        .withIndex("by_user", (q) => q.eq("userId", args.userId))
+        .unique();
+      const legacy = credsFromSettings(settings ?? undefined);
+      if (legacy !== undefined) {
+        return { ok: true, apiKey: legacy.apiKey, environment: legacy.environment };
+      }
+      return { ok: false, error: "No Conductor API key configured." };
     }
 
-    const orgs = await orgsForUser(ctx, args.userId);
     if (orgs.length === 1) return fromOrg(orgs[0]);
 
-    if (orgs.length > 1) {
-      const caches = await ctx.db
-        .query("projectsCache")
-        .withIndex("by_user", (q) => q.eq("userId", args.userId))
-        .collect();
-      const owning = caches.find(
-        (cache) =>
-          cache.orgId !== undefined &&
-          cache.projects.some((p) => p.id === args.projectId),
-      );
-      const org = orgs.find((o) => o._id === owning?.orgId);
-      if (org !== undefined) return fromOrg(org);
-    }
+    const liveOrgIds = new Set(orgs.map((o) => o._id));
+    const caches = await ctx.db
+      .query("projectsCache")
+      .withIndex("by_user", (q) => q.eq("userId", args.userId))
+      .collect();
+    const owning = caches.find(
+      (cache) =>
+        cache.orgId !== undefined &&
+        liveOrgIds.has(cache.orgId) &&
+        cache.projects.some((p) => p.id === args.projectId),
+    );
+    const org = orgs.find((o) => o._id === owning?.orgId);
+    if (org !== undefined) return fromOrg(org);
 
     return {
       ok: false,
       error:
-        orgs.length === 0
-          ? "No Conductor API key configured."
-          : "The API key for this capture's organization was removed — re-add it in Settings.",
+        "The API key for this capture's organization was removed — re-add it in Settings.",
     };
   },
 });

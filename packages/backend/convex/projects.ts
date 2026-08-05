@@ -22,12 +22,15 @@ import {
 } from "./conductorClient";
 import { credsFromSettings } from "./settings";
 import {
+  displayNamesForOrgs,
+  duplicateOrgMessage,
   INVALID_KEY_MESSAGE,
   NETWORK_UNREACHABLE_MESSAGE,
   orgDisplayName,
   orgsForUser,
   projectSetChanged,
   shimTargetOrg,
+  shimWriteTargetOrg,
   upsertOrgProjectsCache,
 } from "./orgs";
 
@@ -64,6 +67,7 @@ export const list = query({
     const orgs = await orgsForUser(ctx, user._id);
     const orgOrder = new Map(orgs.map((org, i) => [org._id, i]));
     const orgById = new Map(orgs.map((org) => [org._id, org]));
+    const displayNames = displayNamesForOrgs(orgs);
 
     const ordered = cacheRows.sort((a, b) => {
       const ai = a.orgId === undefined ? -1 : (orgOrder.get(a.orgId) ?? Number.MAX_SAFE_INTEGER);
@@ -87,7 +91,7 @@ export const list = query({
         merged.push({
           ...project,
           orgId: org?._id,
-          orgLabel: org === undefined ? undefined : orgDisplayName(org),
+          orgLabel: org === undefined ? undefined : displayNames.get(org._id),
         });
       }
     }
@@ -287,7 +291,11 @@ export const refreshProjects = action({
         continue;
       }
 
-      if (org.organizationId === undefined || org.organizationName === undefined) {
+      // F12: narrowed to organizationId only — organizationName is the seam
+      // field the API doesn't serve yet, so probing forever for it alone
+      // was pure noise (an extra GET /me per org per refresh with nothing
+      // to backfill). Re-widen this once the API ships org names.
+      if (org.organizationId === undefined) {
         const me = await getMe(creds);
         if (me !== undefined) {
           await ctx.runMutation(internal.orgs.patchOrgIdentityInternal, {
@@ -352,12 +360,16 @@ export const setAndValidateKey = action({
     const orgs = await ctx.runQuery(internal.orgs.getOrgsForUserInternal, {
       userId: user._id,
     });
+    // F6: the write-path target uses shimWriteTargetOrg, not shimTargetOrg —
+    // with 2+ orgs and no "Default"-labeled row it resolves to undefined
+    // (insert a new Default row below) rather than falling back to the
+    // oldest row and destroying that org's key in place.
     const target =
       (me?.organizationId !== undefined
         ? orgs.find((o) => o.organizationId === me.organizationId)
-        : undefined) ?? shimTargetOrg(orgs);
+        : undefined) ?? shimWriteTargetOrg(orgs);
 
-    const { projectsChanged } = await ctx.runMutation(
+    const result = await ctx.runMutation(
       internal.orgs.commitValidatedOrgKeyInternal,
       {
         userId: user._id,
@@ -371,6 +383,23 @@ export const setAndValidateKey = action({
       },
     );
 
-    return { ok: true, environment: resolved.environment, projectsChanged };
+    if (!result.ok) {
+      // F15: the replace target can vanish between this read and the
+      // commit (a concurrent orgs.remove) — surface ok:false instead of
+      // letting a raw exception reach the old client.
+      return {
+        ok: false,
+        error:
+          result.reason === "duplicateOrg"
+            ? duplicateOrgMessage(result.duplicateOfLabel)
+            : "That key entry was removed. Re-open Settings and try again.",
+      };
+    }
+
+    return {
+      ok: true,
+      environment: resolved.environment,
+      projectsChanged: result.projectsChanged,
+    };
   },
 });

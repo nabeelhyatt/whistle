@@ -75,4 +75,37 @@ final class ProjectPickerTests: XCTestCase {
         XCTAssertNil(groups.first?.orgLabel)
         XCTAssertEqual(groups.first?.projects.map(\.id), ["p1", "p2"])
     }
+
+    // MARK: F7: the `"unlabeled"` sentinel must not collide with a real org
+    // labeled exactly that (pre-fix, `id` was `orgLabel ?? "__unlabeled__"`,
+    // so an org literally named "__unlabeled__" would collide with the
+    // legacy leading group's id).
+
+    func testGroupIdsDoNotCollideWhenAnOrgIsLiterallyNamedTheOldSentinel() {
+        let projects = [
+            project("p1", "Legacy", orgLabel: nil),
+            project("p2", "Sneaky", orgLabel: "__unlabeled__"),
+        ]
+
+        let groups = ProjectPicker.groupedByOrg(projects)
+
+        XCTAssertEqual(groups.count, 2)
+        let ids = Set(groups.map(\.id))
+        XCTAssertEqual(ids.count, 2, "the legacy unlabeled group and a real org named \"__unlabeled__\" must get distinct ids")
+    }
+
+    func testGroupIdsAreStableAndUniqueForDistinctLabels() {
+        let projects = [
+            project("p1", "Legacy", orgLabel: nil),
+            project("p2", "Org A One", orgLabel: "Org A"),
+            project("p3", "Org B One", orgLabel: "Org B"),
+        ]
+
+        let groups = ProjectPicker.groupedByOrg(projects)
+        let ids = groups.map(\.id)
+
+        XCTAssertEqual(Set(ids).count, ids.count, "every group's id must be unique")
+        // Stable: recomputing from the same input yields the same ids.
+        XCTAssertEqual(ProjectPicker.groupedByOrg(projects).map(\.id), ids)
+    }
 }

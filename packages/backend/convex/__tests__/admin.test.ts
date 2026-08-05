@@ -541,8 +541,9 @@ describe("admin.mergeUserData", () => {
       expect(manifest.conductorOrgs).toEqual([orgUnique]);
       expect(manifest.skippedConductorOrgs).toEqual([orgCollide]);
       expect(manifest.captureOrgRewrites).toEqual([
-        { captureId: captureAtCollide, orgId: toOrgShared },
+        { captureId: captureAtCollide, fromOrgId: orgCollide, toOrgId: toOrgShared },
       ]);
+      expect(manifest.captureOrgClears).toEqual([]);
 
       // Cache rows follow their org: the unique org's cache moves, the
       // colliding org's cache and both users' legacy no-org caches are
@@ -617,6 +618,52 @@ describe("admin.mergeUserData", () => {
       expect(secondManifest.conductorOrgs).toHaveLength(0);
       expect(secondManifest.skippedConductorOrgs).toEqual([orgCollide]);
       expect(secondManifest.captureOrgRewrites).toHaveLength(0);
+    });
+
+    test("a collided capture whose orgId points at a MOVING (non-colliding) org row has its orgId cleared, not left stranded on a soon-to-be-foreign row (F3a)", async () => {
+      const t = convexTest(schema, modules);
+      const { to, from, orgUnique } = await seedCollisionScenario(t);
+
+      // A second `from` capture that collides on clientId with a `to`
+      // capture (so it stays under `from`), but points at orgUnique — a row
+      // that IS moving to `to`. Left un-cleared, this would become a
+      // foreign-user pointer under `from` the instant orgUnique moves.
+      const collidedAtMovingOrg = await t.run(async (ctx) =>
+        ctx.db.insert("captures", {
+          userId: from,
+          clientId: "to-own-capture", // collides with `to`'s seeded capture
+          transcript: "t",
+          notes: "",
+          projectId: "proj-unique",
+          projectName: "Unique",
+          orgId: orgUnique,
+          agent: "claude",
+          capturedAt: Date.now(),
+          status: "queued",
+          attempt: 0,
+        }),
+      );
+
+      const manifest = await t.mutation(internal.admin.mergeUserData, {
+        fromUserId: from,
+        toUserId: to,
+        dryRun: true,
+      });
+      expect(manifest.captureOrgClears).toEqual([collidedAtMovingOrg]);
+      expect(manifest.collisions.captures).toContain(collidedAtMovingOrg);
+
+      await t.mutation(internal.admin.mergeUserData, {
+        fromUserId: from,
+        toUserId: to,
+        dryRun: false,
+      });
+
+      const capture = await t.run(async (ctx) => ctx.db.get(collidedAtMovingOrg));
+      // Still under `from` (it collided, so it never moved)...
+      expect(capture?.userId).toBe(from);
+      // ...but its orgId was cleared rather than left pointing at a row
+      // that now belongs to `to`.
+      expect(capture?.orgId).toBeUndefined();
     });
   });
 

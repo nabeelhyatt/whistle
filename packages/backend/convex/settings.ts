@@ -229,6 +229,14 @@ export async function patchConductorKey(
  * surfaces as `.reauthRequired` at launch (AuthController never swallows
  * ensure errors) and rolls back ensure's own email backfill.
  */
+const NON_TERMINAL_CAPTURE_STATUSES = new Set([
+  "queued",
+  "creating",
+  "sending",
+  "agentWorking",
+  "readyUnverified",
+]);
+
 export async function migrateLegacyKeyToOrg(
   ctx: MutationCtx,
   userId: Id<"users">,
@@ -244,7 +252,25 @@ export async function migrateLegacyKeyToOrg(
     .query("conductorOrgs")
     .withIndex("by_user", (q) => q.eq("userId", userId))
     .first();
-  if (existingOrg !== null) return;
+
+  if (existingOrg !== null) {
+    // Coexistence state (F1): org rows already exist — reachable via an
+    // admin merge that moved org rows onto this user before their next
+    // relaunch, or an old-client setAndValidateKey racing first-launch
+    // ensure — but the legacy settings key is still set too. Left alone it
+    // would permanently shadow the org store: every orgId-less capture
+    // would keep resolving the stale legacy key forever, settings.get would
+    // show the stale masked triple, and validateKey would re-create a
+    // legacy no-org cache row. Just clear it; never insert a second org row
+    // here (credsForCaptureInternal only reads legacy settings when the
+    // user has zero org rows).
+    await ctx.db.patch(row._id, {
+      conductorApiKey: undefined,
+      conductorEnvironment: undefined,
+    });
+    console.log(`legacy-key-cleared-coexistence userId=${userId}`);
+    return;
+  }
 
   const orgId = await ctx.db.insert("conductorOrgs", {
     userId,
@@ -260,6 +286,22 @@ export async function migrateLegacyKeyToOrg(
     .unique();
   if (legacyCache !== null) {
     await ctx.db.patch(legacyCache._id, { orgId });
+  }
+
+  // F2: pin the new org row onto the caller's own in-flight (non-terminal,
+  // still orgId-less) captures too, closing the ≤1h window where a
+  // duplicate projectId across orgs could misroute a capture mid-flight.
+  // Bounded and best-effort — a throw here would lock users out at launch
+  // (see file header), so this never fails the migration.
+  const recentCaptures = await ctx.db
+    .query("captures")
+    .withIndex("by_user_time", (q) => q.eq("userId", userId))
+    .order("desc")
+    .take(50);
+  for (const capture of recentCaptures) {
+    if (capture.orgId !== undefined) continue;
+    if (!NON_TERMINAL_CAPTURE_STATUSES.has(capture.status)) continue;
+    await ctx.db.patch(capture._id, { orgId });
   }
 
   await ctx.db.patch(row._id, {

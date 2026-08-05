@@ -950,6 +950,82 @@ final class SettingsViewModelTests: XCTestCase {
 
         XCTAssertEqual(convex.orgRenameCalls.map(\.label), ["Side Project"])
         XCTAssertEqual(viewModel.orgKeys.first?.label, "Side Project")
+        XCTAssertEqual(viewModel.keyAddSucceeded, true, "a successful rename is itself the unified status's last outcome")
+    }
+
+    // MARK: F8: unified last-action status -- a failed remove/rename must
+    // never leave a stale success checkmark, and a stale success message
+    // from an EARLIER action must not survive a later failure.
+
+    func testRemoveKeyFailureSetsFailureStatusAndDoesNotShowSuccess() async throws {
+        let convex = FakeOnboardingConvexService()
+        convex.orgKeysStore = [
+            OrgKeyInfo(orgId: "org-1", label: "Personal", displayName: "Personal", lastFour: "aaaa", environment: .prod, createdAt: Date())
+        ]
+        convex.orgRemoveError = StubError()
+        let (viewModel, _, _) = makeViewModel(convex: convex)
+        await viewModel.load()
+
+        await viewModel.removeKey(orgId: "org-1")
+
+        XCTAssertEqual(viewModel.keyAddSucceeded, false)
+        XCTAssertEqual(viewModel.keyStatusMessage, "Couldn't remove that key. Check your connection and try again.")
+        XCTAssertEqual(viewModel.orgKeys.map(\.orgId), ["org-1"], "a failed remove must not drop the row client-side")
+    }
+
+    func testRenameKeyFailureSetsFailureStatusAndDoesNotShowSuccess() async throws {
+        let convex = FakeOnboardingConvexService()
+        convex.orgKeysStore = [
+            OrgKeyInfo(orgId: "org-1", label: "Personal", displayName: "Personal", lastFour: "aaaa", environment: .prod, createdAt: Date())
+        ]
+        convex.orgRenameError = StubError()
+        let (viewModel, _, _) = makeViewModel(convex: convex)
+        await viewModel.load()
+
+        await viewModel.renameKey(orgId: "org-1", label: "Side Project")
+
+        XCTAssertEqual(viewModel.keyAddSucceeded, false)
+        XCTAssertEqual(viewModel.keyStatusMessage, "Couldn't rename that key. Check your connection and try again.")
+        XCTAssertEqual(viewModel.orgKeys.first?.label, "Personal", "a failed rename must not relabel the row client-side")
+    }
+
+    func testSuccessfulAddFollowedByFailedRemoveDoesNotRetainSuccessMessage() async throws {
+        let convex = FakeOnboardingConvexService()
+        let (viewModel, _, _) = makeViewModel(convex: convex)
+        await viewModel.load()
+
+        viewModel.newKeyInput = "ck_new_key_7890"
+        await viewModel.addKey()
+        XCTAssertEqual(viewModel.keyStatusMessage, "Key saved and validated.")
+        XCTAssertEqual(viewModel.keyAddSucceeded, true)
+
+        let orgId = viewModel.orgKeys.first!.orgId
+        convex.orgRemoveError = StubError()
+        await viewModel.removeKey(orgId: orgId)
+
+        XCTAssertEqual(viewModel.keyAddSucceeded, false)
+        XCTAssertNotEqual(viewModel.keyStatusMessage, "Key saved and validated.", "the earlier action's success message must not survive a later failure")
+        XCTAssertEqual(viewModel.keyStatusMessage, "Couldn't remove that key. Check your connection and try again.")
+    }
+
+    func testReloadOrgKeysFailureKeepsPreviouslyLoadedKeysAndSetsErrorStatus() async throws {
+        let convex = FakeOnboardingConvexService()
+        convex.orgKeysStore = [
+            OrgKeyInfo(orgId: "org-1", label: "Personal", displayName: "Personal", lastFour: "aaaa", environment: .prod, createdAt: Date())
+        ]
+        let (viewModel, _, _) = makeViewModel(convex: convex)
+        await viewModel.load()
+        XCTAssertEqual(viewModel.orgKeys.map(\.orgId), ["org-1"])
+
+        // A later reload (e.g. triggered by a mutation's post-success
+        // refresh) hits a transient failure -- the already-loaded list must
+        // survive, not be wiped to empty.
+        convex.orgsListError = StubError()
+        await viewModel.load()
+
+        XCTAssertEqual(viewModel.orgKeys.map(\.orgId), ["org-1"], "a transient orgs:list failure must not wipe the previously loaded list")
+        XCTAssertEqual(viewModel.keyAddSucceeded, false)
+        XCTAssertNotNil(viewModel.keyStatusMessage)
     }
 
     func testSignOutTransitionsAuthToSignedOut() async throws {

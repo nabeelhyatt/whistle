@@ -189,11 +189,42 @@ describe("credsForCaptureInternal", () => {
     expect(result).toMatchObject({ ok: true, apiKey: "sk-b-2222" });
   });
 
-  test("no orgId + legacy settings key -> legacy creds win over any org rows", async () => {
+  test("no orgId + org rows present -> the org row wins even with a still-set legacy settings key (F1b: legacy branch is the zero-org-rows case only)", async () => {
     const t = convexTest(schema, modules);
-    const asUser = withMockUser(t, "auth0|creds-legacy");
+    const asUser = withMockUser(t, "auth0|creds-legacy-shadowed");
     const userId = await asUser.mutation(api.users.ensure, {});
-    await insertOrg(t, userId, { label: "Ignored org", conductorApiKey: "sk-org-ignored" });
+    const orgId = await insertOrg(t, userId, {
+      label: "Live org",
+      conductorApiKey: "sk-org-live-3333",
+    });
+    await t.run(async (ctx) => {
+      await ctx.db.insert("settings", {
+        userId,
+        conductorApiKey: "sk-legacy-4444",
+        conductorEnvironment: "staging",
+        agent: "claude",
+        screenshotsEnabled: true,
+      });
+    });
+
+    const result = await t.query(internal.pipelineInternal.credsForCaptureInternal, {
+      userId,
+      projectId: "proj-x",
+    });
+
+    expect(result).toMatchObject({
+      ok: true,
+      apiKey: "sk-org-live-3333",
+      environment: "prod",
+      orgLabel: "Live org",
+    });
+    void orgId;
+  });
+
+  test("no orgId + zero org rows + legacy settings key -> legacy creds", async () => {
+    const t = convexTest(schema, modules);
+    const asUser = withMockUser(t, "auth0|creds-legacy-zero-orgs");
+    const userId = await asUser.mutation(api.users.ensure, {});
     await t.run(async (ctx) => {
       await ctx.db.insert("settings", {
         userId,
@@ -265,6 +296,52 @@ describe("credsForCaptureInternal", () => {
     if (!unmatched.ok) {
       expect(unmatched.error).toMatch(/removed/);
     }
+  });
+
+  test("multiple org rows: a zombie cache row (orgId deleted) matching the project is ignored in favor of a live sibling's cache (F5 branch-4 live-org pick)", async () => {
+    const t = convexTest(schema, modules);
+    const asUser = withMockUser(t, "auth0|creds-zombie-cache");
+    const userId = await asUser.mutation(api.users.ensure, {});
+
+    const deletedOrgId = await insertOrg(t, userId, {
+      label: "Gone",
+      conductorApiKey: "sk-gone-1234",
+      createdAt: 1,
+    });
+    const orgB = await insertOrg(t, userId, {
+      label: "B",
+      conductorApiKey: "sk-b-8888",
+      createdAt: 2,
+    });
+
+    await t.run(async (ctx) => {
+      // Zombie row inserted first so a naive "first cache match" scan would
+      // pick it over the live sibling below.
+      await ctx.db.insert("projectsCache", {
+        userId,
+        orgId: deletedOrgId,
+        projects: [{ id: "proj-shared", name: "Shared", gitRemote: "git@shared" }],
+        fetchedAt: 1,
+      });
+      await ctx.db.insert("projectsCache", {
+        userId,
+        orgId: orgB,
+        projects: [{ id: "proj-shared", name: "Shared", gitRemote: "git@shared" }],
+        fetchedAt: 2,
+      });
+      await ctx.db.delete(deletedOrgId);
+    });
+
+    // A second live org row keeps this a "multiple org rows" case even
+    // after deletedOrgId is gone.
+    await insertOrg(t, userId, { label: "C", conductorApiKey: "sk-c-9999", createdAt: 3 });
+
+    const result = await t.query(internal.pipelineInternal.credsForCaptureInternal, {
+      userId,
+      projectId: "proj-shared",
+    });
+
+    expect(result).toMatchObject({ ok: true, apiKey: "sk-b-8888" });
   });
 
   test("zero keys anywhere -> ok:false 'No Conductor API key configured.'", async () => {

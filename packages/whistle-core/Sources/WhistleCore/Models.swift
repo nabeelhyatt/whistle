@@ -209,8 +209,9 @@ public struct Project: Codable, Equatable, Sendable, Identifiable {
     /// Which Conductor org key this project came from (multi-org plan) --
     /// absent for a legacy pre-migration cache row (both `orgId`/`orgLabel`
     /// arrive together or not at all, per `projects:list`). Decoded leniently
-    /// (see `init(from:)`) so a client running ahead of a backend rollout
-    /// still decodes instead of throwing.
+    /// (both fields are `Optional`, so the synthesized `Codable` conformance
+    /// already decodes them with `decodeIfPresent`) so a client running
+    /// ahead of a backend rollout still decodes instead of throwing.
     public var orgId: String?
     /// Display name for `orgId`'s org (server-resolved `orgDisplayName`, not
     /// user-typed `label` directly) -- for grouping the project picker by
@@ -223,14 +224,5 @@ public struct Project: Codable, Equatable, Sendable, Identifiable {
         self.gitRemote = gitRemote
         self.orgId = orgId
         self.orgLabel = orgLabel
-    }
-
-    public init(from decoder: Decoder) throws {
-        let container = try decoder.container(keyedBy: CodingKeys.self)
-        id = try container.decode(String.self, forKey: .id)
-        name = try container.decode(String.self, forKey: .name)
-        gitRemote = try container.decode(String.self, forKey: .gitRemote)
-        orgId = try container.decodeIfPresent(String.self, forKey: .orgId)
-        orgLabel = try container.decodeIfPresent(String.self, forKey: .orgLabel)
     }
 }

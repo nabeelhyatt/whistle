@@ -130,8 +130,12 @@ struct ProjectPicker: View {
         /// `orgLabel` is already unique across groups (see `groupedByOrg`),
         /// so it doubles as a stable `Identifiable` key; the leading
         /// unlabeled group uses a sentinel since two `nil`s can't collide
-        /// anyway.
-        var id: String { orgLabel ?? "__unlabeled__" }
+        /// anyway. The `"labeled:"` / `"unlabeled"` namespacing (rather than
+        /// using `orgLabel` bare, or a bare `"__unlabeled__"` sentinel) means
+        /// no real org label can ever collide with the sentinel -- an org
+        /// literally named `"__unlabeled__"` used to be indistinguishable
+        /// from the legacy leading group.
+        var id: String { orgLabel.map { "labeled:\($0)" } ?? "unlabeled" }
     }
 
     /// Buckets `projects` by `orgLabel`, preserving the list's existing

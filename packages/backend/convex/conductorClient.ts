@@ -139,6 +139,15 @@ export interface ConductorFetchOptions {
    * leaves this false.
    */
   isSendEndpoint?: boolean;
+  /**
+   * When `false`, suppresses the `console.error` this helper otherwise emits
+   * on both failure paths (network-level throw and non-2xx response).
+   * Defaults to `true` — every caller keeps logging except `getMe` (F12),
+   * which uses this for its own /me probe: a 404 from a deployment that
+   * doesn't serve /me yet is expected, not an error worth surfacing in the
+   * Convex dashboard's live logs.
+   */
+  logErrors?: boolean;
 }
 
 /**
@@ -152,7 +161,7 @@ export interface ConductorFetchOptions {
 export async function conductorFetch<T = unknown>(
   options: ConductorFetchOptions,
 ): Promise<T> {
-  const { creds, method, path, body, isSendEndpoint = false } = options;
+  const { creds, method, path, body, isSendEndpoint = false, logErrors = true } = options;
   const url = `${CONDUCTOR_API_BASES[creds.environment]}${path}`;
 
   let res: Response;
@@ -170,9 +179,11 @@ export async function conductorFetch<T = unknown>(
     // transient per §6. Log so this is visible in the Convex dashboard's
     // live function logs (never log the API key or request body).
     const message = err instanceof Error ? err.message : String(err);
-    console.error(
-      `Conductor API network error: ${method} ${path} — ${message}`,
-    );
+    if (logErrors) {
+      console.error(
+        `Conductor API network error: ${method} ${path} — ${message}`,
+      );
+    }
     throw new ConductorApiError({
       errorClass: "network",
       userMessage: `Network error calling Conductor API: ${message}`,
@@ -192,9 +203,11 @@ export async function conductorFetch<T = unknown>(
     const structured = parseStructuredError(parsedBody);
     // Log so non-2xx failures are visible in the Convex dashboard's live
     // function logs (never log the API key or request body).
-    console.error(
-      `Conductor API error: ${method} ${path} — status=${res.status} errorClass=${errorClass}`,
-    );
+    if (logErrors) {
+      console.error(
+        `Conductor API error: ${method} ${path} — status=${res.status} errorClass=${errorClass}`,
+      );
+    }
     throw new ConductorApiError({
       errorClass,
       status: res.status,
@@ -444,7 +457,15 @@ export async function getMe(
 ): Promise<ConductorMe | undefined> {
   let body: unknown;
   try {
-    body = await conductorFetch<unknown>({ creds, method: "GET", path: "/me" });
+    body = await conductorFetch<unknown>({
+      creds,
+      method: "GET",
+      path: "/me",
+      // F12: a 404 from a deployment that doesn't serve /me yet (the
+      // common case today) is expected, not an error — don't spam the
+      // dashboard's live logs once per org per refresh.
+      logErrors: false,
+    });
   } catch {
     return undefined;
   }
@@ -452,13 +473,21 @@ export async function getMe(
   const record = body as Record<string, unknown>;
   const str = (key: string): string | undefined =>
     typeof record[key] === "string" ? (record[key] as string) : undefined;
-  return {
-    organizationId: str("organizationId"),
-    // Server org name lands here when the API ships it (accept either
-    // `organizationName` or a plain `name`).
-    organizationName: str("organizationName") ?? str("name"),
-    authMethod: str("authMethod"),
-  };
+  const organizationId = str("organizationId");
+  // Server org name lands here when the API ships it (accept either
+  // `organizationName` or a plain `name`).
+  const organizationName = str("organizationName") ?? str("name");
+  const authMethod = str("authMethod");
+  // F11: match the doc comment — undefined when every expected field is
+  // absent, rather than an all-undefined object that looks like a hit.
+  if (
+    organizationId === undefined &&
+    organizationName === undefined &&
+    authMethod === undefined
+  ) {
+    return undefined;
+  }
+  return { organizationId, organizationName, authMethod };
 }
 
 // ─── Environment resolution (probe, don't parse — KTD1) ─────────────────

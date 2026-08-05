@@ -31,6 +31,16 @@ export const create = mutation({
   handler: async (ctx, args) => {
     const user = await requireUser(ctx);
 
+    if (args.orgId !== undefined) {
+      // F14: fail fast at create time instead of an alarming cross-account
+      // pipeline error minutes later — old clients never send orgId, so
+      // this only affects new clients.
+      const org = await ctx.db.get(args.orgId);
+      if (org === null || org.userId !== user._id) {
+        throw new Error("Unknown organization key — refresh and try again.");
+      }
+    }
+
     const existing = await ctx.db
       .query("captures")
       .withIndex("by_client", (q) =>
