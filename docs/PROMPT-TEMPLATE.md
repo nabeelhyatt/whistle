@@ -1,6 +1,6 @@
 # Whistle — default prompt template
 
-This is the planning prompt Whistle sends as the first message to the Conductor workspace agent. It's a compact, headless briefing: interpret the captured idea, research the codebase, and produce a right-sized plan (or a short note/memo when a full plan isn't warranted) ending with clarifying questions — since the workspace agent runs with no user present, there's no back-and-forth. It works on any repo with no plugin, skill, or tool dependencies. Source of truth at runtime: `packages/backend/convex/defaultTemplate.ts` (this file is documentation; keep them in sync).
+This is the planning prompt Whistle sends as the first message to the Conductor workspace agent. It's a compact, headless briefing: interpret the captured idea, research the codebase, and produce a right-sized plan (or a short note/memo when a full plan isn't warranted) ending with clarifying questions — since the workspace agent runs with no user present, there's no back-and-forth. It works on any repo with no repo-specific plugin or skill dependencies (the screenshot step below uses `curl`, available on any workspace). Source of truth at runtime: `packages/backend/convex/defaultTemplate.ts` (this file is documentation; keep them in sync).
 
 Users can edit the template in Settings. Rendering is literal `{{var}}` substitution plus a single `{{#if screenshot_url}}...{{/if}}` conditional (see TECH-SPEC §8).
 
