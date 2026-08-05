@@ -126,21 +126,26 @@ describe("generateWorkspaceTitle", () => {
   });
 
   test("returns null when the request is aborted (timeout path)", async () => {
-    // Exercises the same catch path a real 10s AbortController timeout takes,
-    // without waiting on the real timer.
+    vi.useFakeTimers();
     vi.stubGlobal(
       "fetch",
-      vi.fn(() =>
-        Promise.reject(new DOMException("This operation was aborted", "AbortError")),
+      vi.fn((_url: string, init?: RequestInit) =>
+        new Promise((_resolve, reject) => {
+          init?.signal?.addEventListener("abort", () => {
+            reject(new DOMException("This operation was aborted", "AbortError"));
+          });
+        }),
       ),
     );
 
-    const title = await generateWorkspaceTitle({
+    const titlePromise = generateWorkspaceTitle({
       transcript: "anything",
       notes: "",
       projectName: "Whistle",
     });
+    await vi.advanceTimersByTimeAsync(2_000);
 
+    const title = await titlePromise;
     expect(title).toBeNull();
   });
 
@@ -181,10 +186,19 @@ describe("sanitizeTitle", () => {
   });
 
   test("caps at 60 characters", () => {
-    const long = "A".repeat(100);
+    const long = Array.from({ length: 5 }, () => "A".repeat(15)).join(" ");
     const result = sanitizeTitle(long);
     expect(result).not.toBeNull();
     expect(result!.length).toBe(60);
+  });
+
+  test("returns null for titles outside the required 3-5 word range", () => {
+    expect(sanitizeTitle("Settings")).toBeNull();
+    expect(sanitizeTitle("One two three four five six")).toBeNull();
+  });
+
+  test("removes orphan-tag delimiters and trailing punctuation", () => {
+    expect(sanitizeTitle("Capture #panel redesign!")).toBe("Capture panel redesign");
   });
 
   test("returns null for empty input after sanitizing", () => {

@@ -9,7 +9,7 @@
 
 const OPENROUTER_CHAT_URL = "https://openrouter.ai/api/v1/chat/completions";
 const TITLE_MODEL = "anthropic/claude-haiku-4.5";
-const REQUEST_TIMEOUT_MS = 10_000;
+const REQUEST_TIMEOUT_MS = 2_000;
 const MAX_INPUT_CHARS = 2_000;
 const MAX_TITLE_CHARS = 60;
 
@@ -45,11 +45,17 @@ function buildPrompt(args: {
 export function sanitizeTitle(raw: string): string | null {
   const firstLine = raw.split("\n")[0] ?? "";
   const unquoted = firstLine.trim().replace(/^["'“”‘’]+|["'“”‘’]+$/g, "");
-  const collapsed = unquoted.replace(/\s+/g, " ").trim();
+  const collapsed = unquoted
+    .replace(/#/g, "")
+    .replace(/[.,;:!?]+$/, "")
+    .replace(/\s+/g, " ")
+    .trim();
   if (collapsed.length === 0) return null;
-  return collapsed.length > MAX_TITLE_CHARS
+  const title = collapsed.length > MAX_TITLE_CHARS
     ? collapsed.slice(0, MAX_TITLE_CHARS).trim()
     : collapsed;
+  const wordCount = title.split(" ").length;
+  return wordCount >= 3 && wordCount <= 5 ? title : null;
 }
 
 /**

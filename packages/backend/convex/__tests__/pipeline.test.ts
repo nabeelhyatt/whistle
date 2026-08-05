@@ -63,6 +63,7 @@ class MockConductor {
   acceptedEnvironment: "prod" | "staging" = "prod";
 
   createWorkspaceCount = 0;
+  createWorkspaceNames: string[] = [];
   sendMessageCalls: Array<{ sessionId: string; messageId: string }> = [];
 
   /** Behavior overrides a test can toggle mid-run. */
@@ -132,6 +133,7 @@ class MockConductor {
     // POST /v0/workspaces
     if (method === "POST" && path === "/v0/workspaces") {
       this.createWorkspaceCount += 1;
+      this.createWorkspaceNames.push(body.name);
       if (this.createWorkspaceResponder) {
         const r = this.createWorkspaceResponder();
         return json(r.status, r.body);
@@ -764,6 +766,19 @@ describe("staging environment routing (U4)", () => {
 describe("project-visibility guard (canonical-accounts)", () => {
   test("capture's project not visible to the key -> terminal failed/auth, no workspace created", async () => {
     const t = convexTest(schema, modules);
+    const originalTitleKey = process.env.OPENROUTER_API_KEY;
+    process.env.OPENROUTER_API_KEY = "sk-or-test-key";
+    let titleRequests = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((url: string, init?: RequestInit) => {
+        if (url === "https://openrouter.ai/api/v1/chat/completions") {
+          titleRequests += 1;
+          return Promise.resolve(new Response(JSON.stringify({ choices: [] })));
+        }
+        return mock.handle(url, init);
+      }),
+    );
     // The key can only see a *different* project than the capture's proj-1,
     // simulating a key that belongs to a different Conductor account (the one
     // the capture's project was picked under).
@@ -775,15 +790,24 @@ describe("project-visibility guard (canonical-accounts)", () => {
       projectId: "proj-1",
     });
 
-    await tick(t);
+    try {
+      await tick(t);
 
-    const capture = await asUser.query(api.captures.get, { captureId });
-    expect(capture?.status).toBe("failed");
-    expect(capture?.errorCode).toBe("auth");
-    expect(capture?.error).toMatch(/different Conductor account/i);
-    // Guard fires before any workspace/message side effects.
-    expect(mock.createWorkspaceCount).toBe(0);
-    expect(mock.sendMessageCalls).toHaveLength(0);
+      const capture = await asUser.query(api.captures.get, { captureId });
+      expect(capture?.status).toBe("failed");
+      expect(capture?.errorCode).toBe("auth");
+      expect(capture?.error).toMatch(/different Conductor account/i);
+      // Guard fires before any workspace, message, or title-provider side effect.
+      expect(mock.createWorkspaceCount).toBe(0);
+      expect(mock.sendMessageCalls).toHaveLength(0);
+      expect(titleRequests).toBe(0);
+    } finally {
+      if (originalTitleKey === undefined) {
+        delete process.env.OPENROUTER_API_KEY;
+      } else {
+        process.env.OPENROUTER_API_KEY = originalTitleKey;
+      }
+    }
   });
 
   test("capture's project visible to the key -> proceeds to create + agentWorking", async () => {
@@ -921,6 +945,7 @@ describe("error: 5xx on create", () => {
     let capture = await asUser.query(api.captures.get, { captureId });
     expect(capture?.status).toBe("queued");
     expect(capture?.attempt).toBe(1);
+    expect(capture?.workspaceName).toBe("retry create #client");
 
     // U3: this transient failure is logged as "rescheduling", never
     // "terminal" — attempt count is still under MAX_SUBMIT_ATTEMPTS.
@@ -946,6 +971,9 @@ describe("error: 5xx on create", () => {
     expect(mock.createWorkspaceCount).toBe(3); // 2 failed + 1 succeeded
     // But only one *actual* workspace object was ever recorded server-side.
     expect(mock.workspaces.size).toBe(1);
+    expect(mock.createWorkspaceNames.at(-1)).toBe(
+      "retry create #client",
+    );
   });
 });
 

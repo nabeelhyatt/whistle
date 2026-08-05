@@ -384,6 +384,18 @@ async function runSubmit(
     return;
   }
 
+  const needsWorkspace =
+    capture.workspaceId === undefined || capture.sessionId === undefined;
+  if (needsWorkspace && !(await projectVisibleToKey(creds, capture.projectId))) {
+    await patchCapture(ctx, captureId, {
+      status: "failed",
+      errorCode: "auth",
+      error:
+        "This capture's Conductor project isn't visible to your saved API key — the key may belong to a different Conductor account. Update it in Settings.",
+    });
+    return;
+  }
+
   const template = await ctx.runQuery(
     internal.pipelineInternal.getTemplateInternal,
     { userId: capture.userId },
@@ -396,22 +408,24 @@ async function runSubmit(
         })
       : null;
 
-  const workspaceName =
-    capture.workspaceName ??
-    buildWorkspaceName({
+  const workspaceName = capture.workspaceName ??
+    (await ctx.runMutation(
+      internal.pipelineInternal.setWorkspaceNameIfAbsentInternal,
+      {
+        captureId,
+        workspaceName: buildWorkspaceName({
       notes: capture.notes,
       transcript: capture.transcript,
       clientId: capture.clientId,
       capturedAt: capture.capturedAt,
-      // Only spend a Haiku call on a name that hasn't been persisted yet —
-      // the `capture.workspaceName ??` guard above already makes retries
-      // reuse the stored name, so this runs at most once per capture.
       title: await generateWorkspaceTitle({
         transcript: capture.transcript,
         notes: capture.notes,
         projectName: capture.projectName,
       }),
-    });
+        }),
+      },
+    ));
 
   const renderedPrompt = renderTemplate(template, {
     transcript: capture.transcript,
@@ -427,7 +441,7 @@ async function runSubmit(
   let sessionId = capture.sessionId;
   let deepLink = capture.deepLink;
 
-  if (workspaceId === undefined || sessionId === undefined) {
+  if (needsWorkspace) {
     // 3·0. Project-visibility guard (canonical-accounts). The stored key must
     // be able to see this capture's project. A key that belongs to a
     // *different* Conductor account than the one the user picked the project
@@ -437,16 +451,6 @@ async function runSubmit(
     // working" pointing at a workspace the user can't open. Fail fast with a
     // Settings-routing message instead. Runs only on a fresh submit (no
     // workspaceId yet); adopted/created captures skip it on later passes.
-    if (!(await projectVisibleToKey(creds, capture.projectId))) {
-      await patchCapture(ctx, captureId, {
-        status: "failed",
-        errorCode: "auth",
-        error:
-          "This capture's Conductor project isn't visible to your saved API key — the key may belong to a different Conductor account. Update it in Settings.",
-      });
-      return;
-    }
-
     // 3a. Orphan adoption: search for a workspace already tagged with our
     // clientId (a previous run created it but died before patching ids).
     const tag = orphanTag(capture.clientId);
@@ -491,7 +495,6 @@ async function runSubmit(
       workspaceId,
       sessionId,
       deepLink,
-      workspaceName,
       status: "creating",
     });
   }
