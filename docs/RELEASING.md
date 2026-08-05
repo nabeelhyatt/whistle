@@ -30,10 +30,19 @@ download button on `nabeelhyatt.com/experiments/whistle` points at
 touching again.
 
 The feed carries **only the current release's item**. Sparkle only ever offers the newest
-applicable item, every release shares `minimumSystemVersion` 14.0, and the items carry no
-release notes — so historical items would change nothing, while depending on every past
-release's asset staying well-formed forever would be a standing hazard (v1.0.9's published
-item is in fact invalid XML: duplicate `length` attribute, since fixed).
+applicable item, and every release shares `minimumSystemVersion` 14.0 — so historical items
+would change nothing except whichever release notes they happen to carry, and those come from
+that release's own tag (below), never accumulated across items. Depending on every past
+release's asset staying well-formed forever would still be a standing hazard (v1.0.9's published
+item is in fact invalid XML: duplicate `length` attribute, since fixed), which is why each
+release keeps its own `appcast-item.xml` asset rather than concatenating history.
+
+**Release notes.** The appcast item's `<description>` — what Sparkle's update dialog actually
+shows the user — comes from the **annotated git tag's message**, one bullet per line (`- ` or
+`* ` prefix optional, stripped either way). A plain lightweight tag (`git tag vX.Y.Z`, no `-a`)
+degrades gracefully to no description at all; the dialog just shows no notes. Keep bullets short
+and user-facing — "Faster capture panel startup", not a commit message or a file list. The
+`/release` skill drafts these for you and asks you to confirm/edit them before tagging.
 
 ### Invariants
 
@@ -56,6 +65,9 @@ item is in fact invalid XML: duplicate `length` attribute, since fixed).
 - **Feed URL is compile-time.** Moving the feed means editing `SU_FEED_URL`, re-running
   `xcodegen generate`, **and** shipping a new build — existing installs keep checking whatever
   URL was baked into them.
+- **Release notes are optional, never blocking.** `release.yml` reads them off the tag
+  annotation and degrades to no `<description>` on a lightweight tag or an empty message —
+  never fails the release over missing/malformed notes.
 
 ## Cutting a release
 
@@ -67,10 +79,20 @@ item is in fact invalid XML: duplicate `length` attribute, since fixed).
    never needs touching again. Kept here for the record — future releases start at step 1.
 1. **Bump the version.** In the PR with your app changes, bump `MARKETING_VERSION` in
    `apps/macos/project.yml` by one patch (per AGENTS.md "Version Bumping"). Merge to `main`.
-2. **Tag and push.** From `main` at the merged commit:
+2. **Tag and push.** From `main` at the merged commit, as an **annotated** tag carrying 2-4
+   short, user-facing release-note bullets as the message (the `/release` skill drafts these
+   for you from the commits since the last tag — see "Release notes" above):
    ```sh
-   git tag vX.Y.Z && git push origin vX.Y.Z    # vX.Y.Z must match MARKETING_VERSION
+   git tag -a vX.Y.Z -m "$(cat <<'EOF'
+   - Bullet one
+   - Bullet two
+   - Bullet three
+   EOF
+   )"
+   git push origin vX.Y.Z    # vX.Y.Z must match MARKETING_VERSION
    ```
+   A plain `git tag vX.Y.Z` (lightweight, no message) still works — the release just ships with
+   no notes in the update dialog.
    This builds → Developer-ID signs → notarizes → staples → signs the appcast item → assembles
    `appcast.xml` → publishes the Release. Existing installs are offered the update as soon as
    the assets finish uploading; no other step is required.

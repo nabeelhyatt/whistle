@@ -145,9 +145,27 @@ jobs:
           rm -f "$RUNNER_TEMP/sparkle_ed_key"
           BUILD_NUMBER="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' \
             apps/macos/dist/DerivedData/Build/Products/Release/Whistle.app/Contents/Info.plist)"
+          # Release notes ride on the annotated tag's message (see
+          # docs/RELEASING.md) — one bullet per line, "- " or "* " prefix
+          # optional. A lightweight tag (no message) degrades gracefully to no
+          # <description> at all; Sparkle's standard UI just shows no notes.
+          # `]]>` is escaped so a literal one in the notes can't prematurely
+          # close the CDATA section below.
+          TAG_NOTES_RAW="$(git tag -l --format='%(contents)' "$GITHUB_REF_NAME" 2>/dev/null || true)"
+          TAG_NOTES_RAW="${TAG_NOTES_RAW//]]>/]] >}"
+          DESCRIPTION_XML=""
+          if [[ -n "$TAG_NOTES_RAW" ]]; then
+            BULLETS_HTML="$(printf '%s\n' "$TAG_NOTES_RAW" \
+              | sed -e 's/^[[:space:]]*[-*][[:space:]]*//' -e '/^[[:space:]]*$/d' \
+                    -e 's/^/<li>/' -e 's/$/<\/li>/')"
+            if [[ -n "$BULLETS_HTML" ]]; then
+              DESCRIPTION_XML="<description><![CDATA[<ul>${BULLETS_HTML}</ul>]]></description>"
+            fi
+          fi
           cat > apps/macos/dist/appcast-item.xml <<ITEM
           <item>
             <title>Version ${VERSION}</title>
+            ${DESCRIPTION_XML}
             <pubDate>$(date -R)</pubDate>
             <sparkle:version>${BUILD_NUMBER}</sparkle:version>
             <sparkle:shortVersionString>${VERSION}</sparkle:shortVersionString>
@@ -163,10 +181,12 @@ jobs:
       # Wraps the signed item in a complete feed published as the `appcast.xml`
       # release asset, which is what SU_FEED_URL
       # (…/releases/latest/download/appcast.xml) resolves to. The feed carries
-      # only the CURRENT release: Sparkle offers the newest applicable item, all
-      # releases share minimumSystemVersion 14.0, and no item carries release
-      # notes, so historical items would change nothing. Each release keeps its
-      # own appcast-item.xml asset, so history stays reconstructible.
+      # only the CURRENT release: Sparkle offers the newest applicable item, and
+      # all releases share minimumSystemVersion 14.0, so historical items would
+      # change nothing except whatever release notes they carry — and those are
+      # per-release (from that release's own tag annotation, above), not
+      # accumulated across items. Each release keeps its own appcast-item.xml
+      # asset, so history stays reconstructible.
       # (Concatenating history was tried and rejected: v1.0.9's published item
       # has a duplicate `length` attribute — see the note above — so it is
       # invalid XML, and one bad historical asset would break every future
