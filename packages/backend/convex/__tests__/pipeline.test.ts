@@ -63,6 +63,7 @@ class MockConductor {
   acceptedEnvironment: "prod" | "staging" = "prod";
 
   createWorkspaceCount = 0;
+  createWorkspaceNames: string[] = [];
   sendMessageCalls: Array<{ sessionId: string; messageId: string }> = [];
 
   /** Behavior overrides a test can toggle mid-run. */
@@ -132,6 +133,7 @@ class MockConductor {
     // POST /v0/workspaces
     if (method === "POST" && path === "/v0/workspaces") {
       this.createWorkspaceCount += 1;
+      this.createWorkspaceNames.push(body.name);
       if (this.createWorkspaceResponder) {
         const r = this.createWorkspaceResponder();
         return json(r.status, r.body);
@@ -350,27 +352,39 @@ async function tick(t: ReturnType<typeof convexTest>, ms = 0) {
 // ─── Pure helper unit tests ────────────────────────────────────────────────
 
 describe("buildWorkspaceName", () => {
-  test("uses first 6 meaningful words of notes when present", () => {
+  test("uses the title when present", () => {
     const name = buildWorkspaceName({
       notes: "add a dark mode toggle to settings page please",
       transcript: "ignored",
       clientId: "abcdef123456",
       capturedAt: Date.now(),
+      title: "Dark mode toggle",
     });
-    expect(name).toBe("idea: add a dark mode toggle to #abcdef");
+    expect(name).toBe("Dark mode toggle #abcdef");
   });
 
-  test("falls back to transcript when notes is empty", () => {
+  test("falls back to first 6 meaningful words of notes when title is null", () => {
+    const name = buildWorkspaceName({
+      notes: "add a dark mode toggle to settings page please",
+      transcript: "ignored",
+      clientId: "abcdef123456",
+      capturedAt: Date.now(),
+      title: null,
+    });
+    expect(name).toBe("add a dark mode toggle to #abcdef");
+  });
+
+  test("falls back to transcript when notes is empty and no title", () => {
     const name = buildWorkspaceName({
       notes: "",
       transcript: "improve login flow speed",
       clientId: "123456abcdef",
       capturedAt: Date.now(),
     });
-    expect(name).toBe("idea: improve login flow speed #123456");
+    expect(name).toBe("improve login flow speed #123456");
   });
 
-  test("falls back to screenshot-only form when both are empty", () => {
+  test("falls back to screenshot-only form when both are empty and no title", () => {
     const capturedAt = new Date("2026-07-04T12:00:00.000Z").getTime();
     const name = buildWorkspaceName({
       notes: "",
@@ -378,7 +392,18 @@ describe("buildWorkspaceName", () => {
       clientId: "aaaaaa000000",
       capturedAt,
     });
-    expect(name).toBe("idea: screenshot capture 2026-07-04 #aaaaaa");
+    expect(name).toBe("Screenshot capture 2026-07-04 #aaaaaa");
+  });
+
+  test("empty-string title falls back like a missing title", () => {
+    const name = buildWorkspaceName({
+      notes: "",
+      transcript: "improve login flow speed",
+      clientId: "123456abcdef",
+      capturedAt: Date.now(),
+      title: "",
+    });
+    expect(name).toBe("improve login flow speed #123456");
   });
 });
 
@@ -741,6 +766,19 @@ describe("staging environment routing (U4)", () => {
 describe("project-visibility guard (canonical-accounts)", () => {
   test("capture's project not visible to the key -> terminal failed/auth, no workspace created", async () => {
     const t = convexTest(schema, modules);
+    const originalTitleKey = process.env.OPENROUTER_API_KEY;
+    process.env.OPENROUTER_API_KEY = "sk-or-test-key";
+    let titleRequests = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((url: string, init?: RequestInit) => {
+        if (url === "https://openrouter.ai/api/v1/chat/completions") {
+          titleRequests += 1;
+          return Promise.resolve(new Response(JSON.stringify({ choices: [] })));
+        }
+        return mock.handle(url, init);
+      }),
+    );
     // The key can only see a *different* project than the capture's proj-1,
     // simulating a key that belongs to a different Conductor account (the one
     // the capture's project was picked under).
@@ -752,15 +790,24 @@ describe("project-visibility guard (canonical-accounts)", () => {
       projectId: "proj-1",
     });
 
-    await tick(t);
+    try {
+      await tick(t);
 
-    const capture = await asUser.query(api.captures.get, { captureId });
-    expect(capture?.status).toBe("failed");
-    expect(capture?.errorCode).toBe("auth");
-    expect(capture?.error).toMatch(/different Conductor account/i);
-    // Guard fires before any workspace/message side effects.
-    expect(mock.createWorkspaceCount).toBe(0);
-    expect(mock.sendMessageCalls).toHaveLength(0);
+      const capture = await asUser.query(api.captures.get, { captureId });
+      expect(capture?.status).toBe("failed");
+      expect(capture?.errorCode).toBe("auth");
+      expect(capture?.error).toMatch(/different Conductor account/i);
+      // Guard fires before any workspace, message, or title-provider side effect.
+      expect(mock.createWorkspaceCount).toBe(0);
+      expect(mock.sendMessageCalls).toHaveLength(0);
+      expect(titleRequests).toBe(0);
+    } finally {
+      if (originalTitleKey === undefined) {
+        delete process.env.OPENROUTER_API_KEY;
+      } else {
+        process.env.OPENROUTER_API_KEY = originalTitleKey;
+      }
+    }
   });
 
   test("capture's project visible to the key -> proceeds to create + agentWorking", async () => {
@@ -989,6 +1036,7 @@ describe("error: 5xx on create", () => {
     let capture = await asUser.query(api.captures.get, { captureId });
     expect(capture?.status).toBe("queued");
     expect(capture?.attempt).toBe(1);
+    expect(capture?.workspaceName).toBe("retry create #client");
 
     // U3: this transient failure is logged as "rescheduling", never
     // "terminal" — attempt count is still under MAX_SUBMIT_ATTEMPTS.
@@ -1014,6 +1062,9 @@ describe("error: 5xx on create", () => {
     expect(mock.createWorkspaceCount).toBe(3); // 2 failed + 1 succeeded
     // But only one *actual* workspace object was ever recorded server-side.
     expect(mock.workspaces.size).toBe(1);
+    expect(mock.createWorkspaceNames.at(-1)).toBe(
+      "retry create #client",
+    );
   });
 });
 
@@ -1057,7 +1108,7 @@ describe("error: create succeeded but action died pre-patch", () => {
       workspaceId: "ws-orphan",
       sessionId: "sess-orphan",
       projectId: "proj-1",
-      name: `idea: orphan adoption test #${tag}`,
+      name: `orphan adoption test #${tag}`,
       status: "ready",
     });
 

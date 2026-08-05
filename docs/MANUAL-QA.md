@@ -147,6 +147,16 @@ the box when you've personally observed the expected outcome.
   **Expected outcome:** capture proceeds without a screenshot; the
   thumbnail slot shows an "enable in Settings" affordance instead of a
   broken image.
+- [ ] **Action (screenshot excludes Whistle):** With Screen Recording
+  granted, put a clearly-identifiable non-Whistle app in front, then trigger
+  a capture BOTH ways — the status-item click and the Option-Shift-W hotkey —
+  and inspect the attached thumbnail each time.
+  **Expected outcome:** every screenshot shows the underlying app, never the
+  Whistle capture panel (nor its window shadow), for both trigger paths. This
+  is the ordering + self-exclusion fix: the ScreenCaptureKit request is
+  submitted before the panel is presented, and Whistle's own app is excluded
+  from the content filter, so History/Settings windows are likewise absent
+  from any capture.
 - [ ] **Action:** On a machine/account where on-device speech has no
   downloaded model (fresh install, dictation never enabled): trigger a
   capture.
@@ -399,7 +409,7 @@ view, not a duplicate of the instructions).
 
 ## Summary
 
-- **6 sections**, **46 checklist items** total.
+- **6 sections**, **47 checklist items** total.
 - Items requiring hardware/OS this host cannot provide (explicitly
   unchecked, not merely "not yet done"): macOS 26 dictation runtime
   verification, macOS 14 hardware verification.

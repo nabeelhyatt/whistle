@@ -16,10 +16,17 @@
 // `makeFirstResponder` call on the hosting view after `orderFront` (the
 // known-good pattern for SwiftUI text focus inside a key-capable panel).
 //
-// Sequence per §4.2: screenshot fires BEFORE the panel is shown (async;
-// thumbnail fades in when ready, never blocks panel display);
+// Sequence per §4.2: the screenshot REQUEST is submitted before the panel
+// is shown, and the panel is presented only after a one-shot capture-start
+// acknowledgement (or a short timeout fallback) — so the frame is requested
+// while Whistle is not yet on screen, without blocking presentation on image
+// bytes or JPEG encoding (the thumbnail fades in when it resolves). Submitting
+// the request before showing the panel is the primary protection against
+// Whistle capturing itself; the capturer's self-app content-filter exclusion
+// is a best-effort backstop (it may no-op on the bare path -- see
+// ScreenshotService's header).
 // `TranscriptionService.start()` happens on open (prewarmed engine, per
-// §4.2 point 3); panel visible + first responder immediately.
+// §4.2 point 3); panel visible + first responder immediately after the ack.
 //
 // @MainActor per TECH-SPEC §4.1's concurrency map.
 
@@ -61,11 +68,55 @@ private final class NonActivatingCapturePanel: NSPanel {
     override var canBecomeMain: Bool { false }
 }
 
+/// Injectable seam over the raw AppKit window side-effects the controller
+/// performs (ordering the panel front/out, taking key, activating the app,
+/// the global click-away monitor). Production uses the defaults, which call
+/// AppKit directly. Tests inject `.noop` so the panel is never actually
+/// shown or made key -- presentation ordering is then observed purely through
+/// the controller's own `panelPresented` state, with no real window to pop up
+/// on screen and no spurious `windowDidResignKey` racing the test.
+public struct CaptureWindowOps {
+    public var orderFrontRegardless: @MainActor (NSPanel) -> Void = { $0.orderFrontRegardless() }
+    public var makeKey: @MainActor (NSPanel) -> Void = { $0.makeKey() }
+    public var makeKeyAndOrderFront: @MainActor (NSPanel) -> Void = { $0.makeKeyAndOrderFront(nil) }
+    public var orderOut: @MainActor (NSPanel) -> Void = { $0.orderOut(nil) }
+    public var makeFirstResponder: @MainActor (NSPanel, NSView?) -> Void = { $0.makeFirstResponder($1) }
+    public var activateApp: @MainActor () -> Void = { NSApp.activate(ignoringOtherApps: true) }
+    public var frontmostApp: @MainActor () -> NSRunningApplication? = { NSWorkspace.shared.frontmostApplication }
+    public var activate: @MainActor (NSRunningApplication) -> Void = { $0.activate() }
+    public var addGlobalClickMonitor: @MainActor (@escaping (NSEvent) -> Void) -> Any? = {
+        NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown], handler: $0)
+    }
+    public var removeMonitor: @MainActor (Any) -> Void = { NSEvent.removeMonitor($0) }
+
+    public init() {}
+
+    /// Every operation a no-op (monitor returns no token). Panels are created
+    /// but never shown/keyed -- for deterministic tests with no real UI.
+    public static var noop: CaptureWindowOps {
+        var ops = CaptureWindowOps()
+        ops.orderFrontRegardless = { _ in }
+        ops.makeKey = { _ in }
+        ops.makeKeyAndOrderFront = { _ in }
+        ops.orderOut = { _ in }
+        ops.makeFirstResponder = { _, _ in }
+        ops.activateApp = {}
+        ops.frontmostApp = { nil }
+        ops.activate = { _ in }
+        ops.addGlobalClickMonitor = { _ in nil }
+        ops.removeMonitor = { _ in }
+        return ops
+    }
+}
+
 @MainActor
 public final class CapturePanelController: NSObject, NSWindowDelegate {
     private let store: CaptureStore
     private let screenshotService: ScreenshotService
     private let mode: CapturePanelMode
+    /// Raw AppKit window side-effects, injected so tests can run with no real
+    /// window (see `CaptureWindowOps`).
+    private let windowOps: CaptureWindowOps
     /// Threaded straight into every `CaptureViewModel` this controller
     /// creates (fix #2) -- wired by `WhistleApp` to `ProjectsSyncCoordinator.
     /// refreshIfStale()`.
@@ -98,6 +149,15 @@ public final class CapturePanelController: NSObject, NSWindowDelegate {
     private var panel: NSPanel?
     private var viewModel: CaptureViewModel?
     private var hostingView: NSHostingView<CaptureView>?
+    /// Whether the panel is currently presented, tracked deterministically as
+    /// we order it in/out rather than read back from `NSPanel.isVisible`.
+    /// AppKit's window-visibility state settles asynchronously and races
+    /// window key transitions in a headless test host, so reading `isVisible`
+    /// for control flow (the already-visible trigger branch) or for test
+    /// observation is flaky now that presentation is deferred to the
+    /// screenshot ack. This flag flips true in `showPanel` and false wherever
+    /// the panel is ordered out (`dismissPreservingDraft`, `tearDownPanel`).
+    private var panelPresented = false
     /// Global mouse-down monitor active while the panel is open: a click
     /// delivered to ANY OTHER app dismisses the panel (Spotlight pattern,
     /// requested in live review 2026-07-09). A global monitor only sees
@@ -116,6 +176,25 @@ public final class CapturePanelController: NSObject, NSWindowDelegate {
     /// model -- the generation token already discards a stale *result*,
     /// this bounds the *work in flight* to at most one tracked capture.
     private var screenshotTask: Task<Void, Never>?
+
+    /// Monotonic token for the pending-presentation handshake. Bumped by
+    /// every new handshake AND by `tearDownPanel()`, so any stale completion
+    /// (a late ack, a late timeout, or a replaced panel) fails the guard in
+    /// `completePendingPresentation` and no-ops.
+    private var presentationGeneration = 0
+    /// True between "screenshot request dispatched" and "panel shown". A
+    /// plain re-trigger arriving in this window coalesces (see `trigger`)
+    /// rather than spawning a duplicate panel or a second capture job.
+    private var isPresentationPending = false
+    /// Fallback timer so a hung/slow capturer (e.g. a cold, slow
+    /// `SCShareableContent.current`) can never hold the panel hostage — it
+    /// races the ack into the same idempotent completion.
+    private var presentationTimeoutTask: Task<Void, Never>?
+    /// How long to wait for the capture-start ack before presenting anyway.
+    /// Sized to stay inside the §4.2 trigger->interactive budget. Internal so
+    /// tests can lengthen it (to hold the handshake open) or shorten it (to
+    /// exercise the fallback) — never a real TCC/UI dependency.
+    var screenshotStartTimeout: TimeInterval = 0.25
 
     public var onHistoryRequested: () -> Void = {}
     public var onSettingsRequested: () -> Void = {}
@@ -139,8 +218,20 @@ public final class CapturePanelController: NSObject, NSWindowDelegate {
     /// closes, without needing AppKit UI automation. `isPanelOpen` reflects
     /// visibility, not mere existence -- a dismissed-with-draft panel
     /// (fix #4b) still exists (to preserve its draft) but is not "open".
-    var isPanelOpen: Bool { panel?.isVisible ?? false }
-    var hasPreservedDraft: Bool { panel != nil && !(panel?.isVisible ?? false) }
+    var isPanelOpen: Bool { panelPresented }
+    /// A hidden panel that still exists to preserve its draft -- but NOT a
+    /// brand-new panel still mid-handshake (created, not yet presented), which
+    /// has `panel != nil` with `panelPresented == false` too.
+    var hasPreservedDraft: Bool { panel != nil && !panelPresented && !isPresentationPending }
+    /// Whether a capture session is live from the Sparkle update gate's
+    /// perspective: panel presented, a draft preserved, OR a present-after-ack
+    /// handshake still in flight. The pending case is load-bearing and new:
+    /// presentation used to be synchronous, but now there's a brief window
+    /// where `beginCapture` has already loaded a draft (e.g. a "Duplicate as
+    /// new" prefill of a server row, which has no local screenshot and so
+    /// takes the async path) while the panel isn't shown yet -- if the update
+    /// gate treated that as idle, a Sparkle relaunch could discard the draft.
+    var isCaptureSessionActive: Bool { panelPresented || hasPreservedDraft || isPresentationPending }
     var currentViewModel: CaptureViewModel? { viewModel }
     func submitCurrentForTesting() { handleSubmit() }
     func requestSignInForTesting() { handleSignIn() }
@@ -166,11 +257,13 @@ public final class CapturePanelController: NSObject, NSWindowDelegate {
         requestSpeechPermission: @escaping @MainActor () async -> Bool = { await SpeechRecognitionPermission.request() },
         transcriptionServiceFactory: @escaping () -> any TranscriptionService = { TranscriptionServiceFactory.make() },
         authStateProvider: @escaping @MainActor () -> AuthState = { .signedIn },
-        requestSignIn: @escaping @MainActor () -> Void = {}
+        requestSignIn: @escaping @MainActor () -> Void = {},
+        windowOps: CaptureWindowOps = CaptureWindowOps()
     ) {
         self.store = store
         self.screenshotService = screenshotService
         self.mode = mode
+        self.windowOps = windowOps
         self.refreshProjectsIfStale = refreshProjectsIfStale
         self.micPermissionStatus = micPermissionStatus
         self.requestMicPermission = requestMicPermission
@@ -209,25 +302,43 @@ public final class CapturePanelController: NSObject, NSWindowDelegate {
     public func trigger(preFill: CapturePreFill? = nil) {
         let start = Date()
 
-        if let panel, panel.isVisible {
+        if let panel, panelPresented {
             focusExistingPanel(panel)
+            return
+        }
+
+        // A handshake is in flight (screenshot request dispatched, panel not
+        // yet shown) and this is a plain re-trigger -- a hotkey mash or a
+        // status-item double-click. Coalesce: the pending completion will
+        // present the same panel momentarily; a second capture or show would
+        // duplicate work. This MUST precede the preserved-draft branch, which
+        // would otherwise treat the pending-but-hidden panel as a draft and
+        // `showPanel` it immediately, defeating the ordering. An explicit
+        // duplicate-as-new preFill instead falls through to the brand-new
+        // branch, which REPLACES the pending panel via `tearDownPanel`.
+        if isPresentationPending, preFill == nil {
             return
         }
 
         if preFill == nil, let panel, let viewModel {
             viewModel.updateSubmissionAuthState(authStateProvider())
             if viewModel.needsFreshScreenshotOnNextOpen {
-                startScreenshotCapture(for: viewModel)
+                // Defer the show to the capture-start ack (see below).
+                startScreenshotCaptureThenPresent(viewModel: viewModel, triggerStart: start)
+                viewModel.resumeDraft()
+            } else {
+                viewModel.resumeDraft()
+                showPanel(panel)
+                onTimingMeasured(Date().timeIntervalSince(start))
             }
-            viewModel.resumeDraft()
-            showPanel(panel)
-            onTimingMeasured(Date().timeIntervalSince(start))
             return
         }
 
         // Brand-new capture: discard any stale hidden panel/draft first
         // (only relevant for an explicit duplicate-as-new preFill arriving
-        // while a different draft is preserved).
+        // while a different draft is preserved). `tearDownPanel` bumps the
+        // presentation generation, invalidating any handshake we just
+        // replaced.
         tearDownPanel()
 
         let (panel, viewModel) = makePanel()
@@ -237,43 +348,99 @@ public final class CapturePanelController: NSObject, NSWindowDelegate {
         viewModel.updateSubmissionAuthState(authStateProvider())
         // A duplicate can carry the source capture's screenshot. Preserve
         // those bytes rather than replacing them with a screenshot of the
-        // current desktop.
+        // current desktop -- and show synchronously (no capture, no wait).
         if preFill?.screenshotData == nil {
-            // Screenshot fires BEFORE panel show (§4.2): async, never blocks
-            // panel display -- the thumbnail fades in once it resolves.
-            startScreenshotCapture(for: viewModel)
+            // Submit the screenshot request, then present once it's in
+            // flight (§4.2): the panel show is deferred to the ack so the
+            // frame is requested before Whistle is on screen; image bytes
+            // still arrive asynchronously and fade the thumbnail in.
+            startScreenshotCaptureThenPresent(viewModel: viewModel, triggerStart: start)
+            viewModel.beginCapture(preFill: preFill)
+        } else {
+            viewModel.beginCapture(preFill: preFill)
+            showPanel(panel)
+            onTimingMeasured(Date().timeIntervalSince(start))
         }
-        viewModel.beginCapture(preFill: preFill)
-        showPanel(panel)
-
-        onTimingMeasured(Date().timeIntervalSince(start))
     }
 
-    /// Starts a request before the panel is shown so it captures the app the
-    /// user was working in. The view model rejects a late result if Clear
-    /// began a newer capture while this request was in flight.
-    private func startScreenshotCapture(for viewModel: CaptureViewModel) {
+    /// Submits a screenshot request before the panel is shown so it captures
+    /// the app the user was working in, then defers presentation until the
+    /// capture-start acknowledgement (or the timeout fallback) fires -- never
+    /// blocking presentation on image delivery or JPEG encoding. The view
+    /// model rejects a late image result if Clear began a newer capture while
+    /// this request was in flight; the controller-level generation guards the
+    /// deferred *presentation* across panel replacement.
+    private func startScreenshotCaptureThenPresent(viewModel: CaptureViewModel, triggerStart: Date) {
+        presentationGeneration &+= 1
+        let generation = presentationGeneration
+        isPresentationPending = true
+
         let requestGeneration = viewModel.beginScreenshotRequest()
         let screenshotService = screenshotService
         screenshotTask?.cancel()
+        presentationTimeoutTask?.cancel()
+
+        // Deliberately NOT gated on Task.isCancelled: a replaced/cancelled
+        // capture's ack must still be *delivered*; the generation guard on
+        // the main actor is the single authority for whether it still applies.
+        let onCaptureStarted: @Sendable () -> Void = { [weak self] in
+            Task { @MainActor [weak self] in
+                self?.completePendingPresentation(generation: generation, triggerStart: triggerStart)
+            }
+        }
+
         screenshotTask = Task { [weak viewModel] in
-            let data = await screenshotService.capture()
+            let data = await screenshotService.capture(onCaptureStarted: onCaptureStarted)
             guard !Task.isCancelled else { return }
             await MainActor.run {
                 viewModel?.attachScreenshot(data, requestGeneration: requestGeneration)
             }
         }
+
+        let timeout = screenshotStartTimeout
+        presentationTimeoutTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
+            guard !Task.isCancelled else { return }
+            self?.completePendingPresentation(generation: generation, triggerStart: triggerStart)
+        }
+    }
+
+    /// Idempotent, generation-guarded panel presentation. Reached from the
+    /// capture-start ack, the timeout fallback, or both -- whichever lands
+    /// first presents; the loser no-ops.
+    private func completePendingPresentation(generation: Int, triggerStart: Date) {
+        guard isPresentationPending, generation == presentationGeneration else { return }
+        isPresentationPending = false
+        presentationTimeoutTask?.cancel()
+        presentationTimeoutTask = nil
+        // Defensive: the panel is only shown here, so it should never already
+        // be presented under a current generation -- but guard anyway.
+        guard let panel, !panelPresented else { return }
+        showPanel(panel)
+        onTimingMeasured(Date().timeIntervalSince(triggerStart))
+    }
+
+    /// Invalidates any in-flight present-after-ack handshake: bumps the
+    /// generation so a late ack/timeout fails the `completePendingPresentation`
+    /// guard, clears the pending flag, and cancels the timeout fallback. Does
+    /// not cancel `screenshotTask` -- a preserved-draft dismiss lets an
+    /// in-flight image still attach to the surviving view model.
+    private func invalidatePendingPresentation() {
+        presentationGeneration &+= 1
+        isPresentationPending = false
+        presentationTimeoutTask?.cancel()
+        presentationTimeoutTask = nil
     }
 
     private func focusExistingPanel(_ panel: NSPanel) {
         switch mode {
         case .nonActivating:
-            panel.makeKeyAndOrderFront(nil)
+            windowOps.makeKeyAndOrderFront(panel)
         case .activating:
-            NSApp.activate(ignoringOtherApps: true)
-            panel.makeKeyAndOrderFront(nil)
+            windowOps.activateApp()
+            windowOps.makeKeyAndOrderFront(panel)
         }
-        hostingView.map { panel.makeFirstResponder($0) }
+        hostingView.map { windowOps.makeFirstResponder(panel, $0) }
         // Fix #3: re-engage SwiftUI's FocusState even on a plain refocus
         // (this doesn't go through beginCapture/resumeDraft).
         viewModel?.requestTranscriptFocus()
@@ -351,31 +518,30 @@ public final class CapturePanelController: NSObject, NSWindowDelegate {
     }
 
     private func showPanel(_ panel: NSPanel) {
+        panelPresented = true
         positionBeneathStatusItem(panel)
 
         switch mode {
         case .nonActivating:
-            panel.orderFrontRegardless()
-            panel.makeKey()
+            windowOps.orderFrontRegardless(panel)
+            windowOps.makeKey(panel)
         case .activating:
-            previousFrontmostApp = NSWorkspace.shared.frontmostApplication
-            NSApp.activate(ignoringOtherApps: true)
-            panel.makeKeyAndOrderFront(nil)
+            previousFrontmostApp = windowOps.frontmostApp()
+            windowOps.activateApp()
+            windowOps.makeKeyAndOrderFront(panel)
         }
 
         // Explicit makeFirstResponder after orderFront -- the known-good
         // pattern for SwiftUI text focus inside a key-capable panel
         // (TECH-SPEC §4.1).
         if let hostingView {
-            panel.makeFirstResponder(hostingView)
+            windowOps.makeFirstResponder(panel, hostingView)
         }
 
         // Click-away dismissal. Unconditional (no discard confirm): the mic
         // transcribes ambient speech, so gating on "has content" would
         // leave the panel stuck open for anyone who talks near their Mac.
-        outsideClickMonitor = NSEvent.addGlobalMonitorForEvents(
-            matching: [.leftMouseDown, .rightMouseDown]
-        ) { [weak self] _ in
+        outsideClickMonitor = windowOps.addGlobalClickMonitor { [weak self] _ in
             // The user just clicked INTO another app -- don't let
             // closePanel()'s activating-mode restore steal focus back to
             // whatever was frontmost before the panel opened.
@@ -454,11 +620,11 @@ public final class CapturePanelController: NSObject, NSWindowDelegate {
     /// clears everything for the next capture."
     private func closePanel() {
         if let outsideClickMonitor {
-            NSEvent.removeMonitor(outsideClickMonitor)
+            windowOps.removeMonitor(outsideClickMonitor)
             self.outsideClickMonitor = nil
         }
         if mode == .activating, let previousFrontmostApp {
-            previousFrontmostApp.activate()
+            windowOps.activate(previousFrontmostApp)
         }
         previousFrontmostApp = nil
 
@@ -473,25 +639,41 @@ public final class CapturePanelController: NSObject, NSWindowDelegate {
     /// ways to leave without submitting).
     private func dismissPreservingDraft() {
         if let outsideClickMonitor {
-            NSEvent.removeMonitor(outsideClickMonitor)
+            windowOps.removeMonitor(outsideClickMonitor)
             self.outsideClickMonitor = nil
         }
         viewModel?.stopTranscription()
 
         if mode == .activating, let previousFrontmostApp {
-            previousFrontmostApp.activate()
+            windowOps.activate(previousFrontmostApp)
         }
         previousFrontmostApp = nil
 
-        panel?.orderOut(nil)
+        // Invalidate any in-flight presentation handshake so a late ack or
+        // timeout can't re-present a panel the user just dismissed. Cannot
+        // happen via the production dismiss entry points (they're only armed
+        // after the panel is shown), but keeping the state-machine invariant
+        // self-contained -- rather than resting on external unreachability --
+        // is cheaper than reasoning about every future caller.
+        invalidatePendingPresentation()
+
+        panelPresented = false
+        if let panel { windowOps.orderOut(panel) }
     }
 
     /// Stops transcription and releases panel/viewModel/hostingView
     /// outright, discarding any preserved draft. Safe to call when nothing
     /// exists yet (all no-ops via optional chaining).
     private func tearDownPanel() {
+        // Invalidate any in-flight presentation handshake, then also cancel
+        // the screenshot task -- this fully releases the viewModel, so bound
+        // the wasted encode work too (the weak-viewModel + request-generation
+        // guard already drops any late image regardless).
+        invalidatePendingPresentation()
+        screenshotTask?.cancel()
         viewModel?.stopTranscription()
-        panel?.orderOut(nil)
+        panelPresented = false
+        if let panel { windowOps.orderOut(panel) }
         panel = nil
         viewModel = nil
         hostingView = nil
@@ -503,7 +685,8 @@ public final class CapturePanelController: NSObject, NSWindowDelegate {
         // Losing key status -- the user clicked away, or switched apps --
         // dismisses the panel while preserving the draft (plan U8 fix #4b:
         // "no X button", this + Esc are the only ways to leave without
-        // submitting).
+        // submitting). Controller tests inject a no-op window-ops seam, so the
+        // panel never actually becomes key and this never fires under test.
         dismissPreservingDraft()
     }
 

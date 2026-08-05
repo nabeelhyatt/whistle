@@ -31,6 +31,7 @@ import {
   type ConductorMessage,
 } from "./conductorClient";
 import { renderTemplate } from "./promptRenderer";
+import { generateWorkspaceTitle } from "./titleGenerator";
 
 // ─── Tunables (TECH-SPEC §6) ────────────────────────────────────────────
 
@@ -57,31 +58,41 @@ const IN_FLIGHT_STATUSES = [
 // ─── Workspace naming (TECH-SPEC §6) ────────────────────────────────────
 
 /**
- * `workspaceName = "idea: " + firstMeaningfulWords(notes || transcript, 6) +
- * " #" + clientId.slice(0, 6)`; falls back to a screenshot-only form when
- * neither notes nor transcript has any words. Naming happens server-side
- * (here, not the app) so iOS inherits it unchanged (TECH-SPEC §6/§12).
+ * `workspaceName = title + " #" + clientId.slice(0, 6)`, where `title` is a
+ * Haiku-generated 3-5 word title (`titleGenerator.ts`) when available, else
+ * `firstMeaningfulWords(notes || transcript, 6)`; falls back further to
+ * `"Screenshot capture <YYYY-MM-DD>"` when neither notes nor transcript has
+ * any words. The trailing `#<clientId prefix>` tag is always present and is
+ * load-bearing (orphan-workspace adoption, below). Naming happens
+ * server-side (here, not the app) so iOS inherits it unchanged (TECH-SPEC
+ * §6/§12).
  */
 export function buildWorkspaceName(args: {
   notes: string;
   transcript: string;
   clientId: string;
   capturedAt: number;
+  title?: string | null;
 }): string {
+  const tag = args.clientId.slice(0, 6);
+
+  if (args.title !== undefined && args.title !== null && args.title.length > 0) {
+    return `${args.title} #${tag}`;
+  }
+
   const source = args.notes.trim().length > 0 ? args.notes : args.transcript;
   const words = source
     .trim()
     .split(/\s+/)
     .filter((w) => w.length > 0)
     .slice(0, 6);
-  const tag = args.clientId.slice(0, 6);
 
   if (words.length === 0) {
     const date = new Date(args.capturedAt).toISOString().slice(0, 10);
-    return `idea: screenshot capture ${date} #${tag}`;
+    return `Screenshot capture ${date} #${tag}`;
   }
 
-  return `idea: ${words.join(" ")} #${tag}`;
+  return `${words.join(" ")} #${tag}`;
 }
 
 /** Returns the `#<clientId prefix>` tag used for orphan-workspace adoption. */
@@ -375,6 +386,31 @@ async function runSubmit(
     environment: credsResult.environment,
   };
 
+  // 3·0. Project-visibility guard (canonical-accounts). The key resolved for
+  // this capture must be able to see its project. A key that belongs to a
+  // *different* Conductor account or org than the one the user picked the
+  // project under lists a different project set (or none) — orphan-adoption's
+  // listProjectWorkspaces and createWorkspace would then fail with an opaque
+  // 4xx that burns all five retries and strands the capture in "Agent
+  // working" pointing at a workspace the user can't open. Fail fast with a
+  // Settings-routing message instead — and before the title-generation call
+  // below, so a doomed capture never spends an LLM call. Gated on
+  // needsWorkspace: adopted/created captures skip it on later passes.
+  const needsWorkspace =
+    capture.workspaceId === undefined || capture.sessionId === undefined;
+  if (needsWorkspace && !(await projectVisibleToKey(creds, capture.projectId))) {
+    const keyName =
+      credsResult.orgLabel !== undefined
+        ? `your "${credsResult.orgLabel}" API key`
+        : "your saved API key";
+    await patchCapture(ctx, captureId, {
+      status: "failed",
+      errorCode: "auth",
+      error: `This capture's Conductor project isn't visible to ${keyName} — the key may belong to a different Conductor account or organization. Update it in Settings.`,
+    });
+    return;
+  }
+
   const template = await ctx.runQuery(
     internal.pipelineInternal.getTemplateInternal,
     { userId: capture.userId },
@@ -387,14 +423,24 @@ async function runSubmit(
         })
       : null;
 
-  const workspaceName =
-    capture.workspaceName ??
-    buildWorkspaceName({
+  const workspaceName = capture.workspaceName ??
+    (await ctx.runMutation(
+      internal.pipelineInternal.setWorkspaceNameIfAbsentInternal,
+      {
+        captureId,
+        workspaceName: buildWorkspaceName({
       notes: capture.notes,
       transcript: capture.transcript,
       clientId: capture.clientId,
       capturedAt: capture.capturedAt,
-    });
+      title: await generateWorkspaceTitle({
+        transcript: capture.transcript,
+        notes: capture.notes,
+        projectName: capture.projectName,
+      }),
+        }),
+      },
+    ));
 
   const renderedPrompt = renderTemplate(template, {
     transcript: capture.transcript,
@@ -410,29 +456,7 @@ async function runSubmit(
   let sessionId = capture.sessionId;
   let deepLink = capture.deepLink;
 
-  if (workspaceId === undefined || sessionId === undefined) {
-    // 3·0. Project-visibility guard (canonical-accounts). The stored key must
-    // be able to see this capture's project. A key that belongs to a
-    // *different* Conductor account than the one the user picked the project
-    // under lists a different project set (or none) — orphan-adoption's
-    // listProjectWorkspaces and createWorkspace would then fail with an opaque
-    // 4xx that burns all five retries and strands the capture in "Agent
-    // working" pointing at a workspace the user can't open. Fail fast with a
-    // Settings-routing message instead. Runs only on a fresh submit (no
-    // workspaceId yet); adopted/created captures skip it on later passes.
-    if (!(await projectVisibleToKey(creds, capture.projectId))) {
-      const keyName =
-        credsResult.orgLabel !== undefined
-          ? `your "${credsResult.orgLabel}" API key`
-          : "your saved API key";
-      await patchCapture(ctx, captureId, {
-        status: "failed",
-        errorCode: "auth",
-        error: `This capture's Conductor project isn't visible to ${keyName} — the key may belong to a different Conductor account or organization. Update it in Settings.`,
-      });
-      return;
-    }
-
+  if (needsWorkspace) {
     // 3a. Orphan adoption: search for a workspace already tagged with our
     // clientId (a previous run created it but died before patching ids).
     const tag = orphanTag(capture.clientId);
@@ -477,7 +501,6 @@ async function runSubmit(
       workspaceId,
       sessionId,
       deepLink,
-      workspaceName,
       status: "creating",
     });
   }
