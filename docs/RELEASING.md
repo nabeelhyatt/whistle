@@ -83,7 +83,8 @@ and user-facing — "Faster capture panel startup", not a commit message or a fi
    short, user-facing release-note bullets as the message (the `/release` skill drafts these
    for you from the commits since the last tag — see "Release notes" above):
    ```sh
-   git tag -a vX.Y.Z -m "$(cat <<'EOF'
+   git fetch origin main
+   git tag -a vX.Y.Z origin/main -m "$(cat <<'EOF'
    - Bullet one
    - Bullet two
    - Bullet three
@@ -91,6 +92,9 @@ and user-facing — "Faster capture panel startup", not a commit message or a fi
    )"
    git push origin vX.Y.Z    # vX.Y.Z must match MARKETING_VERSION
    ```
+   Tagging `origin/main` explicitly (rather than local `HEAD`) means this works correctly even
+   from a checkout that isn't actually on an up-to-date `main` — the same class of mistake as
+   the "v1.0.15" gotcha below.
    A plain `git tag vX.Y.Z` (lightweight, no message) still works — the release just ships with
    no notes in the update dialog.
    This builds → Developer-ID signs → notarizes → staples → signs the appcast item → assembles

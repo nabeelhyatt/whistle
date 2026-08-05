@@ -149,14 +149,28 @@ jobs:
           # docs/RELEASING.md) — one bullet per line, "- " or "* " prefix
           # optional. A lightweight tag (no message) degrades gracefully to no
           # <description> at all; Sparkle's standard UI just shows no notes.
-          # `]]>` is escaped so a literal one in the notes can't prematurely
-          # close the CDATA section below.
-          TAG_NOTES_RAW="$(git tag -l --format='%(contents)' "$GITHUB_REF_NAME" 2>/dev/null || true)"
-          TAG_NOTES_RAW="${TAG_NOTES_RAW//]]>/]] >}"
+          # `git cat-file -t` gates on the ref actually being an annotated tag
+          # object — `%(contents)` on a *lightweight* tag resolves to the
+          # commit it points at, so without this check a lightweight tag would
+          # leak that commit's message (subject/body/trailers) into the
+          # update dialog instead of showing no notes.
+          TAG_NOTES_RAW=""
+          if [[ "$(git cat-file -t "$GITHUB_REF_NAME" 2>/dev/null || true)" == "tag" ]]; then
+            TAG_NOTES_RAW="$(git tag -l --format='%(contents)' "$GITHUB_REF_NAME")"
+          fi
           DESCRIPTION_XML=""
           if [[ -n "$TAG_NOTES_RAW" ]]; then
+            # Sparkle renders <description> as HTML (that's the point of the
+            # <ul><li> wrap below), so bullet text must be HTML-escaped before
+            # wrapping — otherwise a literal `&`, `<`, or `>` in a bullet is
+            # interpreted as markup/an entity reference instead of shown as
+            # plain text. `&` must be escaped first so the escaping itself
+            # doesn't get re-escaped. Escaping every literal `>` to `&gt;`
+            # also means a literal `]]>` can never survive into the CDATA
+            # content, so no separate CDATA-terminator handling is needed.
             BULLETS_HTML="$(printf '%s\n' "$TAG_NOTES_RAW" \
               | sed -e 's/^[[:space:]]*[-*][[:space:]]*//' -e '/^[[:space:]]*$/d' \
+                    -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' \
                     -e 's/^/<li>/' -e 's/$/<\/li>/')"
             if [[ -n "$BULLETS_HTML" ]]; then
               DESCRIPTION_XML="<description><![CDATA[<ul>${BULLETS_HTML}</ul>]]></description>"

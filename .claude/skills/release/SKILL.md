@@ -21,7 +21,7 @@ tag push), because that's the moment real installs start getting the update.
 !`cat docs/RELEASING.md`
 
 **Latest published tag:**
-!`git fetch --tags --quiet; git describe --tags --abbrev=0 2>/dev/null || echo "(no tags yet)"`
+!`git fetch --tags --quiet; git fetch origin main --quiet; git describe --tags --abbrev=0 origin/main 2>/dev/null || echo "(no tags yet)"`
 
 **origin/main HEAD:**
 !`git fetch origin main --quiet && git log origin/main -1 --oneline`
@@ -30,7 +30,7 @@ tag push), because that's the moment real installs start getting the update.
 !`git show origin/main:apps/macos/project.yml | grep MARKETING_VERSION`
 
 **Commits on origin/main since the latest tag:**
-!`LAST_TAG=$(git describe --tags --abbrev=0 2>/dev/null); if [ -n "$LAST_TAG" ]; then git log "$LAST_TAG"..origin/main --oneline; else git log origin/main --oneline -20; fi`
+!`LAST_TAG=$(git describe --tags --abbrev=0 origin/main 2>/dev/null); if [ -n "$LAST_TAG" ]; then git log "$LAST_TAG"..origin/main --oneline; else git log origin/main --oneline -20; fi`
 
 **Release secrets present (first-time provisioning check):**
 !`gh secret list 2>/dev/null | awk '{print $1}'`
@@ -81,6 +81,11 @@ tag push), because that's the moment real installs start getting the update.
    source of truth and may have changed), with the message set to the confirmed bullets from
    step 5, one per line. If step 4 concluded there's nothing user-visible to note, use a plain
    lightweight tag instead — don't force placeholder bullets into the annotation.
+   **Tag `origin/main` explicitly** (`git tag -a vX.Y.Z origin/main -m "..."`) rather than
+   local `HEAD` — your working tree is not guaranteed to be checked out at `main`, let alone
+   in sync with `origin/main`, and steps 1-2 already verified `origin/main` specifically.
+   Tagging local `HEAD` by accident would land the release on an unverified commit — the exact
+   failure RELEASING.md's "v1.0.15" gotcha describes.
 
 7. **Watch the workflow run to completion.** Find the run for the pushed tag
    (`gh run list --workflow=release.yml -L 1`) and watch it (`gh run watch <run-id>`) rather than
