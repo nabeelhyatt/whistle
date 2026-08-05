@@ -62,3 +62,21 @@ export const patchCaptureInternal = internalMutation({
     await ctx.db.patch(args.captureId as Id<"captures">, args.patch);
   },
 });
+
+/**
+ * Stores a computed workspace name exactly once so retries and overlapping
+ * submit actions use the same name after any remote side effect.
+ */
+export const setWorkspaceNameIfAbsentInternal = internalMutation({
+  args: {
+    captureId: v.id("captures"),
+    workspaceName: v.string(),
+  },
+  handler: async (ctx, args) => {
+    const capture = await ctx.db.get(args.captureId);
+    if (capture === null) throw new Error("Capture deleted while naming workspace");
+    if (capture.workspaceName !== undefined) return capture.workspaceName;
+    await ctx.db.patch(args.captureId, { workspaceName: args.workspaceName });
+    return args.workspaceName;
+  },
+});
