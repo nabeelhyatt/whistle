@@ -371,7 +371,7 @@ view, not a duplicate of the instructions).
 
 ## Summary
 
-- **6 sections**, **46 checklist items** total.
+- **6 sections**, **47 checklist items** total.
 - Items requiring hardware/OS this host cannot provide (explicitly
   unchecked, not merely "not yet done"): macOS 26 dictation runtime
   verification, macOS 14 hardware verification.

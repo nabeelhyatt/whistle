@@ -223,6 +223,15 @@ public final class CapturePanelController: NSObject, NSWindowDelegate {
     /// brand-new panel still mid-handshake (created, not yet presented), which
     /// has `panel != nil` with `panelPresented == false` too.
     var hasPreservedDraft: Bool { panel != nil && !panelPresented && !isPresentationPending }
+    /// Whether a capture session is live from the Sparkle update gate's
+    /// perspective: panel presented, a draft preserved, OR a present-after-ack
+    /// handshake still in flight. The pending case is load-bearing and new:
+    /// presentation used to be synchronous, but now there's a brief window
+    /// where `beginCapture` has already loaded a draft (e.g. a "Duplicate as
+    /// new" prefill of a server row, which has no local screenshot and so
+    /// takes the async path) while the panel isn't shown yet -- if the update
+    /// gate treated that as idle, a Sparkle relaunch could discard the draft.
+    var isCaptureSessionActive: Bool { panelPresented || hasPreservedDraft || isPresentationPending }
     var currentViewModel: CaptureViewModel? { viewModel }
     func submitCurrentForTesting() { handleSubmit() }
     func requestSignInForTesting() { handleSignIn() }

@@ -1786,6 +1786,35 @@ final class CapturePanelControllerTests: XCTestCase {
         XCTAssertTrue(controller.isPanelOpen)
     }
 
+    /// A capture whose panel hasn't been presented yet (mid present-after-ack
+    /// handshake) must still read as an active session, so the Sparkle update
+    /// gate stays busy and a relaunch can't discard an in-flight draft during
+    /// the async window.
+    @MainActor
+    func testCaptureSessionStaysActiveDuringHandshakeSoUpdateGateStaysBusy() async throws {
+        let (store, tempDir) = try makeStore()
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let capturer = GatedCapturer(image: TestSupport.makeCGImage())
+        let controller = makeGatedController(store: store, preflight: GrantedPreflight(), capturer: capturer)
+
+        XCTAssertFalse(controller.isCaptureSessionActive, "no capture in flight -> update gate is idle")
+
+        controller.trigger()
+        try await Whistle_waitUntil { capturer.startWaitingCount == 1 }
+        // Panel not shown yet, but a capture is in flight: the gate must be busy.
+        XCTAssertFalse(controller.isPanelOpen, "panel is not presented mid-handshake")
+        XCTAssertTrue(controller.isCaptureSessionActive, "a pending handshake keeps the update gate busy")
+
+        capturer.releaseStart()
+        try await Whistle_waitUntil { controller.isPanelOpen }
+        XCTAssertTrue(controller.isCaptureSessionActive, "a presented panel keeps the gate busy")
+
+        try await Whistle_waitUntil { capturer.deliveryWaitingCount == 1 }
+        capturer.releaseDelivery()
+        try await Whistle_waitUntil { controller.currentViewModel?.screenshotData != nil }
+    }
+
     // MARK: Fix #4b/c: dismissing (Esc / losing key) preserves the draft;
     // reopening restores it without retaking the screenshot.
 

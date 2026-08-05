@@ -119,8 +119,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let updateCoordinator = UpdateCoordinator()
         updateCoordinator.isIdle = { [weak self] in
             guard let self else { return false }
-            return capturePanelController?.isPanelOpen != true
-                && capturePanelController?.hasPreservedDraft != true
+            // `isCaptureSessionActive` covers panel-open, preserved-draft, AND
+            // the present-after-ack handshake window (a capture whose draft is
+            // already loaded but whose panel hasn't been shown yet) -- so an
+            // update relaunch can't discard an in-flight capture during that
+            // ~250ms async window.
+            return capturePanelController?.isCaptureSessionActive != true
                 && onboardingWindowController?.isWindowVisible != true
                 && settingsWindowController?.isWindowVisible != true
                 && historyWindowController?.isWindowVisible != true
