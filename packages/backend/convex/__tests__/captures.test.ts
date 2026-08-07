@@ -72,6 +72,83 @@ describe("captures.create", () => {
     expect(row?.status).toBe("queued");
     expect(row?.attempt).toBe(0);
   });
+
+  test("an optional orgId round-trips onto the row; omitting it leaves the field undefined", async () => {
+    const t = convexTest(schema, modules);
+    const asUser = withMockUser(t, "auth0|captures-create-orgid");
+    const userId = await asUser.mutation(api.users.ensure, {});
+    const orgId = await t.run(async (ctx) =>
+      ctx.db.insert("conductorOrgs", {
+        userId,
+        label: "Work",
+        conductorApiKey: "sk-captures-orgid-1234",
+        conductorEnvironment: "prod",
+        createdAt: 1,
+      }),
+    );
+
+    const withOrgId = await asUser.mutation(
+      api.captures.create,
+      baseCaptureArgs({ clientId: "client-with-org", orgId }),
+    );
+    const rowWithOrg = await t.run(async (ctx) => ctx.db.get(withOrgId));
+    expect(rowWithOrg?.orgId).toBe(orgId);
+
+    const withoutOrgId = await asUser.mutation(
+      api.captures.create,
+      baseCaptureArgs({ clientId: "client-without-org" }),
+    );
+    const rowWithoutOrg = await t.run(async (ctx) => ctx.db.get(withoutOrgId));
+    expect(rowWithoutOrg?.orgId).toBeUndefined();
+  });
+
+  test("F14: an orgId belonging to a different user is rejected at create time, not left to fail the pipeline minutes later", async () => {
+    const t = convexTest(schema, modules);
+    const owner = withMockUser(t, "auth0|captures-orgid-owner");
+    const ownerUserId = await owner.mutation(api.users.ensure, {});
+    const foreignOrgId = await t.run(async (ctx) =>
+      ctx.db.insert("conductorOrgs", {
+        userId: ownerUserId,
+        label: "Owner's org",
+        conductorApiKey: "sk-owner-org-9999",
+        conductorEnvironment: "prod",
+        createdAt: 1,
+      }),
+    );
+
+    const caller = withMockUser(t, "auth0|captures-orgid-caller");
+    await caller.mutation(api.users.ensure, {});
+
+    await expect(
+      caller.mutation(
+        api.captures.create,
+        baseCaptureArgs({ clientId: "client-foreign-org", orgId: foreignOrgId }),
+      ),
+    ).rejects.toThrow(/Unknown organization key/);
+
+    const all = await t.run(async (ctx) => ctx.db.query("captures").collect());
+    expect(all).toHaveLength(0);
+  });
+
+  test("F14: an orgId for a since-deleted row is rejected at create time", async () => {
+    const t = convexTest(schema, modules);
+    const asUser = withMockUser(t, "auth0|captures-orgid-deleted");
+    const userId = await asUser.mutation(api.users.ensure, {});
+    const orgId = await t.run(async (ctx) =>
+      ctx.db.insert("conductorOrgs", {
+        userId,
+        label: "Gone",
+        conductorApiKey: "sk-deleted-org-1234",
+        conductorEnvironment: "prod",
+        createdAt: 1,
+      }),
+    );
+    await t.run(async (ctx) => ctx.db.delete(orgId));
+
+    await expect(
+      asUser.mutation(api.captures.create, baseCaptureArgs({ orgId })),
+    ).rejects.toThrow(/Unknown organization key/);
+  });
 });
 
 describe("captures.listRecent / captures.list", () => {

@@ -5,9 +5,10 @@ import {
   query,
   type MutationCtx,
 } from "./_generated/server";
-import type { Id } from "./_generated/dataModel";
+import type { Doc, Id } from "./_generated/dataModel";
 import { requireUser } from "./lib/auth";
 import type { ConductorCreds, ConductorEnvironment } from "./conductorClient";
+import { orgsForUser, shimTargetOrg } from "./orgs";
 
 const DEFAULT_AGENT = "claude";
 const DEFAULT_SCREENSHOTS_ENABLED = true;
@@ -53,6 +54,37 @@ export function credsFromSettings(
 }
 
 /**
+ * Old-client compatibility after the multi-org migration: once the legacy
+ * `settings.conductorApiKey` is unset and the key lives on a `conductorOrgs`
+ * row, shipped single-key clients still need the full masked triple —
+ * `hasKey` drives onboarding gates, `lastFour` renders the masked key
+ * display, and `environment` picks the staging-vs-prod dashboard link. So
+ * when the legacy fields are empty, synthesize all three from the shim
+ * target org row (`shimTargetOrg` — same row the setAndValidateKey shim
+ * would replace).
+ */
+async function maskedKeyFieldsWithOrgFallback(
+  ctx: Parameters<typeof orgsForUser>[0],
+  userId: Id<"users">,
+  row: { conductorApiKey?: string; conductorEnvironment?: string } | null,
+) {
+  const legacy = maskedKeyFields(
+    row?.conductorApiKey,
+    row?.conductorEnvironment,
+  );
+  if (legacy.hasKey) return legacy;
+
+  const orgs = await orgsForUser(ctx, userId);
+  const target = shimTargetOrg(orgs);
+  if (target === undefined) return legacy;
+  return {
+    hasKey: true,
+    lastFour: target.conductorApiKey.slice(-4),
+    environment: target.conductorEnvironment,
+  };
+}
+
+/**
  * Returns the calling user's settings. `conductorApiKey` is NEVER included —
  * only a `hasKey` boolean and the last four characters, so the raw key never
  * reaches the client (TECH-SPEC §9).
@@ -72,7 +104,7 @@ export const get = query({
         agent: DEFAULT_AGENT,
         model: undefined,
         screenshotsEnabled: DEFAULT_SCREENSHOTS_ENABLED,
-        ...maskedKeyFields(undefined),
+        ...(await maskedKeyFieldsWithOrgFallback(ctx, user._id, null)),
       };
     }
 
@@ -84,7 +116,10 @@ export const get = query({
     } = row;
     return {
       ...rest,
-      ...maskedKeyFields(conductorApiKey, conductorEnvironment),
+      ...(await maskedKeyFieldsWithOrgFallback(ctx, user._id, {
+        conductorApiKey,
+        conductorEnvironment,
+      })),
     };
   },
 });
@@ -179,6 +214,115 @@ export async function patchConductorKey(
     conductorApiKey,
     conductorEnvironment,
   });
+}
+
+/**
+ * Lazy one-shot migration of the single-key era: moves the legacy
+ * `settings.conductorApiKey`/`conductorEnvironment` onto a `conductorOrgs`
+ * row labeled "Default", repoints the legacy no-org `projectsCache` row, and
+ * unsets the legacy fields — all in the calling mutation's transaction, so
+ * there is never a window with neither key. Runs from `users.ensure` on
+ * every launch; idempotent (no-op once org rows exist or no legacy key is
+ * stored).
+ *
+ * KEEP THIS MINIMAL: a throw here fails `users.ensure`, which the client
+ * surfaces as `.reauthRequired` at launch (AuthController never swallows
+ * ensure errors) and rolls back ensure's own email backfill.
+ */
+const NON_TERMINAL_CAPTURE_STATUSES = new Set([
+  "queued",
+  "creating",
+  "sending",
+  "agentWorking",
+  "readyUnverified",
+]);
+
+export async function migrateLegacyKeyToOrg(
+  ctx: MutationCtx,
+  userId: Id<"users">,
+): Promise<void> {
+  const row = await ctx.db
+    .query("settings")
+    .withIndex("by_user", (q) => q.eq("userId", userId))
+    .unique();
+  const creds = credsFromSettings(row ?? undefined);
+  if (row === null || creds === undefined) return;
+
+  const existingOrg = await ctx.db
+    .query("conductorOrgs")
+    .withIndex("by_user", (q) => q.eq("userId", userId))
+    .first();
+
+  if (existingOrg !== null) {
+    // Coexistence state (F1): org rows already exist — reachable via an
+    // admin merge that moved org rows onto this user before their next
+    // relaunch, or an old-client setAndValidateKey racing first-launch
+    // ensure — but the legacy settings key is still set too. Left alone it
+    // would permanently shadow the org store: every orgId-less capture
+    // would keep resolving the stale legacy key forever, settings.get would
+    // show the stale masked triple, and validateKey would re-create a
+    // legacy no-org cache row. Just clear it; never insert a second org row
+    // here (credsForCaptureInternal only reads legacy settings when the
+    // user has zero org rows).
+    const legacyCache = await ctx.db
+      .query("projectsCache")
+      .withIndex("by_user_org", (q) =>
+        q.eq("userId", userId).eq("orgId", undefined),
+      )
+      .unique();
+    if (legacyCache !== null) {
+      await ctx.db.delete(legacyCache._id);
+    }
+    await ctx.db.patch(row._id, {
+      conductorApiKey: undefined,
+      conductorEnvironment: undefined,
+    });
+    console.log(`legacy-key-cleared-coexistence userId=${userId}`);
+    return;
+  }
+
+  const orgId = await ctx.db.insert("conductorOrgs", {
+    userId,
+    label: "Default",
+    conductorApiKey: creds.apiKey,
+    conductorEnvironment: creds.environment,
+    createdAt: Date.now(),
+  });
+
+  const legacyCache = await ctx.db
+    .query("projectsCache")
+    .withIndex("by_user_org", (q) => q.eq("userId", userId).eq("orgId", undefined))
+    .unique();
+  if (legacyCache !== null) {
+    await ctx.db.patch(legacyCache._id, { orgId });
+  }
+
+  // F2: pin the new org row onto the caller's own in-flight (non-terminal,
+  // still orgId-less) captures too, closing the ≤1h window where a
+  // duplicate projectId across orgs could misroute a capture mid-flight.
+  // Every eligible in-flight capture must be pinned: an older queued capture
+  // can still be retried after this migration, so a newest-N cutoff would
+  // leave it vulnerable to routing through a different org.
+  const captures = await ctx.db
+    .query("captures")
+    .withIndex("by_user_time", (q) => q.eq("userId", userId))
+    .collect();
+  for (const capture of captures) {
+    if (capture.orgId !== undefined) continue;
+    if (!NON_TERMINAL_CAPTURE_STATUSES.has(capture.status)) continue;
+    await ctx.db.patch(capture._id, { orgId });
+  }
+
+  await ctx.db.patch(row._id, {
+    conductorApiKey: undefined,
+    conductorEnvironment: undefined,
+  });
+
+  // Greppable marker (account-split-detected precedent, users.ts) so log
+  // streaming can watch migration progress and alert on anomalies.
+  console.log(
+    `legacy-key-migrated userId=${userId} environment=${creds.environment}`,
+  );
 }
 
 /**

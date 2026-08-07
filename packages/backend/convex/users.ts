@@ -1,5 +1,6 @@
 import { internalQuery, mutation, query } from "./_generated/server";
 import { requireIdentity, requireUser } from "./lib/auth";
+import { migrateLegacyKeyToOrg } from "./settings";
 
 /**
  * Upsert the calling user's `users` row from their auth identity.
@@ -34,6 +35,10 @@ export const ensure = mutation({
       if (existing.email === undefined && identity.email !== undefined) {
         await ctx.db.patch(existing._id, { email: identity.email });
       }
+      // Multi-org lazy migration: this MUST live inside the existing-user
+      // branch — everyone with a legacy key is by definition an existing
+      // user, and the early return below would otherwise skip them forever.
+      await migrateLegacyKeyToOrg(ctx, existing._id);
       return existing._id;
     }
 

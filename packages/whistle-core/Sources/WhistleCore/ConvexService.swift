@@ -165,6 +165,29 @@ public protocol ConvexServiceProtocol: Sendable {
     /// there is no separate client "save" call to make on failure.
     func conductorSetAndValidateKey(key: String) async throws -> ConductorSetAndValidateResult
 
+    // MARK: orgs (multi-org plan)
+
+    /// All of the user's labeled Conductor org keys, masked -- mirrors
+    /// `orgs:list`. Has a default implementation (returns `[]`, see the
+    /// extension below) so pre-existing fakes/tests don't need to be touched
+    /// just to keep conforming.
+    func orgsList() async throws -> [OrgKeyInfo]
+
+    /// Probes `key` against both Conductor hosts and, only on acceptance,
+    /// stores it as a NEW labeled org row -- mirrors `orgs:addKey`. Unlike
+    /// `conductorSetAndValidateKey`, this never replaces an existing row.
+    /// Default implementation throws (see below) rather than no-op-
+    /// succeeding.
+    func orgAddKey(label: String, key: String) async throws -> OrgAddKeyResult
+
+    /// Removes an org key -- mirrors `orgs:remove`. Default implementation
+    /// throws (see below).
+    func orgRemove(orgId: String) async throws
+
+    /// Renames an org key's user-typed label -- mirrors `orgs:rename`.
+    /// Default implementation throws (see below).
+    func orgRename(orgId: String, label: String) async throws
+
     // MARK: projects
     func projectsList() -> AsyncStream<[Project]>
 
@@ -219,6 +242,31 @@ public extension ConvexServiceProtocol {
     /// fakes/onboarding that only care about validity inherit this unchanged.
     func conductorValidateKeyDetailed() async throws -> ConductorValidateResult {
         ConductorValidateResult(ok: try await conductorValidateKey(), projectsChanged: false)
+    }
+
+    /// Default: no orgs. `LiveConvexService` overrides this to decode the
+    /// real `orgs:list` response; a fake/test double that doesn't care about
+    /// multi-org state inherits an empty list unchanged.
+    func orgsList() async throws -> [OrgKeyInfo] { [] }
+
+    /// Default: throws rather than silently no-op-succeeding. A fake that
+    /// doesn't override this must not look like it added a key when nothing
+    /// happened -- callers/tests that need `orgAddKey` to actually work
+    /// override it explicitly.
+    func orgAddKey(label: String, key: String) async throws -> OrgAddKeyResult {
+        throw ConvexServiceError.requestFailed("orgAddKey not implemented by this ConvexServiceProtocol conformance")
+    }
+
+    /// Default: throws, same rationale as `orgAddKey` above -- a silent
+    /// no-op here would hide a missing-fake bug (the caller would believe
+    /// the org was removed when nothing happened).
+    func orgRemove(orgId: String) async throws {
+        throw ConvexServiceError.requestFailed("orgRemove not implemented by this ConvexServiceProtocol conformance")
+    }
+
+    /// Default: throws, same rationale as `orgAddKey` above.
+    func orgRename(orgId: String, label: String) async throws {
+        throw ConvexServiceError.requestFailed("orgRename not implemented by this ConvexServiceProtocol conformance")
     }
 
     /// Default no-op storage-less accessor so pre-existing fakes/test doubles
@@ -290,6 +338,105 @@ public struct ConductorSetAndValidateResult: Equatable, Sendable {
 
     public init(ok: Bool, environment: ConductorEnvironment?, projectsChanged: Bool, error: String?) {
         self.ok = ok
+        self.environment = environment
+        self.projectsChanged = projectsChanged
+        self.error = error
+    }
+}
+
+/// One user's labeled Conductor org key, masked (the raw key never leaves the
+/// server) -- mirrors `orgs:list`'s `{ orgId, label, organizationName?,
+/// displayName, lastFour, environment, createdAt }` response (multi-org
+/// plan). Decoded via a custom `init(from:)`/`encode(to:)` pair, not
+/// synthesized `Codable`: `createdAt` arrives as a raw ms-since-epoch number
+/// on the wire (matching `ServerCaptureRecordWire`'s convention for every
+/// other server timestamp), not an ISO-8601 string. Deliberately a plain,
+/// non-float-boxing-tolerant `Codable` -- like `ServerCaptureRecord` vs
+/// `ServerCaptureRecordWire` -- so literal-JSON tests can decode this type
+/// directly without `ConvexMobile`; `LiveConvexService` decodes the
+/// $float-tolerant `OrgKeyInfoWire` twin and maps into this type for the real
+/// `orgs:list` call.
+public struct OrgKeyInfo: Equatable, Sendable {
+    public var orgId: String
+    public var label: String
+    public var organizationName: String?
+    public var displayName: String
+    public var lastFour: String
+    public var environment: ConductorEnvironment
+    public var createdAt: Date
+
+    public init(
+        orgId: String,
+        label: String,
+        organizationName: String? = nil,
+        displayName: String,
+        lastFour: String,
+        environment: ConductorEnvironment,
+        createdAt: Date
+    ) {
+        self.orgId = orgId
+        self.label = label
+        self.organizationName = organizationName
+        self.displayName = displayName
+        self.lastFour = lastFour
+        self.environment = environment
+        self.createdAt = createdAt
+    }
+}
+
+extension OrgKeyInfo: Codable {
+    private enum CodingKeys: String, CodingKey {
+        case orgId, label, organizationName, displayName, lastFour, environment, createdAt
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        orgId = try container.decode(String.self, forKey: .orgId)
+        label = try container.decode(String.self, forKey: .label)
+        organizationName = try container.decodeIfPresent(String.self, forKey: .organizationName)
+        displayName = try container.decode(String.self, forKey: .displayName)
+        lastFour = try container.decode(String.self, forKey: .lastFour)
+        environment = try container.decode(ConductorEnvironment.self, forKey: .environment)
+        let createdAtMs = try container.decode(Double.self, forKey: .createdAt)
+        createdAt = Date(timeIntervalSince1970: createdAtMs / 1000)
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(orgId, forKey: .orgId)
+        try container.encode(label, forKey: .label)
+        try container.encodeIfPresent(organizationName, forKey: .organizationName)
+        try container.encode(displayName, forKey: .displayName)
+        try container.encode(lastFour, forKey: .lastFour)
+        try container.encode(environment, forKey: .environment)
+        try container.encode(createdAt.timeIntervalSince1970 * 1000, forKey: .createdAt)
+    }
+}
+
+/// Result of `orgs:addKey` (multi-org plan): probes a key and, only on
+/// acceptance, stores it as a NEW labeled org row. Mirrors
+/// `ConductorSetAndValidateResult`'s split -- `orgId`/`environment`/
+/// `projectsChanged` are only meaningful when `ok` is `true`; `error` only
+/// when `ok` is `false`. Not itself `Codable` -- like
+/// `ConductorSetAndValidateResult`, decoding goes through a private wire
+/// twin (`OrgAddKeyActionResult`) that `LiveConvexService` maps into this
+/// type.
+public struct OrgAddKeyResult: Equatable, Sendable {
+    public var ok: Bool
+    public var orgId: String?
+    public var environment: ConductorEnvironment?
+    public var projectsChanged: Bool?
+    public var error: String?
+
+    public init(
+        ok: Bool,
+        orgId: String? = nil,
+        environment: ConductorEnvironment? = nil,
+        projectsChanged: Bool? = nil,
+        error: String? = nil
+    ) {
+        self.ok = ok
+        self.orgId = orgId
         self.environment = environment
         self.projectsChanged = projectsChanged
         self.error = error
@@ -426,6 +573,11 @@ public struct CaptureCreateInput: Equatable, Sendable {
     public var agent: String
     public var model: String?
     public var capturedAt: Date
+    /// Which Conductor org key to attribute this capture to (multi-org
+    /// plan) -- omitted from the wire entirely when `nil` (see
+    /// `capturesCreateArgs`'s omit-vs-null note), letting the server fall
+    /// back to its own single-org shim.
+    public var orgId: String?
 
     public init(
         clientId: String,
@@ -436,7 +588,8 @@ public struct CaptureCreateInput: Equatable, Sendable {
         projectName: String,
         agent: String,
         model: String?,
-        capturedAt: Date
+        capturedAt: Date,
+        orgId: String? = nil
     ) {
         self.clientId = clientId
         self.transcript = transcript
@@ -447,6 +600,7 @@ public struct CaptureCreateInput: Equatable, Sendable {
         self.agent = agent
         self.model = model
         self.capturedAt = capturedAt
+        self.orgId = orgId
     }
 }
 
@@ -1157,6 +1311,37 @@ final class ConvexAuthAttachmentGate: @unchecked Sendable {
             let _: ConductorActionResult = try await authedAction("projects:refreshProjects")
         }
 
+        // MARK: orgs (multi-org plan)
+
+        public func orgsList() async throws -> [OrgKeyInfo] {
+            // See `capturesListRecent` above for the same wire/public split:
+            // decodes the raw, $float-tolerant wire shape, then maps to the
+            // public model.
+            let wireInfos: [OrgKeyInfoWire] = try await authedQuery("orgs:list")
+            return wireInfos.map(\.asInfo)
+        }
+
+        public func orgAddKey(label: String, key: String) async throws -> OrgAddKeyResult {
+            let result: OrgAddKeyActionResult = try await authedAction(
+                "orgs:addKey", with: ["label": label, "apiKey": key]
+            )
+            return OrgAddKeyResult(
+                ok: result.ok,
+                orgId: result.orgId,
+                environment: result.environment,
+                projectsChanged: result.projectsChanged,
+                error: result.error
+            )
+        }
+
+        public func orgRemove(orgId: String) async throws {
+            try await authedMutation("orgs:remove", with: ["orgId": orgId])
+        }
+
+        public func orgRename(orgId: String, label: String) async throws {
+            try await authedMutation("orgs:rename", with: ["orgId": orgId, "label": label])
+        }
+
         // MARK: projects
 
         public func projectsList() -> AsyncStream<[Project]> {
@@ -1189,8 +1374,8 @@ final class ConvexAuthAttachmentGate: @unchecked Sendable {
             try await authedMutation("captures:create", with: Self.capturesCreateArgs(input))
         }
 
-        /// Builds the `captures:create` argument dict, omitting the two
-        /// optional fields (`screenshotId`/`model`) entirely when nil rather
+        /// Builds the `captures:create` argument dict, omitting the optional
+        /// fields (`screenshotId`/`model`/`orgId`) entirely when nil rather
         /// than including them with a `nil` value. The backend validator is
         /// `v.optional(...)`, which only tolerates the key being ABSENT --
         /// convex-swift's dictionary encoder has no way to express "omit this
@@ -1215,6 +1400,9 @@ final class ConvexAuthAttachmentGate: @unchecked Sendable {
             }
             if let model = input.model {
                 args["model"] = model
+            }
+            if let orgId = input.orgId {
+                args["orgId"] = orgId
             }
             return args
         }
@@ -1571,6 +1759,48 @@ final class ConvexAuthAttachmentGate: @unchecked Sendable {
     /// `false` — all three decode as optional so either shape succeeds.
     struct ConductorSetAndValidateActionResult: Decodable, Sendable {
         let ok: Bool
+        let environment: ConductorEnvironment?
+        let projectsChanged: Bool?
+        let error: String?
+    }
+
+    /// Wire-shape twin of `OrgKeyInfo`: decodes `orgs:list`'s raw Convex
+    /// response, tolerating `createdAt` arriving float-boxed
+    /// (`{"$float": "<base64>"}`) the same way `ServerCaptureRecordWire`
+    /// does for every other server timestamp -- `OrgKeyInfo` itself stays a
+    /// plain, bare-number `Codable` so literal-JSON tests don't need
+    /// `ConvexMobile` at all.
+    struct OrgKeyInfoWire: Decodable, @unchecked Sendable {
+        var orgId: String
+        var label: String
+        var organizationName: String?
+        var displayName: String
+        var lastFour: String
+        var environment: ConductorEnvironment
+        @ConvexFloat var createdAt: Double
+
+        var asInfo: OrgKeyInfo {
+            OrgKeyInfo(
+                orgId: orgId,
+                label: label,
+                organizationName: organizationName,
+                displayName: displayName,
+                lastFour: lastFour,
+                environment: environment,
+                createdAt: Date(timeIntervalSince1970: createdAt / 1000)
+            )
+        }
+    }
+
+    /// Decodes the `{ ok, orgId?, environment?, projectsChanged?, error? }`
+    /// shape returned by the `orgs:addKey` action (see
+    /// `packages/backend/convex/orgs.ts`). Mirrors
+    /// `ConductorSetAndValidateActionResult`'s all-optional-except-`ok`
+    /// shape; `orgId` is a plain Convex document id (already a bare string
+    /// over the wire, unlike `createdAt` -- no float-boxing concern here).
+    struct OrgAddKeyActionResult: Decodable, Sendable {
+        let ok: Bool
+        let orgId: String?
         let environment: ConductorEnvironment?
         let projectsChanged: Bool?
         let error: String?

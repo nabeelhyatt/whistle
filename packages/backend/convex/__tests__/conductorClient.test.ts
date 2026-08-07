@@ -109,4 +109,53 @@ describe("conductorFetch logging", () => {
     expect(message).not.toContain("secretPrompt");
     expect(message).not.toContain("should never be logged either");
   });
+
+  test("getMe goes through conductorFetch but a failing /me does NOT log (F12 — a 404 from a deployment that doesn't serve /me yet is expected, not an error) — getMe still swallows it", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(() =>
+        Promise.resolve(
+          new Response(JSON.stringify({ userMessage: "not found" }), {
+            status: 404,
+            headers: { "content-type": "application/json" },
+          }),
+        ),
+      ),
+    );
+
+    const { getMe } = await import("../conductorClient");
+    const result = await getMe({
+      apiKey: "sk-should-never-be-logged",
+      environment: "prod",
+    });
+    expect(result).toBeUndefined();
+
+    expect(errorSpy).not.toHaveBeenCalled();
+  });
+
+  test("other endpoints still log on failure (logErrors defaults to true — /me is the only opt-out)", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(() =>
+        Promise.resolve(
+          new Response(JSON.stringify({ userMessage: "not found" }), {
+            status: 404,
+            headers: { "content-type": "application/json" },
+          }),
+        ),
+      ),
+    );
+
+    await expect(
+      conductorFetch({
+        creds: { apiKey: "sk-should-never-be-logged", environment: "prod" },
+        method: "GET",
+        path: "/v0/projects",
+      }),
+    ).rejects.toBeInstanceOf(ConductorApiError);
+
+    expect(errorSpy).toHaveBeenCalledTimes(1);
+    const [message] = errorSpy.mock.calls[0];
+    expect(message).toContain("/v0/projects");
+  });
 });

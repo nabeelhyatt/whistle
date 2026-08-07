@@ -150,7 +150,13 @@ describe("projects.setAndValidateKey", () => {
     expect(settings.environment).toBe("staging");
 
     const cached = await asUser.query(api.projects.list, {});
-    expect(cached).toEqual(stagingProjects);
+    // The merged multi-org list decorates each project with its org row's id
+    // and display name (the shim stores an old client's key on a
+    // "Default"-labeled org row).
+    expect(cached).toMatchObject(stagingProjects!);
+    expect(cached).toHaveLength(stagingProjects!.length);
+    expect(cached[0].orgLabel).toBe("Default");
+    expect(cached[0].orgId).toBeDefined();
   });
 
   test("invalid key with a previously stored working key: ok:false, stored key/env/cache unchanged", async () => {

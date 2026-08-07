@@ -30,7 +30,6 @@ import {
   type ConductorCreds,
   type ConductorMessage,
 } from "./conductorClient";
-import { credsFromSettings } from "./settings";
 import { renderTemplate } from "./promptRenderer";
 import { generateWorkspaceTitle } from "./titleGenerator";
 
@@ -370,28 +369,44 @@ async function runSubmit(
     return;
   }
 
-  const settings = await ctx.runQuery(
-    internal.pipelineInternal.getSettingsInternal,
-    { userId: capture.userId },
+  const credsResult = await ctx.runQuery(
+    internal.pipelineInternal.credsForCaptureInternal,
+    { userId: capture.userId, orgId: capture.orgId, projectId: capture.projectId },
   );
-  const creds = credsFromSettings(settings ?? undefined);
-  if (creds === undefined) {
+  if (!credsResult.ok) {
     await patchCapture(ctx, captureId, {
       status: "failed",
       errorCode: "auth",
-      error: "No Conductor API key configured.",
+      error: credsResult.error,
     });
     return;
   }
+  const creds = {
+    apiKey: credsResult.apiKey,
+    environment: credsResult.environment,
+  };
 
+  // 3·0. Project-visibility guard (canonical-accounts). The key resolved for
+  // this capture must be able to see its project. A key that belongs to a
+  // *different* Conductor account or org than the one the user picked the
+  // project under lists a different project set (or none) — orphan-adoption's
+  // listProjectWorkspaces and createWorkspace would then fail with an opaque
+  // 4xx that burns all five retries and strands the capture in "Agent
+  // working" pointing at a workspace the user can't open. Fail fast with a
+  // Settings-routing message instead — and before the title-generation call
+  // below, so a doomed capture never spends an LLM call. Gated on
+  // needsWorkspace: adopted/created captures skip it on later passes.
   const needsWorkspace =
     capture.workspaceId === undefined || capture.sessionId === undefined;
   if (needsWorkspace && !(await projectVisibleToKey(creds, capture.projectId))) {
+    const keyName =
+      credsResult.orgLabel !== undefined
+        ? `your "${credsResult.orgLabel}" API key`
+        : "your saved API key";
     await patchCapture(ctx, captureId, {
       status: "failed",
       errorCode: "auth",
-      error:
-        "This capture's Conductor project isn't visible to your saved API key — the key may belong to a different Conductor account. Update it in Settings.",
+      error: `This capture's Conductor project isn't visible to ${keyName} — the key may belong to a different Conductor account or organization. Update it in Settings.`,
     });
     return;
   }
@@ -442,15 +457,6 @@ async function runSubmit(
   let deepLink = capture.deepLink;
 
   if (needsWorkspace) {
-    // 3·0. Project-visibility guard (canonical-accounts). The stored key must
-    // be able to see this capture's project. A key that belongs to a
-    // *different* Conductor account than the one the user picked the project
-    // under lists a different project set (or none) — orphan-adoption's
-    // listProjectWorkspaces and createWorkspace would then fail with an opaque
-    // 4xx that burns all five retries and strands the capture in "Agent
-    // working" pointing at a workspace the user can't open. Fail fast with a
-    // Settings-routing message instead. Runs only on a fresh submit (no
-    // workspaceId yet); adopted/created captures skip it on later passes.
     // 3a. Orphan adoption: search for a workspace already tagged with our
     // clientId (a previous run created it but died before patching ids).
     const tag = orphanTag(capture.clientId);
@@ -665,19 +671,26 @@ export const awaitWorkspaceReady = internalAction({
         return;
       }
 
-      const settings = await ctx.runQuery(
-        internal.pipelineInternal.getSettingsInternal,
-        { userId: capture.userId },
+      const credsResult = await ctx.runQuery(
+        internal.pipelineInternal.credsForCaptureInternal,
+        {
+          userId: capture.userId,
+          orgId: capture.orgId,
+          projectId: capture.projectId,
+        },
       );
-      const creds = credsFromSettings(settings ?? undefined);
-      if (creds === undefined) {
+      if (!credsResult.ok) {
         await patchCapture(ctx, args.captureId, {
           status: "failed",
           errorCode: "auth",
-          error: "No Conductor API key configured.",
+          error: credsResult.error,
         });
         return;
       }
+      const creds = {
+        apiKey: credsResult.apiKey,
+        environment: credsResult.environment,
+      };
 
       const elapsedMs = args.pollCount * AWAIT_READY_INITIAL_MS;
       const status = await getWorkspaceStatus(creds, capture.workspaceId);
@@ -790,19 +803,22 @@ async function runWatch(
     return;
   }
 
-  const settings = await ctx.runQuery(
-    internal.pipelineInternal.getSettingsInternal,
-    { userId: capture.userId },
+  const credsResult = await ctx.runQuery(
+    internal.pipelineInternal.credsForCaptureInternal,
+    { userId: capture.userId, orgId: capture.orgId, projectId: capture.projectId },
   );
-  const creds = credsFromSettings(settings ?? undefined);
-  if (creds === undefined) {
+  if (!credsResult.ok) {
     await patchCapture(ctx, captureId, {
       status: "failed",
       errorCode: "auth",
-      error: "No Conductor API key configured.",
+      error: credsResult.error,
     });
     return;
   }
+  const creds = {
+    apiKey: credsResult.apiKey,
+    environment: credsResult.environment,
+  };
 
   const sessionStatus = await getSessionStatus(creds, capture.sessionId!);
 

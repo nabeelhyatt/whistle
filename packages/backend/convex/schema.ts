@@ -45,6 +45,10 @@ export default defineSchema({
     screenshotId: v.optional(v.id("_storage")),
     projectId: v.string(), // Conductor project id
     projectName: v.string(),
+    // Which org key to use for this capture's Conductor calls. Absent on
+    // pre-multi-org captures and old-client submissions — credsForCapture
+    // (orgs.ts) resolves those via its fallback chain.
+    orgId: v.optional(v.id("conductorOrgs")),
     agent: v.string(),
     model: v.optional(v.string()),
     capturedAt: v.number(),
@@ -85,9 +89,34 @@ export default defineSchema({
 
   projectsCache: defineTable({
     userId: v.id("users"),
+    // Which org key this cache belongs to. Absent only on a legacy
+    // pre-migration row (single-key era); users.ensure's lazy migration
+    // patches it in. All reads go through by_user_org with orgId pinned —
+    // `.unique()` on by_user alone throws once a user has 2+ rows.
+    orgId: v.optional(v.id("conductorOrgs")),
     projects: v.array(
       v.object({ id: v.string(), name: v.string(), gitRemote: v.string() }),
     ),
     fetchedAt: v.number(),
+  })
+    .index("by_user", ["userId"])
+    .index("by_user_org", ["userId", "orgId"]),
+
+  // One row per (user, Conductor org API key). Conductor keys are org-scoped
+  // and there is no org-enumeration endpoint, so the user enters one labeled
+  // key per org. The row's doc id is the org's identity everywhere in Whistle
+  // (captures.orgId, client selection); organizationId/organizationName are
+  // best-effort metadata from GET /me and never identity.
+  conductorOrgs: defineTable({
+    userId: v.id("users"),
+    label: v.string(), // user-typed, renameable; display fallback only
+    conductorApiKey: v.string(), // sensitive; never returned unmasked (see §9)
+    conductorEnvironment: v.union(v.literal("prod"), v.literal("staging")),
+    organizationId: v.optional(v.string()), // from GET /me when available
+    // SEAM: absent today; populated the day the Conductor API starts
+    // returning org names (GET /me or an orgs endpoint). Display name is
+    // always `organizationName ?? label` — see orgDisplayName in orgs.ts.
+    organizationName: v.optional(v.string()),
+    createdAt: v.number(),
   }).index("by_user", ["userId"]),
 });

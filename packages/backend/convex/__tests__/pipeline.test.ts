@@ -846,6 +846,111 @@ describe("project-visibility guard (canonical-accounts)", () => {
   });
 });
 
+describe("multi-org credsForCapture (canonical-accounts)", () => {
+  test("capture.orgId points at a row owned by a different user -> terminal failed/auth, no workspace created", async () => {
+    const t = convexTest(schema, modules);
+
+    const asOwner = withMockUser(t, "auth0|multiorg-foreign-owner");
+    const ownerUserId = await asOwner.mutation(api.users.ensure, {});
+    const foreignOrgId = await t.run(async (ctx) =>
+      ctx.db.insert("conductorOrgs", {
+        userId: ownerUserId,
+        label: "Owner's org",
+        conductorApiKey: "sk-owner-key-0000",
+        conductorEnvironment: "prod",
+        createdAt: 1,
+      }),
+    );
+
+    const asUser = withMockUser(t, "auth0|multiorg-foreign-caller");
+    await asUser.mutation(api.users.ensure, {});
+    // captures.create now validates orgId ownership at create time (F14) and
+    // would reject this outright — but a stale foreign pointer can still
+    // exist on an already-created capture (e.g. an admin merge that moved
+    // org rows without repointing every capture). Simulate that: create
+    // without orgId, cancel the auto-scheduled submit, patch orgId directly,
+    // then invoke submit as a later retry would.
+    const captureId = await asUser.mutation(api.captures.create, {
+      clientId: "client-foreign-org",
+      transcript: "add dark mode toggle",
+      notes: "",
+      projectId: "proj-1",
+      projectName: "Whistle",
+      agent: "claude",
+      capturedAt: Date.now(),
+    });
+    const scheduled = await t.run(async (ctx) =>
+      ctx.db.system.query("_scheduled_functions").collect(),
+    );
+    for (const s of scheduled) {
+      if (s.state.kind === "pending") {
+        await t.run(async (ctx) => ctx.scheduler.cancel(s._id));
+      }
+    }
+    await t.run(async (ctx) => ctx.db.patch(captureId, { orgId: foreignOrgId }));
+
+    await t.action(internal.pipeline.submit, { captureId });
+
+    const capture = await asUser.query(api.captures.get, { captureId });
+    expect(capture?.status).toBe("failed");
+    expect(capture?.errorCode).toBe("auth");
+    expect(capture?.error).toMatch(/Settings/);
+    expect(mock.createWorkspaceCount).toBe(0);
+  });
+
+  test("capture.orgId picks org B's key -> the workspace-create call carries org B's Authorization header", async () => {
+    const t = convexTest(schema, modules);
+    const asUser = withMockUser(t, "auth0|multiorg-happy");
+    const userId = await asUser.mutation(api.users.ensure, {});
+
+    await t.run(async (ctx) =>
+      ctx.db.insert("conductorOrgs", {
+        userId,
+        label: "A",
+        conductorApiKey: "sk-org-a-happy",
+        conductorEnvironment: "prod",
+        createdAt: 1,
+      }),
+    );
+    const orgB = await t.run(async (ctx) =>
+      ctx.db.insert("conductorOrgs", {
+        userId,
+        label: "B",
+        conductorApiKey: "sk-org-b-happy",
+        conductorEnvironment: "prod",
+        createdAt: 2,
+      }),
+    );
+
+    const captureId = await asUser.mutation(api.captures.create, {
+      clientId: "client-org-b-happy",
+      transcript: "add dark mode toggle",
+      notes: "",
+      projectId: "proj-1",
+      projectName: "Whistle",
+      orgId: orgB,
+      agent: "claude",
+      capturedAt: Date.now(),
+    });
+
+    await tick(t);
+
+    const capture = await asUser.query(api.captures.get, { captureId });
+    expect(capture?.status).toBe("agentWorking");
+    expect(mock.createWorkspaceCount).toBe(1);
+
+    const fetchMock = globalThis.fetch as unknown as {
+      mock: { calls: [string, RequestInit | undefined][] };
+    };
+    const createCall = fetchMock.mock.calls.find(
+      ([url, init]) => url === "https://api.conductor.build/v0/workspaces" && init?.method === "POST",
+    );
+    expect(createCall).toBeDefined();
+    const headers = createCall?.[1]?.headers as Record<string, string>;
+    expect(headers.Authorization).toBe("Bearer sk-org-b-happy");
+  });
+});
+
 describe("awaitWorkspaceReady handoff", () => {
   test("send hits not-ready 4xx -> awaitWorkspaceReady reschedules -> ready -> resumes submit -> sends", async () => {
     const t = convexTest(schema, modules);

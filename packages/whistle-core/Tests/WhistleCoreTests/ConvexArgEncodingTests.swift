@@ -33,7 +33,8 @@ import XCTest
                 projectName: "pn",
                 agent: "claude",
                 model: nil,
-                capturedAt: Date(timeIntervalSince1970: 0)
+                capturedAt: Date(timeIntervalSince1970: 0),
+                orgId: nil
             )
 
             let args = LiveConvexService.capturesCreateArgs(input)
@@ -45,6 +46,10 @@ import XCTest
             XCTAssertFalse(
                 args.keys.contains("model"),
                 "a nil model must be omitted, not sent as JSON null"
+            )
+            XCTAssertFalse(
+                args.keys.contains("orgId"),
+                "a nil orgId must be omitted, not sent as JSON null"
             )
             // Required fields are always present.
             for key in ["clientId", "transcript", "notes", "projectId", "projectName", "agent", "capturedAt"] {
@@ -62,13 +67,15 @@ import XCTest
                 projectName: "pn",
                 agent: "claude",
                 model: "opus-4.8",
-                capturedAt: Date(timeIntervalSince1970: 0)
+                capturedAt: Date(timeIntervalSince1970: 0),
+                orgId: "org-abc"
             )
 
             let args = LiveConvexService.capturesCreateArgs(input)
 
             XCTAssertTrue(args.keys.contains("screenshotId"), "a set screenshotId must be included")
             XCTAssertTrue(args.keys.contains("model"), "a set model must be included")
+            XCTAssertTrue(args.keys.contains("orgId"), "a set orgId must be included")
         }
 
         // MARK: settings:update

@@ -76,9 +76,30 @@ struct ProjectPicker: View {
     /// destination rather than a form control.
     private var railBody: some View {
         Menu {
-            ForEach(projects) { project in
-                Button(project.name) {
-                    selectedProjectId = project.id
+            let groups = ProjectPicker.groupedByOrg(projects)
+            if ProjectPicker.distinctOrgLabelCount(projects) > 1 {
+                ForEach(groups) { group in
+                    if let orgLabel = group.orgLabel {
+                        Section(orgLabel) {
+                            ForEach(group.projects) { project in
+                                Button(project.name) {
+                                    selectedProjectId = project.id
+                                }
+                            }
+                        }
+                    } else {
+                        ForEach(group.projects) { project in
+                            Button(project.name) {
+                                selectedProjectId = project.id
+                            }
+                        }
+                    }
+                }
+            } else {
+                ForEach(projects) { project in
+                    Button(project.name) {
+                        selectedProjectId = project.id
+                    }
                 }
             }
         } label: {
@@ -95,6 +116,59 @@ struct ProjectPicker: View {
         .fixedSize(horizontal: false, vertical: true)
         .disabled(projects.isEmpty)
         .modifier(OptionalFocused(isFocused: isFocused))
+    }
+
+    // MARK: - Org grouping (multi-org plan, rail style only)
+
+    /// One `Section`'s worth of projects sharing an `orgLabel` -- `orgLabel`
+    /// is `nil` for the leading group of legacy projects that predate
+    /// multi-org (no header rendered for that group, see `railBody`).
+    struct ProjectOrgGroup: Identifiable {
+        let orgLabel: String?
+        let projects: [Project]
+
+        /// `orgLabel` is already unique across groups (see `groupedByOrg`),
+        /// so it doubles as a stable `Identifiable` key; the leading
+        /// unlabeled group uses a sentinel since two `nil`s can't collide
+        /// anyway. The `"labeled:"` / `"unlabeled"` namespacing (rather than
+        /// using `orgLabel` bare, or a bare `"__unlabeled__"` sentinel) means
+        /// no real org label can ever collide with the sentinel -- an org
+        /// literally named `"__unlabeled__"` used to be indistinguishable
+        /// from the legacy leading group.
+        var id: String { orgLabel.map { "labeled:\($0)" } ?? "unlabeled" }
+    }
+
+    /// Buckets `projects` by `orgLabel`, preserving the list's existing
+    /// order (a group's position is set by its label's first appearance);
+    /// projects with a `nil` `orgLabel` (legacy, pre-multi-org) are
+    /// collected into an unlabeled leading group. Pure function so it's
+    /// unit-testable without standing up any SwiftUI.
+    static func groupedByOrg(_ projects: [Project]) -> [ProjectOrgGroup] {
+        var order: [String?] = []
+        var buckets: [String?: [Project]] = [:]
+        for project in projects {
+            if buckets[project.orgLabel] == nil {
+                order.append(project.orgLabel)
+            }
+            buckets[project.orgLabel, default: []].append(project)
+        }
+        // Keep the unlabeled group leading regardless of where it first
+        // appeared, per spec ("Projects with nil orgLabel ... go in an
+        // unlabeled leading group").
+        var orderedLabels = order
+        if let nilIndex = orderedLabels.firstIndex(where: { $0 == nil }) {
+            orderedLabels.remove(at: nilIndex)
+            orderedLabels.insert(nil, at: 0)
+        }
+        return orderedLabels.map { label in
+            ProjectOrgGroup(orgLabel: label, projects: buckets[label] ?? [])
+        }
+    }
+
+    /// Count of distinct non-nil `orgLabel`s -- the gate for whether
+    /// `railBody` sections the menu at all (spec: only when >1).
+    static func distinctOrgLabelCount(_ projects: [Project]) -> Int {
+        Set(projects.compactMap(\.orgLabel)).count
     }
 }
 

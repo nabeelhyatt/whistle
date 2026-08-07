@@ -3,6 +3,7 @@
 // projects snapshot survives relaunch/offline.
 
 import Foundation
+import GRDB
 import XCTest
 @testable import WhistleCore
 
@@ -97,6 +98,100 @@ final class CaptureStoreTests: XCTestCase {
 
         try store.deleteDraft(clientId: draft.clientId)
         XCTAssertNil(try store.draft(clientId: draft.clientId))
+    }
+
+    // MARK: - orgId (multi-org plan, v2_pending_captures_org_id)
+
+    func testPendingCaptureOrgIdRoundTrips() throws {
+        let (store, tempDir) = try TestSupport.makeStore()
+        self.tempDir = tempDir
+
+        var draft = TestSupport.makeDraft(clientId: "org-draft")
+        draft.orgId = "org-abc"
+        try store.saveDraft(draft)
+        XCTAssertEqual(try store.draft(clientId: "org-draft")?.orgId, "org-abc")
+
+        // A draft saved with no orgId (pre-multi-org, or a single-key
+        // account) must round-trip as nil, not fail to decode.
+        let noOrgDraft = TestSupport.makeDraft(clientId: "no-org-draft")
+        try store.saveDraft(noOrgDraft)
+        XCTAssertNil(try store.draft(clientId: "no-org-draft")?.orgId)
+    }
+
+    func testMigrationFromV1AddsOrgIdColumnWithoutDataLoss() throws {
+        let tempDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("whistle-core-tests-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        self.tempDir = tempDir
+        let dbPath = tempDir.appendingPathComponent("test.sqlite").path
+        let screenshotsDir = tempDir.appendingPathComponent("screenshots")
+
+        // Simulate a database that only ever ran the original
+        // "v1_create_tables" migration (a client that hasn't picked up the
+        // multi-org migration yet), with one existing pending capture row,
+        // by building that exact v1 schema directly through GRDB -- then
+        // open it through the real `CaptureStore`, proving
+        // `v2_pending_captures_org_id` runs cleanly against real
+        // pre-migration data (not just a fresh v1+v2 database) and the
+        // pre-existing row decodes with `orgId == nil`.
+        var v1Migrator = DatabaseMigrator()
+        v1Migrator.registerMigration("v1_create_tables") { db in
+            try db.create(table: "pending_captures") { t in
+                t.column("clientId", .text).primaryKey()
+                t.column("transcript", .text).notNull()
+                t.column("notes", .text).notNull()
+                t.column("screenshotPath", .text)
+                t.column("projectId", .text).notNull()
+                t.column("projectName", .text).notNull()
+                t.column("agent", .text).notNull()
+                t.column("model", .text)
+                t.column("capturedAt", .datetime).notNull()
+                t.column("localState", .text).notNull()
+                t.column("localAttempt", .integer).notNull().defaults(to: 0)
+                t.column("serverId", .text)
+                t.column("localError", .text)
+            }
+            try db.create(table: "history_cache") { t in
+                t.column("id", .text).primaryKey()
+                t.column("capturedAt", .datetime).notNull()
+                t.column("recordJSON", .blob).notNull()
+            }
+            try db.create(table: "projects_snapshot") { t in
+                t.column("id", .integer).primaryKey()
+                t.column("projectsJSON", .blob).notNull()
+                t.column("fetchedAt", .datetime).notNull()
+            }
+            try db.create(table: "app_state") { t in
+                t.column("key", .text).primaryKey()
+                t.column("value", .text).notNull()
+            }
+        }
+        let v1Queue = try DatabaseQueue(path: dbPath)
+        try v1Migrator.migrate(v1Queue)
+        try v1Queue.write { db in
+            try db.execute(
+                sql: """
+                INSERT INTO pending_captures
+                    (clientId, transcript, notes, projectId, projectName, agent, capturedAt, localState, localAttempt)
+                VALUES ('pre-migration', 'old transcript', '', 'proj-1', 'Project One', 'claude', ?, 'queued', 0)
+                """,
+                arguments: [Date(timeIntervalSince1970: 1_700_000_000)]
+            )
+        }
+
+        // Now open through the real CaptureStore -- runs "v1_create_tables"
+        // (already applied, a no-op) then "v2_pending_captures_org_id"
+        // (adds the column), against this exact file.
+        let store = try CaptureStore(path: dbPath, screenshotsDirectory: screenshotsDir)
+        let migrated = try store.draft(clientId: "pre-migration")
+        XCTAssertEqual(migrated?.transcript, "old transcript")
+        XCTAssertNil(migrated?.orgId, "a pre-migration row must decode with orgId == nil, not fail the migration")
+
+        // And the migrated store can read/write orgId going forward.
+        var newDraft = TestSupport.makeDraft(clientId: "post-migration")
+        newDraft.orgId = "org-xyz"
+        try store.saveDraft(newDraft)
+        XCTAssertEqual(try store.draft(clientId: "post-migration")?.orgId, "org-xyz")
     }
 
     // MARK: - drafts(in:) ordering

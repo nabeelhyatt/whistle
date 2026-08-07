@@ -139,6 +139,15 @@ export interface ConductorFetchOptions {
    * leaves this false.
    */
   isSendEndpoint?: boolean;
+  /**
+   * When `false`, suppresses the `console.error` this helper otherwise emits
+   * on both failure paths (network-level throw and non-2xx response).
+   * Defaults to `true` — every caller keeps logging except `getMe` (F12),
+   * which uses this for its own /me probe: a 404 from a deployment that
+   * doesn't serve /me yet is expected, not an error worth surfacing in the
+   * Convex dashboard's live logs.
+   */
+  logErrors?: boolean;
 }
 
 /**
@@ -152,7 +161,7 @@ export interface ConductorFetchOptions {
 export async function conductorFetch<T = unknown>(
   options: ConductorFetchOptions,
 ): Promise<T> {
-  const { creds, method, path, body, isSendEndpoint = false } = options;
+  const { creds, method, path, body, isSendEndpoint = false, logErrors = true } = options;
   const url = `${CONDUCTOR_API_BASES[creds.environment]}${path}`;
 
   let res: Response;
@@ -170,9 +179,11 @@ export async function conductorFetch<T = unknown>(
     // transient per §6. Log so this is visible in the Convex dashboard's
     // live function logs (never log the API key or request body).
     const message = err instanceof Error ? err.message : String(err);
-    console.error(
-      `Conductor API network error: ${method} ${path} — ${message}`,
-    );
+    if (logErrors) {
+      console.error(
+        `Conductor API network error: ${method} ${path} — ${message}`,
+      );
+    }
     throw new ConductorApiError({
       errorClass: "network",
       userMessage: `Network error calling Conductor API: ${message}`,
@@ -192,9 +203,11 @@ export async function conductorFetch<T = unknown>(
     const structured = parseStructuredError(parsedBody);
     // Log so non-2xx failures are visible in the Convex dashboard's live
     // function logs (never log the API key or request body).
-    console.error(
-      `Conductor API error: ${method} ${path} — status=${res.status} errorClass=${errorClass}`,
-    );
+    if (logErrors) {
+      console.error(
+        `Conductor API error: ${method} ${path} — status=${res.status} errorClass=${errorClass}`,
+      );
+    }
     throw new ConductorApiError({
       errorClass,
       status: res.status,
@@ -420,6 +433,61 @@ export async function listWorkspaceSessions(
     method: "GET",
     path: `/v0/workspaces/${workspaceId}/sessions`,
   });
+}
+
+export interface ConductorMe {
+  organizationId?: string;
+  // SEAM: the API doesn't return an org name yet, but will soon — the field
+  // is parsed leniently so names light up here the day it ships, with no
+  // code change (see conductorOrgs.organizationName in schema.ts).
+  organizationName?: string;
+  authMethod?: string;
+}
+
+/**
+ * Best-effort identity probe (`GET /me`, experimental stability). Returns
+ * `undefined` on ANY failure — 404 from a deployment that doesn't serve it
+ * yet, auth errors, network errors, unexpected body shape — because every
+ * caller treats this as optional metadata (org dedupe at key-save time,
+ * organizationName backfill), never as validation. Goes through
+ * `conductorFetch` so the no-key-logging invariant holds.
+ */
+export async function getMe(
+  creds: ConductorCreds,
+): Promise<ConductorMe | undefined> {
+  let body: unknown;
+  try {
+    body = await conductorFetch<unknown>({
+      creds,
+      method: "GET",
+      path: "/me",
+      // F12: a 404 from a deployment that doesn't serve /me yet (the
+      // common case today) is expected, not an error — don't spam the
+      // dashboard's live logs once per org per refresh.
+      logErrors: false,
+    });
+  } catch {
+    return undefined;
+  }
+  if (body === null || typeof body !== "object") return undefined;
+  const record = body as Record<string, unknown>;
+  const str = (key: string): string | undefined =>
+    typeof record[key] === "string" ? (record[key] as string) : undefined;
+  const organizationId = str("organizationId");
+  // Server org name lands here when the API ships it (accept either
+  // `organizationName` or a plain `name`).
+  const organizationName = str("organizationName") ?? str("name");
+  const authMethod = str("authMethod");
+  // F11: match the doc comment — undefined when every expected field is
+  // absent, rather than an all-undefined object that looks like a hit.
+  if (
+    organizationId === undefined &&
+    organizationName === undefined &&
+    authMethod === undefined
+  ) {
+    return undefined;
+  }
+  return { organizationId, organizationName, authMethod };
 }
 
 // ─── Environment resolution (probe, don't parse — KTD1) ─────────────────

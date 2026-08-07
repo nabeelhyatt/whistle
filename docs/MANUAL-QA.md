@@ -294,6 +294,44 @@ the box when you've personally observed the expected outcome.
 
 ---
 
+## Multi-org API keys
+
+Needs API keys for at least two different Conductor organizations (generate
+per-org at app.conductor.build → API keys; keys are org-scoped).
+
+- [ ] **Action:** In Settings → API Key, add a second org's key with a
+  label (e.g. "TTL").
+  **Expected outcome:** both keys list with label, masked `••••` +
+  last-four, and environment badge; the raw key never appears anywhere.
+- [ ] **Action:** Open the capture panel's "TO:" menu with two orgs'
+  keys stored.
+  **Expected outcome:** projects group under small, non-selectable
+  org-name section headers — specifically verify the headers render as
+  headers (dimmed/small text), NOT as tappable-looking disabled menu
+  items, under the rail's borderless menu style. With a single org, the
+  menu stays flat with no headers (unchanged from pre-multi-org).
+- [ ] **Action:** Pick a project belonging to the *second* (non-Default)
+  org and submit a capture end to end.
+  **Expected outcome:** the workspace is created in that org — verify in
+  the Conductor app/dashboard that it appears under the right
+  organization, not under the first key's org (the original bug this
+  feature fixes).
+- [ ] **Action:** Remove an org's key from Settings while one of its
+  captures is mid-pipeline (*Agent working*).
+  **Expected outcome:** a confirm dialog before removal; after removal
+  the org's projects leave the "TO:" menu; the in-flight capture either
+  completes (sibling key for the same org) or fails with an *Auth error*
+  naming the removed org, deep-linking to Settings → API key.
+- [ ] **Action (old-version smoke, needs a pre-multi-org build, e.g.
+  1.0.18):** Sign in on the old build against an account that has
+  already migrated (launched a multi-org build once).
+  **Expected outcome:** the old build's Settings still shows the masked
+  key last-four and the correct staging/prod dashboard link; captures
+  still submit. (The legacy key was moved server-side to a "Default" org
+  row; `settings.get` synthesizes the old shape.)
+
+---
+
 ## Distribution
 
 - [ ] **Action:** On a clean/secondary Mac (or a fresh VM) that has never
