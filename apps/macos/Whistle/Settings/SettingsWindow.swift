@@ -137,12 +137,15 @@ public final class SettingsViewModel: ObservableObject {
     /// user would see their org keys vanish over a network blip), so on
     /// throw `orgKeys` is left exactly as it was and only the status message
     /// reports the failure.
-    private func loadOrgKeys() async {
+    private func loadOrgKeys(preservingStatus: Bool = false) async {
         do {
             orgKeys = try await convex.orgsList()
-        } catch {
+        } catch where !preservingStatus {
             keyStatusMessage = "Couldn't load your organization keys. Check your connection and try again."
             keyAddSucceeded = false
+        } catch {
+            // A mutation already succeeded. Keep its definitive result even
+            // when this best-effort list refresh hits a transient failure.
         }
     }
 
@@ -272,7 +275,7 @@ public final class SettingsViewModel: ObservableObject {
         keyProjectsChanged = result.projectsChanged ?? false
         newKeyLabel = ""
         newKeyInput = ""
-        await loadOrgKeys()
+        await loadOrgKeys(preservingStatus: true)
     }
 
     /// Removes an org key -- mirrors `orgs:remove`. The view is responsible
@@ -284,7 +287,7 @@ public final class SettingsViewModel: ObservableObject {
             try await convex.orgRemove(orgId: orgId)
             keyStatusMessage = "Key removed."
             keyAddSucceeded = true
-            await loadOrgKeys()
+            await loadOrgKeys(preservingStatus: true)
         } catch {
             keyStatusMessage = "Couldn't remove that key. Check your connection and try again."
             keyAddSucceeded = false
@@ -322,7 +325,7 @@ public final class SettingsViewModel: ObservableObject {
             try await convex.orgRename(orgId: orgId, label: label)
             keyStatusMessage = "Key renamed."
             keyAddSucceeded = true
-            await loadOrgKeys()
+            await loadOrgKeys(preservingStatus: true)
         } catch {
             keyStatusMessage = "Couldn't rename that key. Check your connection and try again."
             keyAddSucceeded = false

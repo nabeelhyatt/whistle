@@ -540,11 +540,9 @@ describe("legacy key migration", () => {
       capturedAt: 2001,
     });
 
-    // 60 older queued captures, older than the ones above, to prove the
-    // `.take(50)` bound: the oldest of these should NOT be pinned even
-    // though they're non-terminal and orgId-less, because they fall
-    // outside the 50-most-recent window once the captures above are
-    // included.
+    // Older queued captures must be pinned too: they can still be retried
+    // after migration, even when a high-volume account has more than 50
+    // newer captures.
     const olderIds: Awaited<ReturnType<typeof insertCapture>>[] = [];
     for (let i = 0; i < 60; i++) {
       olderIds.push(
@@ -568,14 +566,10 @@ describe("legacy key migration", () => {
     const failedCapture = await t.run(async (ctx) => ctx.db.get(terminalFailedId));
     expect(failedCapture?.orgId).toBeUndefined();
 
-    // Only the 50 most recent captures (by capturedAt desc) were scanned at
-    // all: the 7 captures above plus the 43 newest of the 60 "older" ones
-    // fill that window, so the oldest "older" captures fall outside it and
-    // stay orgId-less no matter their status.
-    const oldestUnpinned = await t.run(async (ctx) => ctx.db.get(olderIds[0]));
-    expect(oldestUnpinned?.orgId).toBeUndefined();
-    const withinWindow = await t.run(async (ctx) => ctx.db.get(olderIds[59]));
-    expect(withinWindow?.orgId).toBe(orgId);
+    const oldest = await t.run(async (ctx) => ctx.db.get(olderIds[0]));
+    expect(oldest?.orgId).toBe(orgId);
+    const newest = await t.run(async (ctx) => ctx.db.get(olderIds[59]));
+    expect(newest?.orgId).toBe(orgId);
   });
 
   test("migration is idempotent and never runs once org rows exist", async () => {

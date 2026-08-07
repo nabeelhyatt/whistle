@@ -237,19 +237,18 @@ export const mergeUserData = internalMutation({
       fromOrgId: Id<"conductorOrgs">;
       toOrgId: Id<"conductorOrgs">;
     }[] = [];
-    // F3a: a collided capture stays under `from`'s user row (it's not
-    // moving), but if its orgId points at an org row that IS about to move
-    // to `to`, that pointer becomes a foreign-user row the instant the move
-    // commits — a permanent auth hard-fail at the pipeline's ownership
-    // check. Clear it so credsForCaptureInternal's fallback chain resolves
-    // it instead.
-    const captureOrgClears: Id<"captures">[] = [];
+    // A collided capture stays under `from`. If it points at an org that
+    // would move, a safe merge needs to clone that org and its cache for the
+    // target; clearing the pointer would instead let credential fallback
+    // select an unrelated org. Refuse this rare merge before any writes.
     for (const capture of fromCaptures) {
       if (capture.orgId === undefined) continue;
       if (!captureIds.includes(capture._id)) {
         // collided; stays put
         if (movingOrgIds.has(capture.orgId)) {
-          captureOrgClears.push(capture._id);
+          throw new Error(
+            "mergeUserData: a collided capture references an organization that would move; resolve the capture collision before merging",
+          );
         }
         continue;
       }
@@ -292,7 +291,6 @@ export const mergeUserData = internalMutation({
       skippedProjectsCache: skippedProjectsCacheIds,
       skippedConductorOrgs: skippedConductorOrgIds,
       captureOrgRewrites,
-      captureOrgClears,
     };
 
     if (dryRun) {
@@ -304,9 +302,6 @@ export const mergeUserData = internalMutation({
     }
     for (const rewrite of captureOrgRewrites) {
       await ctx.db.patch(rewrite.captureId, { orgId: rewrite.toOrgId });
-    }
-    for (const captureId of captureOrgClears) {
-      await ctx.db.patch(captureId, { orgId: undefined });
     }
     for (const templateId of promptTemplateIds) {
       await ctx.db.patch(templateId, { userId: args.toUserId });

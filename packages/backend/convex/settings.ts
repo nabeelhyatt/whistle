@@ -264,6 +264,15 @@ export async function migrateLegacyKeyToOrg(
     // legacy no-org cache row. Just clear it; never insert a second org row
     // here (credsForCaptureInternal only reads legacy settings when the
     // user has zero org rows).
+    const legacyCache = await ctx.db
+      .query("projectsCache")
+      .withIndex("by_user_org", (q) =>
+        q.eq("userId", userId).eq("orgId", undefined),
+      )
+      .unique();
+    if (legacyCache !== null) {
+      await ctx.db.delete(legacyCache._id);
+    }
     await ctx.db.patch(row._id, {
       conductorApiKey: undefined,
       conductorEnvironment: undefined,
@@ -291,14 +300,14 @@ export async function migrateLegacyKeyToOrg(
   // F2: pin the new org row onto the caller's own in-flight (non-terminal,
   // still orgId-less) captures too, closing the ≤1h window where a
   // duplicate projectId across orgs could misroute a capture mid-flight.
-  // Bounded and best-effort — a throw here would lock users out at launch
-  // (see file header), so this never fails the migration.
-  const recentCaptures = await ctx.db
+  // Every eligible in-flight capture must be pinned: an older queued capture
+  // can still be retried after this migration, so a newest-N cutoff would
+  // leave it vulnerable to routing through a different org.
+  const captures = await ctx.db
     .query("captures")
     .withIndex("by_user_time", (q) => q.eq("userId", userId))
-    .order("desc")
-    .take(50);
-  for (const capture of recentCaptures) {
+    .collect();
+  for (const capture of captures) {
     if (capture.orgId !== undefined) continue;
     if (!NON_TERMINAL_CAPTURE_STATUSES.has(capture.status)) continue;
     await ctx.db.patch(capture._id, { orgId });

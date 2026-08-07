@@ -543,7 +543,6 @@ describe("admin.mergeUserData", () => {
       expect(manifest.captureOrgRewrites).toEqual([
         { captureId: captureAtCollide, fromOrgId: orgCollide, toOrgId: toOrgShared },
       ]);
-      expect(manifest.captureOrgClears).toEqual([]);
 
       // Cache rows follow their org: the unique org's cache moves, the
       // colliding org's cache and both users' legacy no-org caches are
@@ -620,7 +619,7 @@ describe("admin.mergeUserData", () => {
       expect(secondManifest.captureOrgRewrites).toHaveLength(0);
     });
 
-    test("a collided capture whose orgId points at a MOVING (non-colliding) org row has its orgId cleared, not left stranded on a soon-to-be-foreign row (F3a)", async () => {
+    test("refuses a merge when a collided capture would be stranded by its moving org", async () => {
       const t = convexTest(schema, modules);
       const { to, from, orgUnique } = await seedCollisionScenario(t);
 
@@ -644,26 +643,17 @@ describe("admin.mergeUserData", () => {
         }),
       );
 
-      const manifest = await t.mutation(internal.admin.mergeUserData, {
-        fromUserId: from,
-        toUserId: to,
-        dryRun: true,
-      });
-      expect(manifest.captureOrgClears).toEqual([collidedAtMovingOrg]);
-      expect(manifest.collisions.captures).toContain(collidedAtMovingOrg);
-
-      await t.mutation(internal.admin.mergeUserData, {
-        fromUserId: from,
-        toUserId: to,
-        dryRun: false,
-      });
+      await expect(
+        t.mutation(internal.admin.mergeUserData, {
+          fromUserId: from,
+          toUserId: to,
+          dryRun: false,
+        }),
+      ).rejects.toThrow(/resolve the capture collision/);
 
       const capture = await t.run(async (ctx) => ctx.db.get(collidedAtMovingOrg));
-      // Still under `from` (it collided, so it never moved)...
       expect(capture?.userId).toBe(from);
-      // ...but its orgId was cleared rather than left pointing at a row
-      // that now belongs to `to`.
-      expect(capture?.orgId).toBeUndefined();
+      expect(capture?.orgId).toBe(orgUnique);
     });
   });
 

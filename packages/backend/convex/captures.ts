@@ -31,6 +31,16 @@ export const create = mutation({
   handler: async (ctx, args) => {
     const user = await requireUser(ctx);
 
+    // Preserve the offline re-sync contract: an existing clientId is always
+    // a no-op, even if its originally selected org was removed meanwhile.
+    const existing = await ctx.db
+      .query("captures")
+      .withIndex("by_client", (q) =>
+        q.eq("userId", user._id).eq("clientId", args.clientId),
+      )
+      .unique();
+    if (existing !== null) return existing._id;
+
     if (args.orgId !== undefined) {
       // F14: fail fast at create time instead of an alarming cross-account
       // pipeline error minutes later — old clients never send orgId, so
@@ -39,17 +49,6 @@ export const create = mutation({
       if (org === null || org.userId !== user._id) {
         throw new Error("Unknown organization key — refresh and try again.");
       }
-    }
-
-    const existing = await ctx.db
-      .query("captures")
-      .withIndex("by_client", (q) =>
-        q.eq("userId", user._id).eq("clientId", args.clientId),
-      )
-      .unique();
-
-    if (existing !== null) {
-      return existing._id;
     }
 
     const captureId = await ctx.db.insert("captures", {
