@@ -26,3 +26,15 @@
 // app fell through to its hardcoded fallback). The empty substitution
 // `$()` splits the two slashes without changing the resolved value.
 CONVEX_URL = https:/$()/precious-loris-637.convex.cloud
+
+// Debug builds talk to the DEV deployment, Release ships prod. Without this
+// override both configurations would resolve the prod value above —
+// project.yml gives Debug and Release the same `Config/Whistle.xcconfig`,
+// which `#include`s this file unconditionally — and that breaks the backend
+// loop in a way that is easy to miss: `packages/backend/.env.local` points
+// `npx convex dev` at the dev deployment, so you would push backend changes
+// to dev while your local app read prod and never showed them. It also
+// means local runs and manual QA would write into real user data. Keep this
+// override whenever the line above names a different deployment than
+// `.env.local`'s CONVEX_DEPLOYMENT.
+CONVEX_URL[config=Debug] = https:/$()/grandiose-alpaca-243.convex.cloud

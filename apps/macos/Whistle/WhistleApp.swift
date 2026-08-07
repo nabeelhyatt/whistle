@@ -74,9 +74,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// known precious-loris-637 production deployment as a hardcoded
     /// emergency default only if the plist entry is somehow absent, so the
     /// app never crashes at launch over a missing config value. Keep this in
-    /// sync with `Config/Convex.xcconfig` — a fallback pointing at a
-    /// different deployment than the xcconfig turns an xcconfig typo into a
-    /// silent switch to the wrong backend rather than a visible failure.
+    /// sync with `Config/Convex.xcconfig`'s Release value — a fallback
+    /// pointing at a different deployment than the xcconfig turns an xcconfig
+    /// typo into a silent switch to the wrong backend rather than a visible
+    /// failure. Deliberately the *prod* URL even though Debug builds resolve
+    /// the dev deployment: this constant only fires when config is missing
+    /// entirely, and a shipped build silently degrading to dev is the exact
+    /// failure 1.0.20 exists to end.
     private static let fallbackConvexUrl = "https://precious-loris-637.convex.cloud"
 
     func applicationDidFinishLaunching(_ notification: Notification) {

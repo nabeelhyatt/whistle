@@ -56,14 +56,25 @@ jobs:
       # into a silent no-op if the script were ever renamed.
       - run: pnpm -C packages/backend run test
 
+      # Fail loudly rather than skip-and-pass. This step is the fix for this
+      # workflow's own worst bug: the deploy used to be gated on
+      # HAS_DEPLOY_KEY with a companion "Skip deploy" step that echoed a
+      # notice and exited 0, so with the secret unprovisioned the workflow
+      # went GREEN while deploying nothing. Backend changes merged to main
+      # and never reached users, with no red build anywhere — PR #38's
+      # workspace-title change sat undeployed for a day exactly this way.
+      # The secret is provisioned now, so a missing key means it was revoked,
+      # rotated, or lost, and that must stop the run. Mirrors release.yml,
+      # which likewise fails before building when distribution secrets are
+      # absent.
+      - name: Require CONVEX_DEPLOY_KEY
+        if: env.HAS_DEPLOY_KEY != 'true'
+        run: |
+          echo "::error::CONVEX_DEPLOY_KEY is not provisioned — the backend was NOT deployed. See SECRETS.md section 4."
+          exit 1
+
       - name: Deploy to Convex
-        if: env.HAS_DEPLOY_KEY == 'true'
         working-directory: packages/backend
         env:
           CONVEX_DEPLOY_KEY: ${{ secrets.CONVEX_DEPLOY_KEY }}
         run: npx convex deploy --yes
-
-      - name: Skip deploy (no CONVEX_DEPLOY_KEY)
-        if: env.HAS_DEPLOY_KEY != 'true'
-        run: |
-          echo "SKIP Convex deploy: CONVEX_DEPLOY_KEY secret not provisioned (see SECRETS.md)."
