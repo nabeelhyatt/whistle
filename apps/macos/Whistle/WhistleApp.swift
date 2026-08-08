@@ -615,7 +615,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// unsubstituted `$(VAR)` build-setting placeholder. Any other value
     /// (missing, empty, `"https:"` from the xcconfig comment trap, a bare
     /// hostname) returns nil so the caller falls back to a known-good default.
-    static func usableDeploymentUrl(_ raw: String?) -> String? {
+    /// `nonisolated`: pure string validation with no AppDelegate state, and
+    /// XCTest calls it from a nonisolated context (ConvexDeploymentUrlTests).
+    nonisolated static func usableDeploymentUrl(_ raw: String?) -> String? {
         guard let raw, !raw.isEmpty, !raw.hasPrefix("$("),
               let parsed = URL(string: raw),
               parsed.scheme?.lowercased() == "https",
@@ -634,7 +636,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // reach. Requiring a host turns that class of config truncation into a
         // fall back to the known-good default instead of a silently dead app.
         let plistUrl = Bundle.main.object(forInfoDictionaryKey: "CONVEX_URL") as? String
-        let deploymentUrl = Self.usableDeploymentUrl(plistUrl) ?? fallbackConvexUrl
+        var deploymentUrl = fallbackConvexUrl
+        if let usable = Self.usableDeploymentUrl(plistUrl) {
+            deploymentUrl = usable
+        } else {
+            // Loud, because since the Debug->dev split this fallback can cross
+            // environments: the fallback is the prod URL, so a truncated Debug
+            // plist would silently send a developer's captures into production
+            // data. The log is the only signal that happened.
+            NSLog(
+                "Whistle: CONVEX_URL from Info.plist is unusable (%@) — falling back to %@",
+                plistUrl ?? "nil", fallbackConvexUrl)
+        }
         #if canImport(ConvexMobile)
             return LiveConvexService(deploymentUrl: deploymentUrl, authProvider: authProvider)
         #else

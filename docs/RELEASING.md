@@ -83,12 +83,15 @@ and user-facing — "Faster capture panel startup", not a commit message or a fi
    `release.yml` ships the app; it does not touch Convex. `backend-deploy.yml` does, and it
    only runs on pushes touching `packages/backend/**`. Shipping a DMG whose behavior depends
    on undeployed backend code produces a build that looks correct in `main` and wrong in
-   users' hands, with nothing red anywhere:
+   users' hands. A missing CONVEX_DEPLOY_KEY now fails that workflow red (it no longer
+   skips-and-passes), so the first check is simply that the latest backend-deploy run is
+   green — but green on the *latest* run doesn't cover an older change, so confirm:
    ```sh
    gh run list --workflow=backend-deploy.yml -L 1
    gh run view <id> --json jobs -q '.jobs[].steps[] | "\(.conclusion) \(.name)"'
-   # "Deploy to Convex" must be `success`, NOT `skipped` — skipped means
-   # CONVEX_DEPLOY_KEY is missing (SECRETS.md §4) and nothing was deployed.
+   # "Deploy to Convex" must be `success`. `skipped` means an earlier step
+   # failed first (the Require CONVEX_DEPLOY_KEY gate or the tests) and
+   # nothing was deployed — see SECRETS.md §4.
    ```
    Belt-and-braces check that the deployment has the code, not just that CI was green:
    `cd packages/backend && npx convex function-spec --prod | grep <a-function-your-change-added>`.

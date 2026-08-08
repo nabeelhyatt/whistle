@@ -77,13 +77,17 @@ Convex dashboard → team `nabeelo` → project `whistle` → Settings →
 gh secret set CONVEX_DEPLOY_KEY   # paste the key (starts "prod:…")
 ```
 
-**Load-bearing, and it was missing until 2026-08-05.** Without it,
-`backend-deploy.yml` skips its deploy step and the whole workflow still
-reports **green** — so backend changes merge to main and never reach users,
-with no red build anywhere. That is exactly how PR #38 sat undeployed for a
-day. If backend behavior doesn't match `main`, check this secret exists and
-that the workflow's `Deploy to Convex` step actually *ran* rather than
-showing as skipped:
+**Load-bearing, and it was missing until 2026-08-07.** Historically the
+workflow *skipped* its deploy step without this secret and still reported
+**green** — backend changes merged to main and never reached users, with no
+red build anywhere; that is exactly how PR #38 sat undeployed for a day.
+The workflow now **fails red at its `Require CONVEX_DEPLOY_KEY` step** when
+the secret is absent, so a missing/revoked key is loud: a red
+`backend-deploy` run on main is the primary signal and warrants immediate
+attention (it means the backend users run no longer tracks `main`). The
+commands below are confirmatory — use them to check *which* step failed and
+that `Deploy to Convex` concluded `success` (a `skipped` conclusion means an
+earlier step, like the Require gate or the tests, failed first):
 
 ```sh
 gh run list --workflow=backend-deploy.yml -L 1
@@ -139,9 +143,11 @@ npx convex env set AUTH0_AUDIENCE jvCvc5uGUuTJjirvZMI7RAl7A3wrduYj
 npx convex dev --once
 ```
 
-Verify with `npx convex env list --prod` and `npx convex env list`. A value
-present on dev but missing on prod is invisible in local testing and only
-shows up as failing auth for real users.
+Verify with `npx convex env list --names-only --prod` and
+`npx convex env list --names-only` (always `--names-only` — without it the
+command prints every secret's full value to the terminal). A value present
+on dev but missing on prod is invisible in local testing and only shows up
+as failing auth for real users.
 
 ### Auth0 application settings (dashboard)
 
@@ -199,7 +205,7 @@ throws: a missing key returns `null` and `buildWorkspaceName` falls back to
 the first six raw words of the notes/transcript. So a deployment missing
 this var produces workspace names like `on the detail page off the #a7be3e`
 with no error anywhere — the symptom is ugly branch names, not a failure.
-If titles look raw, check `npx convex env list --prod` first.
+If titles look raw, check `npx convex env list --names-only --prod` first.
 
 ---
 

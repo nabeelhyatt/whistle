@@ -1,11 +1,15 @@
 # backend-deploy.yml — deploy the Convex backend on pushes to main
 # (U11, TECH-SPEC §10).
 #
-# ENV-GATED (TECH-SPEC §10): the deploy step runs only when the
-# CONVEX_DEPLOY_KEY secret is provisioned; until then the workflow succeeds
-# with a logged skip so it is authored-correct before secrets exist.
+# FAIL-LOUD: a missing CONVEX_DEPLOY_KEY fails the run red at the
+# "Require CONVEX_DEPLOY_KEY" step before anything deploys. (This workflow
+# originally skipped the deploy and reported green when the secret was
+# unprovisioned; that skip-and-pass gate let PR #38 merge and never reach
+# users. The secret has been provisioned since 2026-08-07, so any absence
+# now means it was revoked, rotated, or lost — a page-worthy failure, not
+# a bootstrap state.)
 #
-# Required secret (see SECRETS.md):
+# Required secret (see SECRETS.md §4):
 #   CONVEX_DEPLOY_KEY — production deploy key for team `nabeelo`,
 #                       project `whistle` (Convex dashboard → Settings →
 #                       Deploy keys).
@@ -44,12 +48,10 @@ jobs:
           cache: pnpm
       - run: pnpm install --frozen-lockfile
 
-      # Runs unconditionally (outside the HAS_DEPLOY_KEY gate below) so a
-      # broken backend fails this workflow even while deploys are still
-      # skipped for lack of a provisioned secret — otherwise a red backend
-      # would sit silently until the key showed up. The deploy step below
-      # still can't run past a failure here: its `if:` carries no status
-      # function, so Actions keeps the implicit `success()` check.
+      # Tests run before the key gate so a broken backend and a missing key
+      # each fail on their own signal. The Deploy step below can't run past
+      # a failure here: it has no `if:`, so Actions keeps the implicit
+      # `success()` check.
       #
       # -C form, not --filter: `pnpm --filter <pkg> <script>` exits 0 when the
       # script or package doesn't match, which would turn this pre-deploy gate
