@@ -147,6 +147,36 @@ describe("admin.accountReport", () => {
     expect(report).toHaveLength(2);
   });
 
+  test("includes masked conductorOrgs entries and never the raw key", async () => {
+    const t = convexTest(schema, modules);
+    const email = "nabeel@sparkcapital.com";
+    const userId = await seedUserWithData(t, "auth0|org-report", email);
+    await t.run(async (ctx) => {
+      await ctx.db.insert("conductorOrgs", {
+        userId,
+        label: "Work org",
+        conductorApiKey: "sk-report-org-key-8888",
+        conductorEnvironment: "staging",
+        organizationId: "org_report",
+        createdAt: 1,
+      });
+    });
+
+    const report = await t.query(internal.admin.accountReport, { email });
+    const row = report.find((r) => r.userId === userId)!;
+
+    expect(row.conductorOrgs).toHaveLength(1);
+    expect(row.conductorOrgs[0]).toMatchObject({
+      label: "Work org",
+      organizationId: "org_report",
+      lastFour: "8888",
+      environment: "staging",
+    });
+
+    const serialized = JSON.stringify(report);
+    expect(serialized).not.toContain("sk-report-org-key");
+  });
+
   test("reflects mergedInto and a missing settings row", async () => {
     const t = convexTest(schema, modules);
     const email = "nabeel@sparkcapital.com";
@@ -404,6 +434,227 @@ describe("admin.mergeUserData", () => {
         dryRun: true,
       }),
     ).rejects.toThrow();
+  });
+
+  describe("conductorOrgs collision handling", () => {
+    /**
+     * Seeds:
+     *  - `to`: one org row (organizationId "org_shared") + the default
+     *    legacy no-org projectsCache row (from seedUserWithData).
+     *  - `from`: one org row colliding on "org_shared" + one non-colliding
+     *    org row, a projectsCache row for each org, a capture pointed at
+     *    each org, plus its own default legacy no-org cache row.
+     */
+    async function seedCollisionScenario(t: ReturnType<typeof convexTest>) {
+      const email = "nabeel@sparkcapital.com";
+      const to = await seedUserWithData(t, "auth0|orgcollide-to", email, {
+        clientId: "to-own-capture",
+      });
+      const from = await seedUserWithData(t, "github|orgcollide-from", email, {
+        clientId: "from-own-capture",
+      });
+
+      const { toOrgShared, orgCollide, orgUnique, captureAtCollide, captureAtUnique } =
+        await t.run(async (ctx) => {
+          const toOrgShared = await ctx.db.insert("conductorOrgs", {
+            userId: to,
+            label: "To Shared",
+            conductorApiKey: "sk-to-shared-1111",
+            conductorEnvironment: "prod",
+            organizationId: "org_shared",
+            createdAt: 1,
+          });
+          const orgCollide = await ctx.db.insert("conductorOrgs", {
+            userId: from,
+            label: "From Shared",
+            conductorApiKey: "sk-from-shared-2222",
+            conductorEnvironment: "prod",
+            organizationId: "org_shared",
+            createdAt: 1,
+          });
+          const orgUnique = await ctx.db.insert("conductorOrgs", {
+            userId: from,
+            label: "From Unique",
+            conductorApiKey: "sk-from-unique-3333",
+            conductorEnvironment: "prod",
+            organizationId: "org_unique_from",
+            createdAt: 2,
+          });
+
+          await ctx.db.insert("projectsCache", {
+            userId: from,
+            orgId: orgCollide,
+            projects: [{ id: "proj-collide", name: "Collide", gitRemote: "git@collide" }],
+            fetchedAt: 1,
+          });
+          await ctx.db.insert("projectsCache", {
+            userId: from,
+            orgId: orgUnique,
+            projects: [{ id: "proj-unique", name: "Unique", gitRemote: "git@unique" }],
+            fetchedAt: 1,
+          });
+
+          const captureAtCollide = await ctx.db.insert("captures", {
+            userId: from,
+            clientId: "from-capture-collide",
+            transcript: "t",
+            notes: "",
+            projectId: "proj-collide",
+            projectName: "Collide",
+            orgId: orgCollide,
+            agent: "claude",
+            capturedAt: Date.now(),
+            status: "queued",
+            attempt: 0,
+          });
+          const captureAtUnique = await ctx.db.insert("captures", {
+            userId: from,
+            clientId: "from-capture-unique",
+            transcript: "t",
+            notes: "",
+            projectId: "proj-unique",
+            projectName: "Unique",
+            orgId: orgUnique,
+            agent: "claude",
+            capturedAt: Date.now(),
+            status: "queued",
+            attempt: 0,
+          });
+
+          return { toOrgShared, orgCollide, orgUnique, captureAtCollide, captureAtUnique };
+        });
+
+      return { to, from, toOrgShared, orgCollide, orgUnique, captureAtCollide, captureAtUnique };
+    }
+
+    test("dry run: manifest lists the non-colliding org, skips the colliding one, and rewrites the collided capture's orgId to the surviving row", async () => {
+      const t = convexTest(schema, modules);
+      const { to, from, toOrgShared, orgCollide, orgUnique, captureAtCollide, captureAtUnique } =
+        await seedCollisionScenario(t);
+
+      const manifest = await t.mutation(internal.admin.mergeUserData, {
+        fromUserId: from,
+        toUserId: to,
+        dryRun: true,
+      });
+
+      expect(manifest.conductorOrgs).toEqual([orgUnique]);
+      expect(manifest.skippedConductorOrgs).toEqual([orgCollide]);
+      expect(manifest.captureOrgRewrites).toEqual([
+        { captureId: captureAtCollide, fromOrgId: orgCollide, toOrgId: toOrgShared },
+      ]);
+
+      // Cache rows follow their org: the unique org's cache moves, the
+      // colliding org's cache and both users' legacy no-org caches are
+      // skipped (to already has a legacy row).
+      expect(manifest.projectsCache).toHaveLength(1);
+      expect(manifest.skippedProjectsCache).toHaveLength(2);
+
+      // Nothing written yet.
+      const fromOrgsStill = await t.run(async (ctx) =>
+        ctx.db
+          .query("conductorOrgs")
+          .withIndex("by_user", (q) => q.eq("userId", from))
+          .collect(),
+      );
+      expect(fromOrgsStill).toHaveLength(2);
+      const captureStill = await t.run(async (ctx) => ctx.db.get(captureAtCollide));
+      expect(captureStill?.orgId).toBe(orgCollide);
+      expect(captureAtUnique).toBeDefined();
+    });
+
+    test("live run: the unique org and its cache move, captures move with the collided one repointed, the colliding org row stays put; second run is idempotent", async () => {
+      const t = convexTest(schema, modules);
+      const { to, from, toOrgShared, orgCollide, orgUnique, captureAtCollide, captureAtUnique } =
+        await seedCollisionScenario(t);
+
+      await t.mutation(internal.admin.mergeUserData, {
+        fromUserId: from,
+        toUserId: to,
+        dryRun: false,
+      });
+
+      // Unique org moved to `to`; colliding org stayed under `from`.
+      const uniqueOrgRow = await t.run(async (ctx) => ctx.db.get(orgUnique));
+      expect(uniqueOrgRow?.userId).toBe(to);
+      const collideOrgRow = await t.run(async (ctx) => ctx.db.get(orgCollide));
+      expect(collideOrgRow?.userId).toBe(from);
+
+      // Both captures moved to `to`; the collided one's orgId was rewritten
+      // to the surviving `to` row, the unique one kept its (now `to`-owned) org.
+      const collideCapture = await t.run(async (ctx) => ctx.db.get(captureAtCollide));
+      expect(collideCapture?.userId).toBe(to);
+      expect(collideCapture?.orgId).toBe(toOrgShared);
+      const uniqueCapture = await t.run(async (ctx) => ctx.db.get(captureAtUnique));
+      expect(uniqueCapture?.userId).toBe(to);
+      expect(uniqueCapture?.orgId).toBe(orgUnique);
+
+      // Cache: the unique org's cache followed to `to`; the colliding org's
+      // cache and the legacy no-org caches stayed under `from`.
+      const toCaches = await t.run(async (ctx) =>
+        ctx.db
+          .query("projectsCache")
+          .withIndex("by_user", (q) => q.eq("userId", to))
+          .collect(),
+      );
+      expect(toCaches.some((c) => c.orgId === orgUnique)).toBe(true);
+      const fromCaches = await t.run(async (ctx) =>
+        ctx.db
+          .query("projectsCache")
+          .withIndex("by_user", (q) => q.eq("userId", from))
+          .collect(),
+      );
+      expect(fromCaches.some((c) => c.orgId === orgCollide)).toBe(true);
+      expect(fromCaches.some((c) => c.orgId === undefined)).toBe(true); // legacy row stayed
+
+      // Idempotent: second live run finds nothing new to move.
+      const secondManifest = await t.mutation(internal.admin.mergeUserData, {
+        fromUserId: from,
+        toUserId: to,
+        dryRun: false,
+      });
+      expect(secondManifest.captures).toHaveLength(0);
+      expect(secondManifest.conductorOrgs).toHaveLength(0);
+      expect(secondManifest.skippedConductorOrgs).toEqual([orgCollide]);
+      expect(secondManifest.captureOrgRewrites).toHaveLength(0);
+    });
+
+    test("refuses a merge when a collided capture would be stranded by its moving org", async () => {
+      const t = convexTest(schema, modules);
+      const { to, from, orgUnique } = await seedCollisionScenario(t);
+
+      // A second `from` capture that collides on clientId with a `to`
+      // capture (so it stays under `from`), but points at orgUnique — a row
+      // that IS moving to `to`. Left un-cleared, this would become a
+      // foreign-user pointer under `from` the instant orgUnique moves.
+      const collidedAtMovingOrg = await t.run(async (ctx) =>
+        ctx.db.insert("captures", {
+          userId: from,
+          clientId: "to-own-capture", // collides with `to`'s seeded capture
+          transcript: "t",
+          notes: "",
+          projectId: "proj-unique",
+          projectName: "Unique",
+          orgId: orgUnique,
+          agent: "claude",
+          capturedAt: Date.now(),
+          status: "queued",
+          attempt: 0,
+        }),
+      );
+
+      await expect(
+        t.mutation(internal.admin.mergeUserData, {
+          fromUserId: from,
+          toUserId: to,
+          dryRun: false,
+        }),
+      ).rejects.toThrow(/resolve the capture collision/);
+
+      const capture = await t.run(async (ctx) => ctx.db.get(collidedAtMovingOrg));
+      expect(capture?.userId).toBe(from);
+      expect(capture?.orgId).toBe(orgUnique);
+    });
   });
 
   test("re-running toward the SAME already-merged target is allowed (idempotent)", async () => {

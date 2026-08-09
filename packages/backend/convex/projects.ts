@@ -1,37 +1,101 @@
 // Conductor project listing + key validation — TECH-SPEC §7.
 //
 // The app never holds the Conductor key; project listing goes through this
-// backend cache (`projectsCache` table) so the client only ever sees
-// already-fetched project metadata.
+// backend cache (`projectsCache` table, one row per org key) so the client
+// only ever sees already-fetched project metadata.
+//
+// `setAndValidateKey`/`validateKey` survive as back-compat shims for shipped
+// single-key clients — new clients use orgs.addKey and friends (orgs.ts).
 
 import { v } from "convex/values";
 import { action, query } from "./_generated/server";
 import { internal } from "./_generated/api";
 import { internalMutation, internalQuery } from "./_generated/server";
+import type { Id } from "./_generated/dataModel";
 import { requireUser } from "./lib/auth";
 import {
   listAllProjects,
+  getMe,
   resolveConductorEnvironment,
   ConductorApiError,
   type ConductorEnvironment,
 } from "./conductorClient";
-import { credsFromSettings, patchConductorKey } from "./settings";
+import { credsFromSettings } from "./settings";
+import {
+  displayNamesForOrgs,
+  duplicateOrgMessage,
+  INVALID_KEY_MESSAGE,
+  NETWORK_UNREACHABLE_MESSAGE,
+  orgDisplayName,
+  orgsForUser,
+  projectSetChanged,
+  shimTargetOrg,
+  shimWriteTargetOrg,
+  upsertOrgProjectsCache,
+} from "./orgs";
 
 /** Both actions below resolve the caller via `users.getSelfInternal` since
  * actions don't have direct `ctx.db` access and `requireUser` is a
  * QueryCtx/MutationCtx-only helper (see lib/auth.ts). */
 
-/** Cached projects for the calling user — client persists the latest yield
- * into GRDB for offline picker use. */
+/**
+ * Cached projects for the calling user, merged across all org caches —
+ * client persists the latest yield into GRDB for offline picker use.
+ *
+ * Each item carries `orgId`/`orgLabel` (display name) so the picker can group
+ * by org; a legacy pre-migration cache row contributes items with both
+ * undefined, which old and new clients alike render ungrouped (added optional
+ * fields are ignored by shipped clients' Codable decoding — no wire break).
+ *
+ * Groups are ordered legacy-first then org `createdAt`; within a group,
+ * cache order is preserved (what Conductor returned — same as the single-key
+ * era). Duplicate project ids across rows (two keys for one org, possible
+ * when GET /me was unavailable for dedupe) collapse to the first occurrence:
+ * `Project` is Identifiable by project id on the client and duplicate ids in
+ * a SwiftUI ForEach is undefined behavior.
+ */
 export const list = query({
   args: {},
   handler: async (ctx) => {
     const user = await requireUser(ctx);
-    const row = await ctx.db
+    const cacheRows = await ctx.db
       .query("projectsCache")
       .withIndex("by_user", (q) => q.eq("userId", user._id))
-      .unique();
-    return row?.projects ?? [];
+      .collect();
+    if (cacheRows.length === 0) return [];
+
+    const orgs = await orgsForUser(ctx, user._id);
+    const orgOrder = new Map(orgs.map((org, i) => [org._id, i]));
+    const orgById = new Map(orgs.map((org) => [org._id, org]));
+    const displayNames = displayNamesForOrgs(orgs);
+
+    const ordered = cacheRows.sort((a, b) => {
+      const ai = a.orgId === undefined ? -1 : (orgOrder.get(a.orgId) ?? Number.MAX_SAFE_INTEGER);
+      const bi = b.orgId === undefined ? -1 : (orgOrder.get(b.orgId) ?? Number.MAX_SAFE_INTEGER);
+      return ai - bi;
+    });
+
+    const seen = new Set<string>();
+    const merged: Array<{
+      id: string;
+      name: string;
+      gitRemote: string;
+      orgId?: Id<"conductorOrgs">;
+      orgLabel?: string;
+    }> = [];
+    for (const row of ordered) {
+      const org = row.orgId === undefined ? undefined : orgById.get(row.orgId);
+      for (const project of row.projects) {
+        if (seen.has(project.id)) continue;
+        seen.add(project.id);
+        merged.push({
+          ...project,
+          orgId: org?._id,
+          orgLabel: org === undefined ? undefined : displayNames.get(org._id),
+        });
+      }
+    }
+    return merged;
   },
 });
 
@@ -45,120 +109,42 @@ export const getSettingsForUserInternal = internalQuery({
   },
 });
 
+/** One org's cache row (or the legacy no-org row when `orgId` is absent).
+ * Always pinned on by_user_org — `.unique()` on by_user alone throws once a
+ * user has 2+ cache rows. */
 export const getProjectsCacheForUserInternal = internalQuery({
-  args: { userId: v.id("users") },
+  args: {
+    userId: v.id("users"),
+    orgId: v.optional(v.id("conductorOrgs")),
+  },
   handler: async (ctx, args) => {
     return await ctx.db
       .query("projectsCache")
-      .withIndex("by_user", (q) => q.eq("userId", args.userId))
+      .withIndex("by_user_org", (q) =>
+        q.eq("userId", args.userId).eq("orgId", args.orgId),
+      )
       .unique();
   },
 });
-
-/**
- * True when a previously-cached project set exists AND its project ids differ
- * from the newly-fetched set — i.e. this key can see a different set of
- * Conductor projects than the last key did. Order-independent. Returns false
- * when there is no prior cache (first key, nothing to compare against), so
- * onboarding never shows a spurious "changed" warning.
- */
-function projectSetChanged(
-  previous: { id: string }[] | undefined,
-  next: { id: string }[],
-): boolean {
-  if (previous === undefined) return false;
-  const prevIds = [...new Set(previous.map((p) => p.id))].sort();
-  const nextIds = [...new Set(next.map((p) => p.id))].sort();
-  if (prevIds.length !== nextIds.length) return true;
-  return prevIds.some((id, i) => id !== nextIds[i]);
-}
 
 export const writeProjectsCacheInternal = internalMutation({
   args: {
     userId: v.id("users"),
+    orgId: v.optional(v.id("conductorOrgs")),
     projects: v.array(
       v.object({ id: v.string(), name: v.string(), gitRemote: v.string() }),
     ),
   },
   handler: async (ctx, args) => {
-    const existing = await ctx.db
-      .query("projectsCache")
-      .withIndex("by_user", (q) => q.eq("userId", args.userId))
-      .unique();
-    if (existing === null) {
-      await ctx.db.insert("projectsCache", {
-        userId: args.userId,
-        projects: args.projects,
-        fetchedAt: Date.now(),
-      });
-    } else {
-      await ctx.db.patch(existing._id, {
-        projects: args.projects,
-        fetchedAt: Date.now(),
-      });
-    }
+    await upsertOrgProjectsCache(ctx, args.userId, args.orgId, args.projects);
   },
 });
 
 /**
- * The single transactional write behind `setAndValidateKey` (KTD3): patches
- * `settings` (key + environment) and upserts `projectsCache` from the
- * already-probed project list in one Convex mutation, so both writes commit
- * or fail together. `projectsChanged` is computed against the prior cache
- * *inside* this mutation (not read-then-decided in the calling action)
- * specifically so a concurrent write to the same user's cache can't race
- * between "read previous" and "write new" — the comparison and the write
- * share one transaction.
- */
-export const commitValidatedKeyInternal = internalMutation({
-  args: {
-    userId: v.id("users"),
-    conductorApiKey: v.string(),
-    conductorEnvironment: v.union(v.literal("prod"), v.literal("staging")),
-    projects: v.array(
-      v.object({ id: v.string(), name: v.string(), gitRemote: v.string() }),
-    ),
-  },
-  handler: async (ctx, args): Promise<{ projectsChanged: boolean }> => {
-    const existingCache = await ctx.db
-      .query("projectsCache")
-      .withIndex("by_user", (q) => q.eq("userId", args.userId))
-      .unique();
-    const projectsChanged = projectSetChanged(
-      existingCache?.projects,
-      args.projects,
-    );
-
-    await patchConductorKey(
-      ctx,
-      args.userId,
-      args.conductorApiKey,
-      args.conductorEnvironment,
-    );
-
-    if (existingCache === null) {
-      await ctx.db.insert("projectsCache", {
-        userId: args.userId,
-        projects: args.projects,
-        fetchedAt: Date.now(),
-      });
-    } else {
-      await ctx.db.patch(existingCache._id, {
-        projects: args.projects,
-        fetchedAt: Date.now(),
-      });
-    }
-
-    return { projectsChanged };
-  },
-});
-
-/**
- * Re-checks the caller's *stored* Conductor key via `GET /v0/projects`
- * against its stored environment (`credsFromSettings`) and, on success,
- * refreshes `projectsCache`. Drops the old `apiKey` arg (KTD6, clean break)
- * — entering/replacing a key now goes through `setAndValidateKey` below,
- * which is the only path that can change what's stored.
+ * Old-client shim: re-checks a *stored* Conductor key via `GET /v0/projects`
+ * against its stored environment and, on success, refreshes that org's
+ * projectsCache. Pre-migration users validate the legacy settings key;
+ * post-migration the target org row is picked by `shimTargetOrg`.
  */
 export const validateKey = action({
   args: {},
@@ -174,7 +160,23 @@ export const validateKey = action({
       internal.projects.getSettingsForUserInternal,
       { userId: user._id },
     );
-    const creds = credsFromSettings(settingsRow ?? undefined);
+    const legacyCreds = credsFromSettings(settingsRow ?? undefined);
+
+    let creds = legacyCreds;
+    let orgId: Id<"conductorOrgs"> | undefined;
+    if (creds === undefined) {
+      const orgs = await ctx.runQuery(internal.orgs.getOrgsForUserInternal, {
+        userId: user._id,
+      });
+      const target = shimTargetOrg(orgs);
+      if (target !== undefined) {
+        creds = {
+          apiKey: target.conductorApiKey,
+          environment: target.conductorEnvironment,
+        };
+        orgId = target._id;
+      }
+    }
 
     if (creds === undefined) {
       return { ok: false, error: "No API key provided or stored." };
@@ -183,11 +185,11 @@ export const validateKey = action({
     try {
       // Capture the prior project set before overwriting the cache, so we can
       // tell the client whether this key sees a different set of Conductor
-      // projects than the last one — a cheap proxy (there is no whoami
-      // endpoint) for "this key may belong to a different Conductor account."
+      // projects than the last one — a cheap proxy (predates GET /me) for
+      // "this key may belong to a different Conductor account."
       const previous = await ctx.runQuery(
         internal.projects.getProjectsCacheForUserInternal,
-        { userId: user._id },
+        { userId: user._id, orgId },
       );
       const projects = await listAllProjects(creds, { limit: 50 });
       const changedFromPrevious = projectSetChanged(
@@ -196,6 +198,7 @@ export const validateKey = action({
       );
       await ctx.runMutation(internal.projects.writeProjectsCacheInternal, {
         userId: user._id,
+        orgId,
         projects,
       });
       return { ok: true, changedFromPrevious };
@@ -208,60 +211,118 @@ export const validateKey = action({
   },
 });
 
-/** Refreshes the project cache using the caller's stored key + environment. */
+/**
+ * Refreshes every org's project cache independently — one bad key must not
+ * block the others. Also backfills best-effort GET /me metadata
+ * (`organizationId`/`organizationName`) onto rows that lack it, so existing
+ * keys pick up server org names the day the API ships them (the seam).
+ *
+ * Pre-migration users (legacy settings key, no org rows) refresh the legacy
+ * no-org cache row. Returns the old `{ ok, error? }` shape old clients decode
+ * plus a `failures` array new clients can surface.
+ */
 export const refreshProjects = action({
   args: {},
-  handler: async (ctx): Promise<{ ok: boolean; error?: string }> => {
+  handler: async (
+    ctx,
+  ): Promise<{
+    ok: boolean;
+    error?: string;
+    failures?: { orgId: Id<"conductorOrgs">; label: string; error: string }[];
+  }> => {
     const user = await ctx.runQuery(internal.users.getSelfInternal, {});
     if (user === null) {
       return { ok: false, error: "Not authenticated" };
     }
 
-    const settingsRow = await ctx.runQuery(
-      internal.projects.getSettingsForUserInternal,
-      { userId: user._id },
-    );
-    const creds = credsFromSettings(settingsRow ?? undefined);
-    if (creds === undefined) {
-      return { ok: false, error: "No API key configured." };
+    const orgs = await ctx.runQuery(internal.orgs.getOrgsForUserInternal, {
+      userId: user._id,
+    });
+
+    if (orgs.length === 0) {
+      const settingsRow = await ctx.runQuery(
+        internal.projects.getSettingsForUserInternal,
+        { userId: user._id },
+      );
+      const creds = credsFromSettings(settingsRow ?? undefined);
+      if (creds === undefined) {
+        return { ok: false, error: "No API key configured." };
+      }
+      try {
+        const projects = await listAllProjects(creds, { limit: 50 });
+        await ctx.runMutation(internal.projects.writeProjectsCacheInternal, {
+          userId: user._id,
+          projects,
+        });
+        return { ok: true };
+      } catch (err) {
+        const message =
+          err instanceof ConductorApiError
+            ? err.userMessage
+            : (err as Error).message;
+        return { ok: false, error: message };
+      }
     }
 
-    try {
-      const projects = await listAllProjects(creds, { limit: 50 });
-      await ctx.runMutation(internal.projects.writeProjectsCacheInternal, {
-        userId: user._id,
-        projects,
-      });
-      return { ok: true };
-    } catch (err) {
-      if (err instanceof ConductorApiError) {
-        return { ok: false, error: err.userMessage };
+    const failures: { orgId: Id<"conductorOrgs">; label: string; error: string }[] =
+      [];
+    for (const org of orgs) {
+      const creds = {
+        apiKey: org.conductorApiKey,
+        environment: org.conductorEnvironment,
+      };
+      try {
+        const projects = await listAllProjects(creds, { limit: 50 });
+        await ctx.runMutation(internal.projects.writeProjectsCacheInternal, {
+          userId: user._id,
+          orgId: org._id,
+          projects,
+        });
+      } catch (err) {
+        const message =
+          err instanceof ConductorApiError
+            ? err.userMessage
+            : (err as Error).message;
+        failures.push({
+          orgId: org._id,
+          label: orgDisplayName(org),
+          error: message,
+        });
+        continue;
       }
-      return { ok: false, error: (err as Error).message };
+
+      // F12: narrowed to organizationId only — organizationName is the seam
+      // field the API doesn't serve yet, so probing forever for it alone
+      // was pure noise (an extra GET /me per org per refresh with nothing
+      // to backfill). Re-widen this once the API ships org names.
+      if (org.organizationId === undefined) {
+        const me = await getMe(creds);
+        if (me !== undefined) {
+          await ctx.runMutation(internal.orgs.patchOrgIdentityInternal, {
+            orgId: org._id,
+            organizationId: me.organizationId,
+            organizationName: me.organizationName,
+          });
+        }
+      }
     }
+
+    if (failures.length === orgs.length) {
+      return { ok: false, error: failures[0]?.error, failures };
+    }
+    return failures.length > 0 ? { ok: true, failures } : { ok: true };
   },
 });
 
 /**
- * Copy for setAndValidateKey's failure result (R7) — distinguishes a
- * rejected key from an unreachable host.
- */
-const INVALID_KEY_MESSAGE =
-  "Conductor didn't accept that key. Check that you copied the whole key.";
-const NETWORK_UNREACHABLE_MESSAGE =
-  "Couldn't reach Conductor. Check your connection and try again.";
-
-/**
- * Probes both Conductor hosts for `apiKey` (`resolveConductorEnvironment`),
- * and only on success commits the detected environment + key together with
- * `projectsCache` via a *single* internal mutation
- * (`commitValidatedKeyInternal`, KTD3) — actions can't run multiple
- * `ctx.runMutation` calls transactionally, so the settings patch and the
- * cache upsert (plus the race-free `projectsChanged` comparison) all live in
- * that one mutation rather than here. `projectsCache` is seeded from the
- * probe's own already-fetched project list (no second projects fetch). On
- * failure, nothing is stored — the previously working key (if any) is left
- * exactly as it was.
+ * Old-client shim over the multi-org store. Probes both Conductor hosts for
+ * `apiKey` (`resolveConductorEnvironment`) and, on success, commits the key
+ * into a `conductorOrgs` row via the same single internal mutation as
+ * `orgs.addKey` (KTD3 — row + cache in one transaction, seeded from the
+ * probe's own project list). Row resolution: a GET /me `organizationId`
+ * match wins (refreshing that row's metadata); else `shimTargetOrg`;
+ * else insert a new row labeled "Default" (fresh user on an old client). On
+ * failure nothing is stored.
  */
 export const setAndValidateKey = action({
   args: { apiKey: v.string() },
@@ -292,16 +353,53 @@ export const setAndValidateKey = action({
       };
     }
 
-    const { projectsChanged } = await ctx.runMutation(
-      internal.projects.commitValidatedKeyInternal,
+    const me = await getMe({
+      apiKey: args.apiKey,
+      environment: resolved.environment,
+    });
+    const orgs = await ctx.runQuery(internal.orgs.getOrgsForUserInternal, {
+      userId: user._id,
+    });
+    // F6: the write-path target uses shimWriteTargetOrg, not shimTargetOrg —
+    // with 2+ orgs and no "Default"-labeled row it resolves to undefined
+    // (insert a new Default row below) rather than falling back to the
+    // oldest row and destroying that org's key in place.
+    const target =
+      (me?.organizationId !== undefined
+        ? orgs.find((o) => o.organizationId === me.organizationId)
+        : undefined) ?? shimWriteTargetOrg(orgs);
+
+    const result = await ctx.runMutation(
+      internal.orgs.commitValidatedOrgKeyInternal,
       {
         userId: user._id,
+        orgId: target?._id,
+        label: target?.label ?? "Default",
         conductorApiKey: args.apiKey,
         conductorEnvironment: resolved.environment,
+        organizationId: me?.organizationId,
+        organizationName: me?.organizationName,
         projects: resolved.projects,
       },
     );
 
-    return { ok: true, environment: resolved.environment, projectsChanged };
+    if (!result.ok) {
+      // F15: the replace target can vanish between this read and the
+      // commit (a concurrent orgs.remove) — surface ok:false instead of
+      // letting a raw exception reach the old client.
+      return {
+        ok: false,
+        error:
+          result.reason === "duplicateOrg"
+            ? duplicateOrgMessage(result.duplicateOfLabel)
+            : "That key entry was removed. Re-open Settings and try again.",
+      };
+    }
+
+    return {
+      ok: true,
+      environment: resolved.environment,
+      projectsChanged: result.projectsChanged,
+    };
   },
 });

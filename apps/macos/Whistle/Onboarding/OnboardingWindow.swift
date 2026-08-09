@@ -117,6 +117,7 @@ public final class OnboardingViewModel: ObservableObject {
     @Published public private(set) var speechModelAvailability: SpeechModelAvailability?
 
     // Step 3 (API key)
+    @Published public var apiKeyLabel: String = "Default"
     @Published public var apiKeyInput: String = ""
     @Published public private(set) var isValidatingKey = false
     @Published public private(set) var apiKeyError: String?
@@ -277,15 +278,14 @@ public final class OnboardingViewModel: ObservableObject {
         connectedEnvironment = nil
         defer { isValidatingKey = false }
 
-        let result: ConductorSetAndValidateResult
+        let result: OrgAddKeyResult
         do {
-            // Single atomic call (staging-keys plan KTD3): probes the key
-            // against both Conductor hosts and, only on acceptance, stores
-            // the key + detected environment and seeds the projects cache
-            // server-side — replacing the previous validate-then-save
-            // two-step. A rejected key changes nothing server-side, so
-            // there is no separate client "save" call to make here.
-            result = try await convex.conductorSetAndValidateKey(key: key)
+            // Multi-org plan: onboarding's first key becomes a labeled org
+            // row via `orgs:addKey` (still one atomic probe-then-store call,
+            // same rejected-key-changes-nothing guarantee as the old
+            // `conductorSetAndValidateKey` shim it replaces here).
+            let label = apiKeyLabel.trimmingCharacters(in: .whitespacesAndNewlines)
+            result = try await convex.orgAddKey(label: label.isEmpty ? "Default" : label, key: key)
         } catch {
             apiKeyError = "Couldn't reach Conductor. Check your connection and try again."
             return
@@ -532,6 +532,9 @@ struct OnboardingView: View {
                 destination: ConductorDashboardLink.apiKeysURL(environment: viewModel.connectedEnvironment)
             )
             .font(.callout)
+
+            TextField("Label", text: $viewModel.apiKeyLabel, prompt: Text("Default"))
+                .textFieldStyle(.roundedBorder)
 
             SecureField("Conductor API key", text: $viewModel.apiKeyInput)
                 .textFieldStyle(.roundedBorder)

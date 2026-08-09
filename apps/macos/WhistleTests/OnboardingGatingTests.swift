@@ -129,6 +129,103 @@ private final class FakeOnboardingConvexService: ConvexServiceProtocol, @uncheck
 
     func conductorRefreshProjects() async throws {}
 
+    // MARK: orgs (multi-org plan)
+
+    /// Backing store for `orgsList()` -- mutated by `orgAddKey`/`orgRemove`/
+    /// `orgRename` below so a scenario can add a key, then reload the list
+    /// and see it reflected, same as the real `orgs:*` actions/mutations.
+    var orgKeysStore: [OrgKeyInfo] = []
+    var orgsListError: Error?
+    /// Scripted result for `orgAddKey`. `nil` (the default) derives a
+    /// result from `validateKeyResult` the same way
+    /// `conductorSetAndValidateKey` above does, so scenarios that only
+    /// script the plain bool keep working unchanged.
+    var orgAddKeyResult: Result<OrgAddKeyResult, Error>?
+    var orgRemoveError: Error?
+    var orgRenameError: Error?
+
+    private(set) var orgAddKeyCalls: [(label: String, key: String)] = []
+    private(set) var orgRemoveCalls: [String] = []
+    private(set) var orgRenameCalls: [(orgId: String, label: String)] = []
+    private var orgIdCounter = 0
+
+    func orgsList() async throws -> [OrgKeyInfo] {
+        lock.lock(); defer { lock.unlock() }
+        if let orgsListError { throw orgsListError }
+        return orgKeysStore
+    }
+
+    func orgAddKey(label: String, key: String) async throws -> OrgAddKeyResult {
+        lock.lock()
+        orgAddKeyCalls.append((label, key))
+        let scripted = orgAddKeyResult
+        orgIdCounter += 1
+        let candidateOrgId = "org-\(orgIdCounter)"
+        lock.unlock()
+
+        let result: OrgAddKeyResult
+        if let scripted {
+            result = try scripted.get()
+        } else {
+            let ok = try validateKeyResult.get()
+            result = ok
+                ? OrgAddKeyResult(ok: true, orgId: candidateOrgId, environment: .prod, projectsChanged: false, error: nil)
+                : OrgAddKeyResult(
+                    ok: false,
+                    error: "Conductor didn't accept that key. Check that you copied the whole key."
+                )
+        }
+
+        if result.ok {
+            lock.lock()
+            let orgId = result.orgId ?? candidateOrgId
+            orgKeysStore.append(OrgKeyInfo(
+                orgId: orgId,
+                label: label,
+                displayName: label,
+                lastFour: String(key.suffix(4)),
+                environment: result.environment ?? .prod,
+                createdAt: Date()
+            ))
+            settingsSnapshot.hasKey = true
+            settingsSnapshot.lastFour = String(key.suffix(4))
+            settingsSnapshot.environment = result.environment ?? .prod
+            lock.unlock()
+        }
+        return result
+    }
+
+    func orgRemove(orgId: String) async throws {
+        lock.lock()
+        orgRemoveCalls.append(orgId)
+        let error = orgRemoveError
+        lock.unlock()
+        if let error { throw error }
+        lock.lock(); orgKeysStore.removeAll { $0.orgId == orgId }; lock.unlock()
+    }
+
+    func orgRename(orgId: String, label: String) async throws {
+        lock.lock()
+        orgRenameCalls.append((orgId, label))
+        let error = orgRenameError
+        lock.unlock()
+        if let error { throw error }
+        lock.lock()
+        if let index = orgKeysStore.firstIndex(where: { $0.orgId == orgId }) {
+            let old = orgKeysStore[index]
+            orgKeysStore[index] = OrgKeyInfo(
+                orgId: old.orgId,
+                label: label,
+                organizationName: old.organizationName,
+                displayName: label,
+                lastFour: old.lastFour,
+                environment: old.environment,
+                createdAt: old.createdAt
+            )
+        }
+        lock.unlock()
+    }
+
     // MARK: projects
 
     func projectsList() -> AsyncStream<[Project]> {
@@ -266,10 +363,12 @@ final class OnboardingGatingTests: XCTestCase {
         viewModel.continueFromPermissions()
         XCTAssertEqual(viewModel.step, .apiKey)
 
-        // (3) API key — one atomic probe-and-store call (KTD3)
+        // (3) API key — one atomic probe-and-store call (multi-org plan:
+        // `orgs:addKey`, replacing the old single-key
+        // `conductorSetAndValidateKey` shim)
         viewModel.apiKeyInput = "ck_valid_key_1234"
         await viewModel.submitApiKey()
-        XCTAssertEqual(convex.setAndValidateKeyCalls, ["ck_valid_key_1234"])
+        XCTAssertEqual(convex.orgAddKeyCalls.map(\.key), ["ck_valid_key_1234"])
 
         // (4) exactly one project -> auto-selected, NO picker step: we land
         // directly on the test capture.
@@ -450,9 +549,9 @@ final class OnboardingGatingTests: XCTestCase {
 
     func testInvalidKeyShowsInlineErrorAndDoesNotAdvanceOrStoreKey() async throws {
         let convex = FakeOnboardingConvexService()
-        convex.setAndValidateKeyResult = .success(
-            ConductorSetAndValidateResult(
-                ok: false, environment: nil, projectsChanged: false,
+        convex.orgAddKeyResult = .success(
+            OrgAddKeyResult(
+                ok: false,
                 error: "Conductor didn't accept that key. Check that you copied the whole key."
             )
         )
@@ -466,13 +565,13 @@ final class OnboardingGatingTests: XCTestCase {
 
         XCTAssertEqual(viewModel.step, .apiKey, "invalid key must not advance")
         XCTAssertEqual(viewModel.apiKeyError, "Conductor didn't accept that key. Check that you copied the whole key.")
-        XCTAssertEqual(convex.setAndValidateKeyCalls, ["ck_bad_key"], "the atomic action is still called")
+        XCTAssertEqual(convex.orgAddKeyCalls.map(\.key), ["ck_bad_key"], "the atomic action is still called")
         XCTAssertFalse(convex.settingsSnapshot.hasKey, "a rejected key must never be stored — there is no separate client-side save call to make")
     }
 
     func testValidateKeyNetworkErrorShowsInlineErrorAndDoesNotAdvance() async throws {
         let convex = FakeOnboardingConvexService()
-        convex.setAndValidateKeyResult = .failure(StubError())
+        convex.orgAddKeyResult = .failure(StubError())
         let (viewModel, _, _, _) = OnboardingTestSupport.makeViewModel(convex: convex)
 
         await viewModel.signIn()
@@ -497,15 +596,15 @@ final class OnboardingGatingTests: XCTestCase {
 
         XCTAssertEqual(viewModel.step, .apiKey)
         XCTAssertNotNil(viewModel.apiKeyError)
-        XCTAssertTrue(convex.setAndValidateKeyCalls.isEmpty)
+        XCTAssertTrue(convex.orgAddKeyCalls.isEmpty)
     }
 
     // MARK: Happy: successful staging key entry surfaces the staging confirmation
 
     func testSuccessfulStagingKeyEntrySetsStagingConfirmationState() async throws {
         let convex = FakeOnboardingConvexService()
-        convex.setAndValidateKeyResult = .success(
-            ConductorSetAndValidateResult(ok: true, environment: .staging, projectsChanged: false, error: nil)
+        convex.orgAddKeyResult = .success(
+            OrgAddKeyResult(ok: true, orgId: "org-1", environment: .staging, projectsChanged: false, error: nil)
         )
         let (viewModel, _, _, _) = OnboardingTestSupport.makeViewModel(convex: convex)
 
@@ -757,128 +856,176 @@ final class SettingsViewModelTests: XCTestCase {
         XCTAssertEqual(convex.settingsUpdateCalls.count, 4)
     }
 
-    func testMaskedKeyDisplayShowsLastFourAndNeverTheKey() async throws {
+    // MARK: - API key management (multi-org plan: labeled org keys)
+
+    func testLoadPopulatesOrgKeysFromOrgsList() async throws {
         let convex = FakeOnboardingConvexService()
-        convex.settingsSnapshot = SettingsSnapshot(
-            defaultProjectId: nil, agent: "claude", model: nil,
-            screenshotsEnabled: true, hasKey: true, lastFour: "9xyz"
-        )
+        convex.orgKeysStore = [
+            OrgKeyInfo(orgId: "org-1", label: "Personal", displayName: "Personal", lastFour: "9xyz", environment: .prod, createdAt: Date())
+        ]
         let (viewModel, _, _) = makeViewModel(convex: convex)
         await viewModel.load()
 
-        XCTAssertTrue(viewModel.hasKey)
-        XCTAssertEqual(viewModel.maskedKeyDisplay, "••••••••••••9xyz")
+        XCTAssertEqual(viewModel.orgKeys.map(\.orgId), ["org-1"])
+        XCTAssertEqual(viewModel.orgKeys.first?.displayName, "Personal")
     }
 
-    func testMaskedKeyDisplayShowsStagingSuffixForStagingAndPlainForProd() async throws {
-        let stagingConvex = FakeOnboardingConvexService()
-        stagingConvex.settingsSnapshot = SettingsSnapshot(
-            defaultProjectId: nil, agent: "claude", model: nil,
-            screenshotsEnabled: true, hasKey: true, lastFour: "9xyz", environment: .staging
-        )
-        let (stagingViewModel, _, _) = makeViewModel(convex: stagingConvex)
-        await stagingViewModel.load()
-        XCTAssertEqual(stagingViewModel.maskedKeyDisplay, "••••••••••••9xyz · Staging")
-
-        let prodConvex = FakeOnboardingConvexService()
-        prodConvex.settingsSnapshot = SettingsSnapshot(
-            defaultProjectId: nil, agent: "claude", model: nil,
-            screenshotsEnabled: true, hasKey: true, lastFour: "9xyz", environment: .prod
-        )
-        let (prodViewModel, _, _) = makeViewModel(convex: prodConvex)
-        await prodViewModel.load()
-        XCTAssertEqual(prodViewModel.maskedKeyDisplay, "••••••••••••9xyz", "prod shows nothing extra")
-    }
-
-    func testReplaceKeyFlowCallsTheAtomicActionOnceAndRefreshesMask() async throws {
+    func testAddKeySuccessAppendsOrgKeyAndClearsFormAndSetsSuccessState() async throws {
         let (viewModel, convex, _) = makeViewModel()
         await viewModel.load()
-        XCTAssertEqual(viewModel.maskedKeyDisplay, "No key on file")
+        XCTAssertTrue(viewModel.orgKeys.isEmpty)
 
+        viewModel.newKeyLabel = "Personal"
         viewModel.newKeyInput = "ck_new_key_7890"
-        await viewModel.replaceKey()
+        await viewModel.addKey()
 
-        // Single atomic call (staging-keys plan KTD3) replaces the previous
-        // validate-then-save two-step.
-        XCTAssertEqual(convex.setAndValidateKeyCalls, ["ck_new_key_7890"])
-        XCTAssertEqual(viewModel.keyReplaceSucceeded, true)
-        XCTAssertTrue(viewModel.newKeyInput.isEmpty, "input clears after a successful replace")
-        XCTAssertEqual(viewModel.maskedKeyDisplay, "••••••••••••7890")
+        // Single atomic call (multi-org plan, mirroring the old single-key
+        // `conductorSetAndValidateKey`'s KTD3 atomicity) -- probes then
+        // stores, only on acceptance.
+        XCTAssertEqual(convex.orgAddKeyCalls.map(\.key), ["ck_new_key_7890"])
+        XCTAssertEqual(convex.orgAddKeyCalls.map(\.label), ["Personal"])
+        XCTAssertEqual(viewModel.keyAddSucceeded, true)
+        XCTAssertTrue(viewModel.newKeyInput.isEmpty, "key input clears after a successful add")
+        XCTAssertTrue(viewModel.newKeyLabel.isEmpty, "label input clears after a successful add")
+        XCTAssertEqual(viewModel.orgKeys.map(\.lastFour), ["7890"])
     }
 
-    func testSuccessfulReplaceKeepsMaskWhenRefreshFails() async throws {
-        let (viewModel, convex, _) = makeViewModel()
-        await viewModel.load()
-        convex.settingsGetError = StubError()
-        viewModel.newKeyInput = "ck_new_key_7890"
-
-        await viewModel.replaceKey()
-
-        XCTAssertEqual(viewModel.keyReplaceSucceeded, true)
-        XCTAssertEqual(viewModel.maskedKeyDisplay, "••••••••••••7890")
-    }
-
-    func testSuccessfulReplaceCanWarnWhenProjectSetChanged() async throws {
+    func testAddKeyFailureSetsStatusMessageAndDoesNotClearField() async throws {
         let convex = FakeOnboardingConvexService()
-        convex.setAndValidateKeyResult = .success(
-            ConductorSetAndValidateResult(ok: true, environment: .prod, projectsChanged: true, error: nil)
-        )
-        let (viewModel, _, _) = makeViewModel(convex: convex)
-        await viewModel.load()
-
-        viewModel.newKeyInput = "ck_new_key_7890"
-        await viewModel.replaceKey()
-
-        XCTAssertEqual(viewModel.keyReplaceSucceeded, true)
-        XCTAssertTrue(viewModel.keyProjectsChanged)
-        XCTAssertTrue(viewModel.keyProjectsAvailable)
-    }
-
-    func testReplaceKeyRejectedByConductorSurfacesInlineWarning() async throws {
-        let convex = FakeOnboardingConvexService()
-        convex.setAndValidateKeyResult = .success(
-            ConductorSetAndValidateResult(
-                ok: false, environment: nil, projectsChanged: false,
-                error: "Conductor didn't accept that key. Check that you copied the whole key."
-            )
+        convex.orgAddKeyResult = .success(
+            OrgAddKeyResult(ok: false, error: "Conductor didn't accept that key. Check that you copied the whole key.")
         )
         let (viewModel, _, _) = makeViewModel(convex: convex)
         await viewModel.load()
 
         viewModel.newKeyInput = "ck_revoked"
-        await viewModel.replaceKey()
+        await viewModel.addKey()
 
-        XCTAssertEqual(viewModel.keyReplaceSucceeded, false)
+        XCTAssertEqual(viewModel.keyAddSucceeded, false)
         XCTAssertEqual(viewModel.keyStatusMessage, "Conductor didn't accept that key. Check that you copied the whole key.")
-        XCTAssertFalse(convex.settingsSnapshot.hasKey, "a rejected replacement key must never be stored")
+        XCTAssertEqual(viewModel.newKeyInput, "ck_revoked", "a rejected key's input is left in place so the user can correct/retry")
+        XCTAssertTrue(viewModel.orgKeys.isEmpty, "a rejected key must never be stored")
     }
 
-    func testRejectedStoredKeyReplacementDoesNotReplaceTheCurrentKeyOrCache() async throws {
+    func testAddKeyCanWarnWhenProjectSetChanged() async throws {
         let convex = FakeOnboardingConvexService()
-        convex.settingsSnapshot = SettingsSnapshot(
-            defaultProjectId: nil, agent: "claude", model: nil,
-            screenshotsEnabled: true, hasKey: true, lastFour: "old1"
-        )
-        convex.projectsToYield = [
-            Project(id: "old-project", name: "Old Account Project", gitRemote: "git@example.com:old.git")
-        ]
-        convex.setAndValidateKeyResult = .success(
-            ConductorSetAndValidateResult(ok: false, environment: nil, projectsChanged: false, error: "Conductor didn't accept that key.")
+        convex.orgAddKeyResult = .success(
+            OrgAddKeyResult(ok: true, orgId: "org-1", environment: .prod, projectsChanged: true, error: nil)
         )
         let (viewModel, _, _) = makeViewModel(convex: convex)
         await viewModel.load()
 
-        try await Whistle_waitUntil { viewModel.projects.count == 1 }
-        XCTAssertTrue(viewModel.keyProjectsAvailable)
+        viewModel.newKeyInput = "ck_new_key_7890"
+        await viewModel.addKey()
 
-        viewModel.newKeyInput = "ck_rejected_new_key"
-        await viewModel.replaceKey()
+        XCTAssertEqual(viewModel.keyAddSucceeded, true)
+        XCTAssertTrue(viewModel.keyProjectsChanged)
+    }
 
-        XCTAssertEqual(viewModel.keyReplaceSucceeded, false)
-        XCTAssertEqual(convex.settingsSnapshot.lastFour, "old1", "the rejected key must not become the stored key")
-        XCTAssertTrue(viewModel.keyProjectsAvailable)
-        XCTAssertEqual(viewModel.maskedKeyDisplay, "••••••••••••old1")
-        XCTAssertEqual(viewModel.projects.map(\.id), ["old-project"])
+    func testRemoveKeyRemovesRowFromOrgKeys() async throws {
+        let convex = FakeOnboardingConvexService()
+        convex.orgKeysStore = [
+            OrgKeyInfo(orgId: "org-1", label: "Personal", displayName: "Personal", lastFour: "aaaa", environment: .prod, createdAt: Date()),
+            OrgKeyInfo(orgId: "org-2", label: "Work", displayName: "Work", lastFour: "bbbb", environment: .prod, createdAt: Date())
+        ]
+        let (viewModel, _, _) = makeViewModel(convex: convex)
+        await viewModel.load()
+        XCTAssertEqual(viewModel.orgKeys.count, 2)
+
+        await viewModel.removeKey(orgId: "org-1")
+
+        XCTAssertEqual(convex.orgRemoveCalls, ["org-1"])
+        XCTAssertEqual(viewModel.orgKeys.map(\.orgId), ["org-2"])
+    }
+
+    func testRenameKeyUpdatesTheRowsLabel() async throws {
+        let convex = FakeOnboardingConvexService()
+        convex.orgKeysStore = [
+            OrgKeyInfo(orgId: "org-1", label: "Personal", displayName: "Personal", lastFour: "aaaa", environment: .prod, createdAt: Date())
+        ]
+        let (viewModel, _, _) = makeViewModel(convex: convex)
+        await viewModel.load()
+
+        await viewModel.renameKey(orgId: "org-1", label: "Side Project")
+
+        XCTAssertEqual(convex.orgRenameCalls.map(\.label), ["Side Project"])
+        XCTAssertEqual(viewModel.orgKeys.first?.label, "Side Project")
+        XCTAssertEqual(viewModel.keyAddSucceeded, true, "a successful rename is itself the unified status's last outcome")
+    }
+
+    // MARK: F8: unified last-action status -- a failed remove/rename must
+    // never leave a stale success checkmark, and a stale success message
+    // from an EARLIER action must not survive a later failure.
+
+    func testRemoveKeyFailureSetsFailureStatusAndDoesNotShowSuccess() async throws {
+        let convex = FakeOnboardingConvexService()
+        convex.orgKeysStore = [
+            OrgKeyInfo(orgId: "org-1", label: "Personal", displayName: "Personal", lastFour: "aaaa", environment: .prod, createdAt: Date())
+        ]
+        convex.orgRemoveError = StubError()
+        let (viewModel, _, _) = makeViewModel(convex: convex)
+        await viewModel.load()
+
+        await viewModel.removeKey(orgId: "org-1")
+
+        XCTAssertEqual(viewModel.keyAddSucceeded, false)
+        XCTAssertEqual(viewModel.keyStatusMessage, "Couldn't remove that key. Check your connection and try again.")
+        XCTAssertEqual(viewModel.orgKeys.map(\.orgId), ["org-1"], "a failed remove must not drop the row client-side")
+    }
+
+    func testRenameKeyFailureSetsFailureStatusAndDoesNotShowSuccess() async throws {
+        let convex = FakeOnboardingConvexService()
+        convex.orgKeysStore = [
+            OrgKeyInfo(orgId: "org-1", label: "Personal", displayName: "Personal", lastFour: "aaaa", environment: .prod, createdAt: Date())
+        ]
+        convex.orgRenameError = StubError()
+        let (viewModel, _, _) = makeViewModel(convex: convex)
+        await viewModel.load()
+
+        await viewModel.renameKey(orgId: "org-1", label: "Side Project")
+
+        XCTAssertEqual(viewModel.keyAddSucceeded, false)
+        XCTAssertEqual(viewModel.keyStatusMessage, "Couldn't rename that key. Check your connection and try again.")
+        XCTAssertEqual(viewModel.orgKeys.first?.label, "Personal", "a failed rename must not relabel the row client-side")
+    }
+
+    func testSuccessfulAddFollowedByFailedRemoveDoesNotRetainSuccessMessage() async throws {
+        let convex = FakeOnboardingConvexService()
+        let (viewModel, _, _) = makeViewModel(convex: convex)
+        await viewModel.load()
+
+        viewModel.newKeyInput = "ck_new_key_7890"
+        await viewModel.addKey()
+        XCTAssertEqual(viewModel.keyStatusMessage, "Key saved and validated.")
+        XCTAssertEqual(viewModel.keyAddSucceeded, true)
+
+        let orgId = viewModel.orgKeys.first!.orgId
+        convex.orgRemoveError = StubError()
+        await viewModel.removeKey(orgId: orgId)
+
+        XCTAssertEqual(viewModel.keyAddSucceeded, false)
+        XCTAssertNotEqual(viewModel.keyStatusMessage, "Key saved and validated.", "the earlier action's success message must not survive a later failure")
+        XCTAssertEqual(viewModel.keyStatusMessage, "Couldn't remove that key. Check your connection and try again.")
+    }
+
+    func testReloadOrgKeysFailureKeepsPreviouslyLoadedKeysAndSetsErrorStatus() async throws {
+        let convex = FakeOnboardingConvexService()
+        convex.orgKeysStore = [
+            OrgKeyInfo(orgId: "org-1", label: "Personal", displayName: "Personal", lastFour: "aaaa", environment: .prod, createdAt: Date())
+        ]
+        let (viewModel, _, _) = makeViewModel(convex: convex)
+        await viewModel.load()
+        XCTAssertEqual(viewModel.orgKeys.map(\.orgId), ["org-1"])
+
+        // A later reload (e.g. triggered by a mutation's post-success
+        // refresh) hits a transient failure -- the already-loaded list must
+        // survive, not be wiped to empty.
+        convex.orgsListError = StubError()
+        await viewModel.load()
+
+        XCTAssertEqual(viewModel.orgKeys.map(\.orgId), ["org-1"], "a transient orgs:list failure must not wipe the previously loaded list")
+        XCTAssertEqual(viewModel.keyAddSucceeded, false)
+        XCTAssertNotNil(viewModel.keyStatusMessage)
     }
 
     func testSignOutTransitionsAuthToSignedOut() async throws {

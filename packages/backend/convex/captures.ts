@@ -21,6 +21,9 @@ export const create = mutation({
     screenshotId: v.optional(v.id("_storage")),
     projectId: v.string(),
     projectName: v.string(),
+    // Which org key to use for this capture. Optional: old clients omit it
+    // and the pipeline's credsForCapture fallback chain resolves them.
+    orgId: v.optional(v.id("conductorOrgs")),
     agent: v.string(),
     model: v.optional(v.string()),
     capturedAt: v.number(),
@@ -28,15 +31,24 @@ export const create = mutation({
   handler: async (ctx, args) => {
     const user = await requireUser(ctx);
 
+    // Preserve the offline re-sync contract: an existing clientId is always
+    // a no-op, even if its originally selected org was removed meanwhile.
     const existing = await ctx.db
       .query("captures")
       .withIndex("by_client", (q) =>
         q.eq("userId", user._id).eq("clientId", args.clientId),
       )
       .unique();
+    if (existing !== null) return existing._id;
 
-    if (existing !== null) {
-      return existing._id;
+    if (args.orgId !== undefined) {
+      // F14: fail fast at create time instead of an alarming cross-account
+      // pipeline error minutes later — old clients never send orgId, so
+      // this only affects new clients.
+      const org = await ctx.db.get(args.orgId);
+      if (org === null || org.userId !== user._id) {
+        throw new Error("Unknown organization key — refresh and try again.");
+      }
     }
 
     const captureId = await ctx.db.insert("captures", {
@@ -47,6 +59,7 @@ export const create = mutation({
       screenshotId: args.screenshotId,
       projectId: args.projectId,
       projectName: args.projectName,
+      orgId: args.orgId,
       agent: args.agent,
       model: args.model,
       capturedAt: args.capturedAt,

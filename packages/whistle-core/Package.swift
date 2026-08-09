@@ -29,7 +29,14 @@ let package = Package(
         ),
         .testTarget(
             name: "WhistleCoreTests",
-            dependencies: ["WhistleCore"]
+            dependencies: [
+                "WhistleCore",
+                // Test-only: CaptureStoreTests builds a raw v1-only schema
+                // (via GRDB directly) to prove the v2_pending_captures_org_id
+                // migration runs cleanly against real pre-migration data,
+                // not just a fresh v1+v2 database.
+                .product(name: "GRDB", package: "GRDB.swift")
+            ]
             // No `resources:` entry: TemplatePreviewTests reads the shared
             // fixture file (packages/backend/convex/__tests__/fixtures/
             // template-rendering.json) directly from its source path via

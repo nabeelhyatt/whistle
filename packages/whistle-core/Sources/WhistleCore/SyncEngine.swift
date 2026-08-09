@@ -341,7 +341,8 @@ public actor SyncEngine {
             projectName: draft.projectName,
             agent: draft.agent,
             model: draft.model,
-            capturedAt: draft.capturedAt
+            capturedAt: draft.capturedAt,
+            orgId: draft.orgId
         )
         // The server dedupes on (userId, clientId) — TECH-SPEC §6 — so
         // calling this again on a local retry with the same clientId is
