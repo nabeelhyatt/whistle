@@ -46,6 +46,10 @@ final class ConvexDeploymentUrlTests: XCTestCase {
         XCTAssertNil(AppDelegate.usableDeploymentUrl("precious-loris-637.convex.cloud"))
     }
 
+    func testNonConvexHttpsHostIsRejected() {
+        XCTAssertNil(AppDelegate.usableDeploymentUrl("https://example.com"))
+    }
+
     func testSchemeCaseIsNormalized() {
         // URL(string:) preserves case in the scheme; the guard lowercases it.
         let mixedCase = "HTTPS://precious-loris-637.convex.cloud"

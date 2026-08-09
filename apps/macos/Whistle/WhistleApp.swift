@@ -621,7 +621,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard let raw, !raw.isEmpty, !raw.hasPrefix("$("),
               let parsed = URL(string: raw),
               parsed.scheme?.lowercased() == "https",
-              let host = parsed.host, !host.isEmpty
+              let host = parsed.host, host.hasSuffix(".convex.cloud")
         else { return nil }
         return raw
     }
