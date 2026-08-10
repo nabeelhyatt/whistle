@@ -21,6 +21,7 @@ import type * as projects from "../projects.js";
 import type * as promptRenderer from "../promptRenderer.js";
 import type * as settings from "../settings.js";
 import type * as templates from "../templates.js";
+import type * as titleGenerator from "../titleGenerator.js";
 import type * as users from "../users.js";
 
 import type {
@@ -43,6 +44,7 @@ declare const fullApi: ApiFromModules<{
   promptRenderer: typeof promptRenderer;
   settings: typeof settings;
   templates: typeof templates;
+  titleGenerator: typeof titleGenerator;
   users: typeof users;
 }>;
 

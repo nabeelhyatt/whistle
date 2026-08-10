@@ -109,7 +109,7 @@ public final class TemplateEditorViewModel: ObservableObject {
                 screenshotUrl: "https://example.convex.cloud/storage/sample-screenshot",
                 capturedAtIso: "2026-07-08T09:30:00Z",
                 projectName: "whistle",
-                workspaceName: "idea: fuzzy search history window #a1b2c3"
+                workspaceName: "Fuzzy search in history #a1b2c3"
             )
         )
     }

@@ -398,6 +398,16 @@ async function runSubmit(
   // needsWorkspace: adopted/created captures skip it on later passes.
   const needsWorkspace =
     capture.workspaceId === undefined || capture.sessionId === undefined;
+  // Project-visibility guard (canonical-accounts). The stored key must be able
+  // to see this capture's project. A key that belongs to a *different*
+  // Conductor account than the one the user picked the project under lists a
+  // different project set (or none) — orphan-adoption's listProjectWorkspaces
+  // and createWorkspace would then fail with an opaque 4xx that burns all five
+  // retries and strands the capture in "Agent working" pointing at a workspace
+  // the user can't open. Fail fast with a Settings-routing message instead.
+  // Gated on `needsWorkspace` — either id still missing — so it runs on a fresh
+  // submit and on any later pass that still has workspace setup left to do. A
+  // capture with both ids already patched skips it and goes straight to sending.
   if (needsWorkspace && !(await projectVisibleToKey(creds, capture.projectId))) {
     const keyName =
       credsResult.orgLabel !== undefined
