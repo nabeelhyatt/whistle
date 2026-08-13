@@ -78,6 +78,11 @@ jobs:
           set -euo pipefail
           git fetch --force --no-recurse-submodules origin \
             "+refs/tags/${GITHUB_REF_NAME}:refs/tags/${GITHUB_REF_NAME}"
+          if [[ "$(git rev-parse HEAD)" != "$(git rev-parse "${GITHUB_REF_NAME}^{commit}")" ]]; then
+            echo "ERROR: $GITHUB_REF_NAME no longer points at the commit this run checked out." >&2
+            echo "The tag was likely force-updated after the workflow started; refusing to mix its notes with this build." >&2
+            exit 1
+          fi
           echo "$GITHUB_REF_NAME is a $(git cat-file -t "$GITHUB_REF_NAME") object"
 
       - name: Install xcodegen
@@ -198,7 +203,10 @@ jobs:
           # dialog itself. A ::warning:: puts it in the run summary instead.
           if [[ -n "$DESCRIPTION_XML" ]]; then
             echo "Release notes from the tag annotation:"
+            STOP_COMMANDS_TOKEN="$(uuidgen)"
+            echo "::stop-commands::$STOP_COMMANDS_TOKEN"
             printf '%s\n' "$TAG_NOTES_RAW"
+            echo "::$STOP_COMMANDS_TOKEN::"
           else
             echo "::warning::No release notes — $GITHUB_REF_NAME is $(git cat-file -t "$GITHUB_REF_NAME" 2>/dev/null || echo 'unreadable'), not an annotated tag with a message. The update dialog will show no notes."
           fi

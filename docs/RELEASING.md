@@ -120,7 +120,8 @@ visible in the run summary rather than only in the update dialog.
    ```
    Tagging `origin/main` explicitly (rather than local `HEAD`) means this works correctly even
    from a checkout that isn't actually on an up-to-date `main` — the same class of mistake as
-   the "v1.0.15" gotcha below.
+   the "v1.0.15" gotcha below. Do not force-update a release tag after pushing it: the workflow
+   rejects a tag that no longer points at the commit it checked out.
    A plain `git tag vX.Y.Z` (lightweight, no message) still works — the release just ships with
    no notes in the update dialog.
    This builds → Developer-ID signs → notarizes → staples → signs the appcast item → assembles
@@ -152,7 +153,8 @@ visible in the run summary rather than only in the update dialog.
    slot means the annotated-tag read degraded (check the run log for the `::warning::` and the
    `Restore annotated tag object` step). It's cosmetic, and fixable in place without re-cutting:
    the EdDSA signature binds the DMG bytes, not the description, so an edited `appcast.xml`
-   re-uploaded with `gh release upload vX.Y.Z appcast.xml --clobber` is a valid feed.
+   re-uploaded with `xmllint --noout appcast.xml && gh release upload vX.Y.Z appcast.xml --clobber`
+   is a valid feed.
 
 ### Rolling back a bad release
 
