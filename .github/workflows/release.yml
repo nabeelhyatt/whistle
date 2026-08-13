@@ -64,6 +64,22 @@ jobs:
 
       - uses: actions/checkout@v4
 
+      # actions/checkout materializes a tag push as `+<commitSHA>:refs/tags/<tag>`
+      # — a LIGHTWEIGHT tag pointing at the peeled commit, so the annotated tag
+      # object (which carries the release notes, see docs/RELEASING.md) is never
+      # fetched. Re-fetch the real object by refspec so the annotated-tag gate in
+      # "Sign update & generate appcast item" reads the tag the release was cut
+      # from, not checkout's rewritten stand-in. v1.0.21 shipped with no release
+      # notes because of this. `fetch-tags: true` on checkout is NOT a substitute:
+      # it only drops `--no-tags`, and it races checkout's own explicit refspec
+      # for this same ref.
+      - name: Restore annotated tag object
+        run: |
+          set -euo pipefail
+          git fetch --force --no-recurse-submodules origin \
+            "+refs/tags/${GITHUB_REF_NAME}:refs/tags/${GITHUB_REF_NAME}"
+          echo "$GITHUB_REF_NAME is a $(git cat-file -t "$GITHUB_REF_NAME") object"
+
       - name: Install xcodegen
         run: brew install xcodegen
 
@@ -175,6 +191,16 @@ jobs:
             if [[ -n "$BULLETS_HTML" ]]; then
               DESCRIPTION_XML="<description><![CDATA[<ul>${BULLETS_HTML}</ul>]]></description>"
             fi
+          fi
+          # Never blocking (docs/RELEASING.md's notes invariant), but never
+          # silent either: an empty description shipped unnoticed through every
+          # release up to v1.0.21 because the only evidence was the update
+          # dialog itself. A ::warning:: puts it in the run summary instead.
+          if [[ -n "$DESCRIPTION_XML" ]]; then
+            echo "Release notes from the tag annotation:"
+            printf '%s\n' "$TAG_NOTES_RAW"
+          else
+            echo "::warning::No release notes — $GITHUB_REF_NAME is $(git cat-file -t "$GITHUB_REF_NAME" 2>/dev/null || echo 'unreadable'), not an annotated tag with a message. The update dialog will show no notes."
           fi
           cat > apps/macos/dist/appcast-item.xml <<ITEM
           <item>
