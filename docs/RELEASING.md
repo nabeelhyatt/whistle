@@ -44,6 +44,16 @@ degrades gracefully to no description at all; the dialog just shows no notes. Ke
 and user-facing — "Faster capture panel startup", not a commit message or a file list. The
 `/release` skill drafts these for you and asks you to confirm/edit them before tagging.
 
+Reading those notes requires the **annotated tag object**, and `actions/checkout` does not
+leave one behind: on a tag push it materializes the ref as `+<commitSHA>:refs/tags/<tag>`, a
+*lightweight* tag pointing at the peeled commit. The `Restore annotated tag object` step in
+`release.yml` re-fetches the real object by refspec before the notes are read — **don't remove
+it**, and don't assume `fetch-tags: true` on the checkout replaces it. Every release up to and
+including v1.0.21 shipped with an empty `<description>` because of this
+(`docs/solutions/integration-issues/checkout-peels-annotated-tag-release-notes.md`). The step
+that builds the item now also emits a `::warning::` when no notes are found, so a repeat is
+visible in the run summary rather than only in the update dialog.
+
 ### Invariants
 
 - **Tag == version.** `vX.Y.Z` must exactly equal `MARKETING_VERSION` in
@@ -110,7 +120,8 @@ and user-facing — "Faster capture panel startup", not a commit message or a fi
    ```
    Tagging `origin/main` explicitly (rather than local `HEAD`) means this works correctly even
    from a checkout that isn't actually on an up-to-date `main` — the same class of mistake as
-   the "v1.0.15" gotcha below.
+   the "v1.0.15" gotcha below. Do not force-update a release tag after pushing it: the workflow
+   rejects a tag that no longer points at the commit it checked out.
    A plain `git tag vX.Y.Z` (lightweight, no message) still works — the release just ships with
    no notes in the update dialog.
    This builds → Developer-ID signs → notarizes → staples → signs the appcast item → assembles
@@ -138,6 +149,12 @@ and user-facing — "Faster capture panel startup", not a commit message or a fi
    curl -sL https://github.com/nabeelhyatt/whistle/releases/latest/download/appcast.xml \
      | xmllint --format -        # want: one <item> with the version you just tagged
    ```
+   If you tagged with notes, `<description>` must be present and carry your bullets — an empty
+   slot means the annotated-tag read degraded (check the run log for the `::warning::` and the
+   `Restore annotated tag object` step). It's cosmetic, and fixable in place without re-cutting:
+   the EdDSA signature binds the DMG bytes, not the description, so an edited `appcast.xml`
+   re-uploaded with `xmllint --noout appcast.xml && gh release upload vX.Y.Z appcast.xml --clobber`
+   is a valid feed.
 
 ### Rolling back a bad release
 
